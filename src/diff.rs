@@ -135,22 +135,41 @@ pub struct DiffPage<'a> {
     /// the children whose ids are absent from the other side's child-id set,
     /// which is precisely "on a differing path".
     pub need: Vec<Cid>,
-    /// The `b`-side nodes this page had to open — the ones for which no
-    /// equal-id counterpart was found on the `a` side.
+    /// The `b`-side nodes this page opened: what a keeper told "the head moved
+    /// from `a` to `b`" must fetch.
     ///
-    /// Within one page each block appears **once**. Across pages it can appear
-    /// again: resuming re-opens the path to where it carries on, and the nodes
-    /// on that path are named by each page that walks them. So a caller
-    /// collecting this across a paged diff must dedupe — the UNION over the
-    /// pages is exact (it is `nodes(b) ∖ nodes(a)` at every page size), the
-    /// concatenation is not. The smaller the page the more repeats: 567 of them
-    /// at one change per page, 0 in a single page, for the same 169 blocks.
+    /// # The contract
     ///
-    /// What a keeper told "the head moved from `a` to `b`" must fetch, and no
-    /// more. Defined by comparison, never by "we happened to descend it": under
-    /// the rule above, the only reason to open a `b`-side node is that its slot
-    /// did not match, so the two coincide — and the gate asserts the exact set
-    /// `nodes(b) ∖ nodes(a)` rather than anything looser.
+    /// 1. **Complete, always.** Every node of `b` that is not in `a` and whose
+    ///    span overlaps the range is named on some page. This is the part a
+    ///    keeper relies on, and nothing may be traded for it.
+    /// 2. **Sound, always.** Every name is a node of `b` whose span overlaps
+    ///    the range — never a block only `a` has, never a value block, never
+    ///    one outside the range.
+    /// 3. **Exact in one page from the roots**, with or without a range:
+    ///    exactly `nodes(b) ∖ nodes(a)` restricted to the range, and no name
+    ///    twice.
+    /// 4. **Under a resume, a bounded extra.** A resumed page may also name
+    ///    nodes `a` HOLDS TOO — at most `height(b)` of them per page, and of no
+    ///    other kind.
+    ///
+    /// Why (4) exists, and why it is not a wart to be fixed by weakening (1):
+    /// a root has no parent, so where its keys begin cannot be known without
+    /// loading it — and at the moment of loading, "opened because it differs"
+    /// and "opened to reach the resume position" are the same act. On a resumed
+    /// page `a` has already moved past the ground below the resume key, so the
+    /// comparison that would have found such a node equal never happens, and
+    /// `b` walks its left spine to get there. That spine is the extra, and it
+    /// is bounded by the height.
+    ///
+    /// **Extras are harmless; misses are not.** For a keeper this list is a pin
+    /// list and a fetch list filtered by what it already holds — a block `a`
+    /// also has is already pinned and already held, so naming it costs nothing,
+    /// while a block left unnamed is one nobody fetches.
+    ///
+    /// Across pages a block may be named again (each page re-opens the path it
+    /// carries on from), so a caller paging a diff unions these lists. The
+    /// union is exact in the un-resumed sense above.
     pub new_blocks: Vec<Cid>,
 }
 
@@ -592,5 +611,85 @@ fn name_siblings<'a, B: Blocks>(
                 push_need(&mut s.need, id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply::{apply_into, Edit};
+    use crate::build::init;
+    use crate::store::MemBlocks;
+
+    /// `need` must compare child-id sets between nodes of the SAME level.
+    ///
+    /// Called directly, because through the public API this cannot be seen: the
+    /// junk a cross-level comparison names is made of blocks both trees share,
+    /// and in every reachable state those are exactly the blocks the caller
+    /// already holds — so the held-check filters them and the bug hides behind
+    /// the fix for a different one. Here the store passed in is EMPTY, so
+    /// nothing is filtered and the naming rule stands on its own.
+    #[test]
+    fn need_is_computed_between_nodes_of_the_same_level() {
+        let mut blocks = MemBlocks::default();
+        let root = init(&mut blocks);
+        let edits: Vec<(Vec<u8>, Edit)> = (0..20_000u32)
+            .map(|i| {
+                (
+                    format!("k/{i:08}").into_bytes(),
+                    Edit::Put(vec![(i % 251) as u8; 120]),
+                )
+            })
+            .collect();
+        let a = apply_into(&mut blocks, &root, &edits).unwrap().root;
+        let b = apply_into(
+            &mut blocks,
+            &a,
+            &[(b"k/00009000".to_vec(), Edit::Put(vec![7u8; 200]))],
+        )
+        .unwrap()
+        .root;
+
+        let mut ca = SlotCursor::open(&blocks, &a).unwrap();
+        let mut cb = SlotCursor::open(&blocks, &b).unwrap();
+        // The asymmetry a real sync produces: `a` is held so its descent
+        // succeeds, `b` is being fetched so its descent is the one that failed.
+        // `a` therefore stands one level deeper than `b` at the stop.
+        ca.as_mut().unwrap().descend().unwrap();
+        ca.as_mut().unwrap().descend().unwrap();
+        cb.as_mut().unwrap().descend().unwrap();
+        let (la, lb) = (
+            ca.as_ref().unwrap().parent().0.level(),
+            cb.as_ref().unwrap().parent().0.level(),
+        );
+        assert!(la < lb, "the test needs the two sides at different depths");
+
+        let empty = MemBlocks::default();
+        let r = Range::default();
+        let mut s = State {
+            r: &r,
+            changes: Vec::new(),
+            need: Vec::new(),
+            new_blocks: Vec::new(),
+            bytes: 0,
+            last: None,
+            stopped: false,
+        };
+        name_siblings(&empty, &mut s, &ca, &cb);
+
+        // At the shared level the two roots differ in one child, so a handful
+        // of names is right. Comparing `a`'s level-1 children against `b`'s
+        // root's children instead makes two disjoint sets and names everything
+        // in sight, up to the cap.
+        assert!(
+            s.need.len() <= 8,
+            "named {} blocks; a comparison across two levels names everything \
+             it can see (cap {MAX_NEED})",
+            s.need.len()
+        );
+        assert!(
+            !s.need.is_empty(),
+            "the position really does need something"
+        );
     }
 }

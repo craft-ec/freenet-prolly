@@ -315,78 +315,6 @@ fn random_pairs_match_the_reference() {
     }
 }
 
-/// `new_blocks` must be EXACTLY the b-side nodes that are not in `a` — the set
-/// a keeper told "the head moved" has to fetch, and no more.
-///
-/// The argument it rests on: if node N is in `a`, then N's first key is a node
-/// start in `a` at N's level, and every a-side ancestor of N has a slot
-/// boundary there. The merge opens the a side only as far as it needs to
-/// process keys below that point, so it arrives with both sides holding a slot
-/// at N's level, the ids match, and N is skipped. So a node the diff had to
-/// open cannot be one that exists in `a` — and this asserts the exact set
-/// rather than a superset, so if that laziness is ever lost the test says so.
-#[test]
-fn new_blocks_is_exactly_what_b_has_and_a_does_not() {
-    let mut checked = 0;
-    for (what, base, edits) in [
-        ("append 1", ordered_map(5_000), appended(5_000, 1)),
-        ("append 1000", ordered_map(5_000), appended(5_000, 1000)),
-        (
-            "prepend",
-            ordered_map(5_000),
-            (0..7)
-                .map(|i| (format!("a/{i:08}").into_bytes(), Edit::Put(vec![3u8; 70])))
-                .collect(),
-        ),
-        (
-            "scattered",
-            ordered_map(5_000),
-            (0..25)
-                .map(|i| {
-                    (
-                        format!("k/{:08}", i * 173).into_bytes(),
-                        Edit::Put(vec![5u8; 200]),
-                    )
-                })
-                .collect(),
-        ),
-        (
-            "deletes",
-            ordered_map(5_000),
-            (200..260)
-                .map(|i| (format!("k/{i:08}").into_bytes(), Edit::Delete))
-                .collect(),
-        ),
-    ] {
-        let p = pair(base, edits);
-        let (got, _) = p.check(&Range::default());
-        let (mut na, mut nb) = (HashSet::new(), HashSet::new());
-        nodes(&p.blocks, p.a, &mut na);
-        nodes(&p.blocks, p.b, &mut nb);
-        let want: HashSet<Cid> = nb.difference(&na).copied().collect();
-        let got: HashSet<Cid> = got.into_iter().collect();
-        assert_eq!(
-            got,
-            want,
-            "{what}: new_blocks must be nodes(b) ∖ nodes(a) exactly \
-             ({} named, {} really new)",
-            got.len(),
-            want.len()
-        );
-        assert!(
-            !want.is_empty(),
-            "{what}: the case must have new nodes at all"
-        );
-        println!(
-            "  {what:12}: {} new of {} b-side nodes",
-            want.len(),
-            nb.len()
-        );
-        checked += 1;
-    }
-    assert_eq!(checked, 5);
-}
-
 /// The cheapest answer a sync can get, and the most common one.
 #[test]
 fn equal_roots_read_nothing() {
@@ -1159,72 +1087,6 @@ fn a_cold_diff_from_one_side_names_only_missing_differing_blocks() {
     }
 }
 
-/// `b` is a node `a` already contains — the collapse shape, where a batch of
-/// deletes leaves one of `a`'s own nodes as the whole tree. Nothing in `b` is
-/// new, and `new_blocks` must say so.
-#[test]
-fn new_blocks_is_empty_when_b_is_a_node_of_a() {
-    let m: Map = dataset(9, 3_000).into_iter().collect();
-    let mut blocks = MemBlocks::default();
-    let a = build(&mut blocks, &m);
-    // Every leaf of `a`, and one level-1 subtree, as candidate roots for `b`.
-    let mut leaves: Vec<Cid> = Vec::new();
-    let mut subtrees: Vec<Cid> = Vec::new();
-    let mut seen = HashSet::new();
-    nodes(&blocks, a, &mut seen);
-    for id in &seen {
-        let n = Node::parse(&blocks.0[id]).unwrap();
-        if n.is_leaf() {
-            leaves.push(*id);
-        } else if n.level() == 1 {
-            subtrees.push(*id);
-        }
-    }
-    leaves.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
-    subtrees.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
-    assert!(leaves.len() >= 3 && !subtrees.is_empty());
-
-    let entries_under = |root: &Cid| -> Map {
-        let mut set = HashSet::new();
-        nodes(&blocks, *root, &mut set);
-        let mut out = Map::new();
-        for id in &set {
-            let n = Node::parse(&blocks.0[id]).unwrap();
-            if n.is_leaf() {
-                for i in 0..n.len() {
-                    out.insert(n.key(i), bytes_of(&blocks, &n.value(i)));
-                }
-            }
-        }
-        out
-    };
-
-    // `b = a level-1 subtree of a` is NOT in this list, and that is a finding,
-    // not an omission: it is reported open on the PR. Page 1 is exact; a
-    // RESUMED page names `b`'s root and one of its leaves although `a` holds
-    // both, because on a later page `a` has already moved past that ground, so
-    // the coincident-key comparison that would have found them equal never
-    // happens and `b` descends its left spine positionally to reach the resume
-    // key. The three leaf shapes below are exact at every page size.
-    let _ = &subtrees;
-    for (what, b) in [
-        ("first leaf", leaves[0]),
-        ("a middle leaf", leaves[leaves.len() / 2]),
-        ("last leaf", leaves[leaves.len() - 1]),
-    ] {
-        let mb = entries_under(&b);
-        let r = Range::default();
-        let (got, new_blocks, _) = all_pages(&blocks, &a, &b, &r).unwrap();
-        assert_eq!(got, reference(&m, &mb, &r), "{what}: changes");
-        assert!(
-            new_blocks.is_empty(),
-            "{what}: {} blocks called new, but every node of b is already in a",
-            new_blocks.len()
-        );
-        println!("  b = {what:18}: {} changes, 0 new blocks", got.len());
-    }
-}
-
 /// The loop a caller writes without reading the documentation twice.
 ///
 /// `next: None` must mean one thing. A page that stops on a missing block
@@ -1362,4 +1224,225 @@ fn a_byte_limit_charges_the_reference_not_the_file() {
         "  40 changed 200 KB files: {} changes in the first page, {pages} pages in all",
         page.changes.len()
     );
+}
+
+/// The span of a node — its smallest and largest key — walked from the store,
+/// independently of anything the diff says.
+fn span(store: &MemBlocks, id: &Cid) -> (Vec<u8>, Vec<u8>) {
+    let n = Node::parse(&store.0[id]).unwrap();
+    if n.is_leaf() {
+        return (n.key(0), n.key(n.len() - 1));
+    }
+    (
+        span(store, &n.child(0).0).0,
+        span(store, &n.child(n.len() - 1).0).1,
+    )
+}
+
+fn overlaps(store: &MemBlocks, id: &Cid, r: &Range) -> bool {
+    let (lo, hi) = span(store, id);
+    let above = match &r.lo {
+        Bound::Unbounded => true,
+        Bound::Included(k) => hi >= *k,
+        Bound::Excluded(k) => hi > *k,
+    };
+    let below = match &r.hi {
+        Bound::Unbounded => true,
+        Bound::Included(k) => lo <= *k,
+        Bound::Excluded(k) => lo < *k,
+    };
+    above && below
+}
+
+fn unlimited(r: &Range) -> Range {
+    Range {
+        max_entries: 0,
+        max_bytes: 0,
+        ..r.clone()
+    }
+}
+
+/// The four clauses of the `new_blocks` contract, checked against oracles
+/// walked from the store rather than derived from the diff.
+///
+/// 1 complete · 2 sound · 3 exact in one page from the roots · 4 under a
+/// resume, extras only of the bounded, already-held kind.
+fn check_new_blocks_contract(store: &MemBlocks, a: &Cid, b: &Cid, r: &Range, what: &str) {
+    let (mut na, mut nb) = (HashSet::new(), HashSet::new());
+    nodes(store, *a, &mut na);
+    nodes(store, *b, &mut nb);
+    let want: HashSet<Cid> = nb
+        .difference(&na)
+        .copied()
+        .filter(|id| overlaps(store, id, r))
+        .collect();
+    let b_node = Node::parse(&store.0[b]).unwrap();
+    let height = b_node.level() as usize + 1;
+    // A LEAF root is the one case where a root's span IS knowable without
+    // loading anything below it — its own entries are the whole tree — so it
+    // can always be dismissed when it lies below the resume key, and clause
+    // (4)'s allowance is not needed. Anything else means a side is being
+    // drained over ground the other has already left.
+    let b_root_is_leaf = b_node.is_leaf();
+    let shared: HashSet<Cid> = na.intersection(&nb).copied().collect();
+
+    // (3) One page, from the roots. Exact, and nothing named twice.
+    let one = diff(store, a, b, &unlimited(r), None).unwrap();
+    assert!(one.next.is_none(), "{what}: the unlimited page must finish");
+    let named: HashSet<Cid> = one.new_blocks.iter().copied().collect();
+    assert_eq!(
+        named.len(),
+        one.new_blocks.len(),
+        "{what}: a block is named twice in one page"
+    );
+    assert_eq!(named, want, "{what}: one page from the roots must be exact");
+
+    // (1)(2)(4) paged, which is where a resume enters.
+    for size in [1usize, 5, 40] {
+        let paged = Range {
+            max_entries: size,
+            ..r.clone()
+        };
+        let mut union: HashSet<Cid> = HashSet::new();
+        let mut resume: Option<Resume> = None;
+        let (mut pages, mut extras_total) = (0, 0);
+        loop {
+            let page = diff(store, a, b, &paged, resume.as_ref()).unwrap();
+            pages += 1;
+            assert!(pages < 5_000, "{what}: does not terminate");
+            let this: HashSet<Cid> = page.new_blocks.iter().copied().collect();
+            assert_eq!(
+                this.len(),
+                page.new_blocks.len(),
+                "{what}/{size}: a block is named twice in one page"
+            );
+            // (2) sound: a node of b, in range, and nothing else.
+            for id in &this {
+                assert!(
+                    nb.contains(id),
+                    "{what}/{size}: named a block b does not have"
+                );
+                assert!(
+                    overlaps(store, id, r),
+                    "{what}/{size}: named a block outside the range"
+                );
+            }
+            // (4) the only extras allowed are nodes `a` holds too, bounded by
+            // the height of b — the spine walked to reach the resume position.
+            let extras: HashSet<Cid> = this.difference(&want).copied().collect();
+            for id in &extras {
+                assert!(
+                    shared.contains(id),
+                    "{what}/{size}: an extra that `a` does NOT hold — not the spine"
+                );
+            }
+            assert!(
+                extras.len() <= height,
+                "{what}/{size}: {} extras in one page, height is {height}",
+                extras.len()
+            );
+            extras_total += extras.len();
+            union.extend(this);
+            match page.next {
+                Some(n) => resume = Some(n),
+                None => break,
+            }
+        }
+        // (1) complete: nothing that is really new is missed.
+        let missing: Vec<&Cid> = want.difference(&union).collect();
+        assert!(
+            missing.is_empty(),
+            "{what}/{size}: {} new blocks were never named — a keeper would not fetch them",
+            missing.len()
+        );
+        assert!(
+            !b_root_is_leaf || extras_total == 0,
+            "{what}/{size}: {extras_total} extras, but b's root is a leaf and \
+             a leaf root's span is known — nothing should be walked into"
+        );
+        if extras_total > 0 {
+            println!(
+                "    {what}/page {size}: {pages} pages, {} new, {extras_total} extras (all held by a)",
+                want.len()
+            );
+        }
+    }
+}
+
+/// The contract over the shapes that exercise each clause — including the one
+/// that is inexact under a resume, which now has a defined expected result
+/// rather than being left out.
+#[test]
+fn new_blocks_keeps_its_contract() {
+    // Ordinary shapes: b is a with edits.
+    for (what, base, edits) in [
+        ("append 1", ordered_map(5_000), appended(5_000, 1)),
+        ("append 1000", ordered_map(5_000), appended(5_000, 1000)),
+        (
+            "scattered",
+            ordered_map(5_000),
+            (0..25)
+                .map(|i| {
+                    (
+                        format!("k/{:08}", i * 173).into_bytes(),
+                        Edit::Put(vec![5u8; 200]),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "deletes",
+            ordered_map(5_000),
+            (200..260)
+                .map(|i| (format!("k/{i:08}").into_bytes(), Edit::Delete))
+                .collect(),
+        ),
+    ] {
+        let p = pair(base, edits);
+        check_new_blocks_contract(&p.blocks, &p.a, &p.b, &Range::default(), what);
+        check_new_blocks_contract(
+            &p.blocks,
+            &p.a,
+            &p.b,
+            &Range {
+                lo: Bound::Included(b"k/00001000".to_vec()),
+                hi: Bound::Included(b"k/00004000".to_vec()),
+                ..Range::default()
+            },
+            &format!("{what} (windowed)"),
+        );
+    }
+
+    // The collapse shapes: b is a node `a` already holds, so NOTHING is new.
+    // Under a resume the spine `b` walks is the extra clause (4) allows.
+    let m: Map = dataset(9, 3_000).into_iter().collect();
+    let mut blocks = MemBlocks::default();
+    let a = build(&mut blocks, &m);
+    let mut seen = HashSet::new();
+    nodes(&blocks, a, &mut seen);
+    let mut leaves: Vec<Cid> = seen
+        .iter()
+        .copied()
+        .filter(|id| Node::parse(&blocks.0[id]).unwrap().is_leaf())
+        .collect();
+    let mut subtrees: Vec<Cid> = seen
+        .iter()
+        .copied()
+        .filter(|id| Node::parse(&blocks.0[id]).unwrap().level() == 1)
+        .collect();
+    leaves.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
+    subtrees.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
+    assert!(leaves.len() >= 3 && !subtrees.is_empty());
+    for (what, b) in [
+        ("b = first leaf of a", leaves[0]),
+        ("b = a middle leaf of a", leaves[leaves.len() / 2]),
+        ("b = last leaf of a", leaves[leaves.len() - 1]),
+        ("b = a level-1 subtree of a", subtrees[0]),
+        (
+            "b = a level-1 subtree of a (last)",
+            subtrees[subtrees.len() - 1],
+        ),
+    ] {
+        check_new_blocks_contract(&blocks, &a, &b, &Range::default(), what);
+    }
 }
