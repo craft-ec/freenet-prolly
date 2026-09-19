@@ -455,11 +455,12 @@ fn frozen_vectors() {
         }
     }
     got += &format!(
-        "const {} {} {} {}\n",
+        "const {} {} {} {} {}\n",
         boundary::LAMBDA,
         MIN_SPLIT,
         boundary::MAX_LOGICAL,
-        MAX_INLINE
+        MAX_INLINE,
+        freenet_prolly::node::MAX_VALUE
     );
     for (k, body) in [(0u8, &b""[..]), (0, b"value"), (1, b"value")] {
         let id = freenet_prolly::block_id(k, body);

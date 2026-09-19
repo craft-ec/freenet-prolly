@@ -488,6 +488,10 @@ fn a_value_has_exactly_one_encoding() {
         b.push(b"b", r(MAX_INLINE as u32)),
         Err(BuildError::ValueTooShort)
     );
+    assert_eq!(
+        b.push(b"b", r(MAX_VALUE as u32 + 1)),
+        Err(BuildError::ValueTooLong)
+    );
     b.push(b"b", r(MAX_INLINE as u32 + 1)).unwrap();
     let good = b.finish().unwrap();
     Node::parse(&good).unwrap();
@@ -509,4 +513,8 @@ fn a_value_has_exactly_one_encoding() {
     );
     bad[vlen_at..vlen_at + 4].copy_from_slice(&(MAX_INLINE as u32).to_le_bytes());
     assert_eq!(Node::parse(&bad).err(), Some(NodeError::NonCanonicalValue));
+    bad[vlen_at..vlen_at + 4].copy_from_slice(&(MAX_VALUE as u32 + 1).to_le_bytes());
+    assert_eq!(Node::parse(&bad).err(), Some(NodeError::NonCanonicalValue));
+    bad[vlen_at..vlen_at + 4].copy_from_slice(&(MAX_VALUE as u32).to_le_bytes());
+    assert_eq!(Node::parse(&bad).err(), Some(NodeError::AggMismatch));
 }

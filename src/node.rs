@@ -45,6 +45,9 @@ pub const MAX_KEY: usize = 512;
 /// anything this short MUST be inline: the choice is part of the format, or
 /// the same contents could hash two ways.
 pub const MAX_INLINE: usize = 1024;
+/// Longest value at all. A referenced value is one Block, and this is the Block
+/// contract's body limit; anything larger is a blob (manifest + chunks).
+pub const MAX_VALUE: usize = 256 * 1024;
 const LEAF_FIXED: usize = 2 + 1 + 4;
 const BRANCH_FIXED: usize = 2 + 32 + 16;
 const REF_LEN: usize = 32;
@@ -108,7 +111,8 @@ pub enum NodeError {
     KeyTooLong,
     /// The stored prefix is not exactly the longest common prefix of the keys.
     NonCanonicalPrefix,
-    /// An inline value longer than `MAX_INLINE`, or a reference to one that short.
+    /// An inline value longer than `MAX_INLINE`, a reference to one that short,
+    /// or a reference to a value longer than `MAX_VALUE`.
     NonCanonicalValue,
 }
 
@@ -226,7 +230,7 @@ impl<'a> Node<'a> {
                 let vlen = u32_at(bytes, off + 3);
                 let stored = match vkind {
                     0 if vlen as usize <= MAX_INLINE => vlen as usize,
-                    1 if vlen as usize > MAX_INLINE => REF_LEN,
+                    1 if vlen as usize > MAX_INLINE && vlen as usize <= MAX_VALUE => REF_LEN,
                     0 | 1 => return Err(NodeError::NonCanonicalValue),
                     _ => return Err(NodeError::BadEntry),
                 };
@@ -405,7 +409,8 @@ pub enum BuildError {
     /// Keys must be pushed in strictly increasing order.
     NotSorted,
     KeyTooLong,
-    /// An inline value longer than `MAX_INLINE`: store it by reference.
+    /// An inline value longer than `MAX_INLINE` (store it by reference), or any
+    /// value longer than `MAX_VALUE` (store it as a blob).
     ValueTooLong,
     /// A reference to a value of at most `MAX_INLINE` bytes: store it inline.
     ValueTooShort,
@@ -498,6 +503,7 @@ impl NodeBuilder {
         match value {
             Value::Inline(b) if b.len() > MAX_INLINE => Err(BuildError::ValueTooLong),
             Value::Ref { len, .. } if *len as usize <= MAX_INLINE => Err(BuildError::ValueTooShort),
+            Value::Ref { len, .. } if *len as usize > MAX_VALUE => Err(BuildError::ValueTooLong),
             _ => Ok(()),
         }
     }
