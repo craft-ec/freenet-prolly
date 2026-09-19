@@ -76,6 +76,26 @@ impl Blocks for Counting<'_> {
 /// comparison leaves the emitted-set check to fail first and mask the walk. The
 /// point of the control is that the walk is the thing that speaks, so nothing
 /// else may be in a position to speak instead.
+///
+/// # The two checks do not subsume each other
+///
+/// With the switch on and NOTHING broken, exactly two tests fail:
+/// `an_edit_behind_a_force_closed_node_rechunks_it` and
+/// `random_edit_sequences_match_a_rebuild_and_a_history_dependent_rule_is_caught`.
+/// That is correct, and it is the clearest statement of what each check is for.
+/// Both of those tests are negative controls that ASSERT the rebuild comparison
+/// catches a broken rule — so silencing it is exactly what they are built to
+/// notice.
+///
+/// The walk proves the result is **a** tree. The rebuild comparison proves it is
+/// **the** tree. A history-dependent split rule and a skipped neighbour re-check
+/// both produce well-formed, internally consistent trees that are simply not the
+/// canonical one for their contents, and the walk accepts every one of them.
+/// C2 is the converse: a forged aggregate is carried identically by the
+/// incremental tree and the rebuild, so the roots agree and only the walk
+/// objects. Neither check is a weaker version of the other, and running this
+/// suite with the switch permanently on would be a real loss of coverage rather
+/// than a stricter mode.
 fn compare_rebuild() -> bool {
     std::env::var_os("PROLLY_NO_REBUILD_COMPARE").is_none()
 }
