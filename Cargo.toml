@@ -1,0 +1,10 @@
+[package]
+name = "freenet-prolly"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "History-independent authenticated sorted map (prolly tree). Pure library: no network, no clock."
+
+[dependencies]
+blake3 = "1"
