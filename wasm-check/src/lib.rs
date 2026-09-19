@@ -200,3 +200,84 @@ pub extern "C" fn empty_final_page_ok(n: u32) -> i32 {
     }
     1
 }
+
+// ------------------------------------------------------------- parity ------
+//
+// The parity code, recomputed HERE rather than shared with the native test:
+// the two meet only in `tests/vectors.txt`, which is what makes the file a
+// check of the target and not of a helper both sides call.
+
+/// Members of unequal length, each a plausible block state (`kind ‖ body`).
+/// Deliberately the same construction as the native side — a different one
+/// would prove nothing about the target.
+fn parity_members(k: usize) -> Vec<Vec<u8>> {
+    (0..k)
+        .map(|i| {
+            let len = 1 + i * i * 8 + i * 8;
+            let mut s = Vec::with_capacity(1 + len);
+            s.push(if i % 2 == 0 {
+                freenet_prolly::kind::RAW
+            } else {
+                freenet_prolly::kind::TREE_NODE
+            });
+            s.extend((0..len).map(|b| (b as u8).wrapping_mul(i as u8 + 3)));
+            s
+        })
+        .collect()
+}
+
+/// The three parity ids of the frozen group, concatenated: 96 bytes.
+#[no_mangle]
+pub extern "C" fn parity_ids(k: u32) -> *const u8 {
+    use freenet_prolly::parity::encode_group;
+    let states = parity_members(k as usize);
+    let parity = encode_group(&states).expect("a codeable group");
+    let mut out = Vec::with_capacity(96);
+    for p in &parity {
+        out.extend_from_slice(&freenet_prolly::block_id(freenet_prolly::kind::PARITY, p));
+    }
+    leak(out)
+}
+
+/// The padded symbol width of the frozen group.
+#[no_mangle]
+pub extern "C" fn parity_width(k: u32) -> u32 {
+    freenet_prolly::parity::group_width(&parity_members(k as usize)) as u32
+}
+
+/// Every way to lose three of the `k + 3`, rebuilt, digested — the claim
+/// "anyone can repair without a key" has to hold on THIS target too, not only
+/// on the one the vectors were generated on.
+#[no_mangle]
+pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
+    use freenet_prolly::parity::{encode_group, group_width, repair_group, symbol};
+    use freenet_prolly::rs::PARITY;
+    let k = k as usize;
+    let states = parity_members(k);
+    let width = group_width(&states);
+    let parity = encode_group(&states).expect("a codeable group");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s, width))
+        .chain(parity.iter().cloned())
+        .collect();
+    let n = k + PARITY;
+    let mut h = blake3::Hasher::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            for c in b + 1..n {
+                let have: Vec<Option<Vec<u8>>> = (0..n)
+                    .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
+                    .collect();
+                let got = repair_group(k, &have).expect("k of k+3 present");
+                // If a rebuild differs here, the digest differs and the driver
+                // says so — but assert too, so the failure names the case.
+                assert!(got == states, "repair differs on wasm32");
+                for s in &got {
+                    h.update(s);
+                }
+            }
+        }
+    }
+    leak(h.finalize().as_bytes().to_vec())
+}

@@ -7,7 +7,8 @@
 //!   flags   u8          reserved, must be 0
 //!   count   u16         entries
 //!   agg     count:u64 ‖ bytes:u64     this subtree
-//!   pcount  u16         parity cids (branch only)
+//!   pcount  u16         parity cids: 3 per sibling group (branch: children;
+//!                       leaf: referenced values)
 //!   plen    u16         length of the shared key prefix
 //! prefix [u8; plen]     the longest common prefix of every key in the node
 //! offs   [u16; count]   offset of each entry from the start of the node
@@ -51,6 +52,19 @@ pub const MAX_VALUE: usize = 256 * 1024;
 const LEAF_FIXED: usize = 2 + 1 + 4;
 const BRANCH_FIXED: usize = 2 + 32 + 16;
 const REF_LEN: usize = 32;
+
+/// The most parity cids the reserve can hold: 4 KiB of 32-byte ids.
+///
+/// A cheap bound at PARSE time, before the entries are read. The EXACT count is
+/// a pure function of the entries and is checked in
+/// [`check_node`](crate::boundary::check_node) — but a node claiming more
+/// parity than could ever fit must be refused before its entries are walked,
+/// or the region is a place to hang bytes that cost a reader work to reach.
+pub const MAX_PCOUNT: usize = (MAX_NODE - MAX_LOGICAL_RESERVE) / REF_LEN;
+/// The entries' hard limit, restated here so `MAX_PCOUNT` does not depend on
+/// `boundary`, which depends on this module. Asserted equal to
+/// [`crate::boundary::MAX_LOGICAL`] there.
+const MAX_LOGICAL_RESERVE: usize = 12 * 1024;
 
 /// Rolled-up statistics of a subtree. Per-type counts need no extra fields:
 /// keys are type-prefixed, so a range aggregate yields them.
@@ -121,7 +135,8 @@ pub enum NodeError {
     TooLarge,
     BadMagic,
     BadFlags,
-    /// A leaf carries parity, or a field is inconsistent with the level.
+    /// A field is inconsistent with the level, or the parity region is larger
+    /// than the reserve can hold.
     BadShape,
     OffsetOutOfRange,
     /// Entries do not tile the entry region exactly.
@@ -200,7 +215,11 @@ impl<'a> Node<'a> {
         };
         let pcount = u16_at(bytes, 24);
         let plen = u16_at(bytes, 26);
-        if level == 0 && pcount != 0 {
+        // A LEAF may carry parity now: it protects the values stored by
+        // reference (#19). What `pcount` must EQUAL is a boundary-rule question
+        // — it is a pure function of the entries, so it needs them parsed —
+        // and lives in `check_node`. Here only the region's size is decided.
+        if pcount > MAX_PCOUNT {
             return Err(NodeError::BadShape);
         }
         // A branch with no children is meaningless; an empty leaf is the empty tree.

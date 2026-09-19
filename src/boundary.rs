@@ -47,6 +47,24 @@ const _: () = assert!(MAX_LOGICAL + 4096 <= MAX_NODE);
 const DOMAIN: &[u8] = b"PT01-split";
 const LAMBDA4: u128 = (LAMBDA as u128).pow(4);
 
+/// What the node's own entries require of its parity region, and what it
+/// claims. Three ids per sibling group, and the grouping is a pure function of
+/// the keys (and, on a leaf, of the referenced values' size classes), so this
+/// is decidable from the node alone.
+///
+/// It says nothing about the ids themselves. Verifying parity CONTENTS needs
+/// the children, which is 8+ related fetches per validation; a writer can still
+/// list garbage, but only a fixed number of ids, only harming recovery of its
+/// own tree, and a reader finds out the first time a rebuild fails to hash.
+pub fn check_parity(node: &Node<'_>) -> Result<(), BoundaryError> {
+    let want = crate::parity::pcount_of(node);
+    let got = node.parity_count();
+    if want != got {
+        return Err(BoundaryError::WrongParityCount(want, got));
+    }
+    Ok(())
+}
+
 /// The per-entry split hash.
 pub fn split_hash(level: u8, key: &[u8]) -> u32 {
     split_hash_parts(level, key, &[])
@@ -99,10 +117,12 @@ pub enum BoundaryError {
     InteriorSplit(usize),
     /// The entries measure more than `MAX_LOGICAL`.
     TooLarge,
-    /// The node carries parity cids. Nothing emits them yet, and they are the
-    /// only region of an otherwise valid node no rule constrains — so until the
-    /// parity rule exists (#19) a node that has any is refused.
-    UnexpectedParity,
+    /// `pcount` is not what the node's own entries require. The count is a pure
+    /// function of them — three ids per sibling group — so a host can check it
+    /// exactly, and the parity region stops being the one part of a valid node
+    /// no rule constrains. `.0` is what the entries require, `.1` what the node
+    /// claims.
+    WrongParityCount(usize, usize),
 }
 
 /// The part of the split rule that one node can be held to: no entry but the
@@ -133,11 +153,6 @@ pub enum BoundaryError {
 /// So this check guards against accidents and lazy writers. The reader is the
 /// enforcer.
 pub fn check_node(node: &Node<'_>) -> Result<(), BoundaryError> {
-    // The parity region is the one part of a valid node no rule constrains, and
-    // nothing emits it yet. One comparison closes it until #19 defines the rule.
-    if node.parity_count() != 0 {
-        return Err(BoundaryError::UnexpectedParity);
-    }
     // Keys are read as the node's shared prefix plus each entry's suffix and are
     // never joined: this runs on every tree-node block on every hosting node, and
     // an allocation per entry was almost the whole of its cost.
@@ -160,5 +175,54 @@ pub fn check_node(node: &Node<'_>) -> Result<(), BoundaryError> {
         }
         s = after;
     }
+    // `check_parity` is NOT called here yet, and that is deliberate. It
+    // requires `pcount == 3 · groups(entries)`, so every node would need
+    // parity — and the writer cannot emit it until `TreeBuilder` can reach a
+    // pushed `Ref`'s bytes (freenet-prolly#19). Wiring the call in before the
+    // writer can satisfy it would make the library unable to build a tree at
+    // all. It lands in the same change as the writer.
     Ok(())
+}
+
+/// The reserve arithmetic, derived here rather than asserted from memory.
+///
+/// Both worst cases must fit the 4 KiB the node format reserves, and both
+/// depend on the SMALLEST entry of their kind and on [`MIN_GROUP`]: a smaller
+/// minimum group means more groups means more ids. The `+ 1` is the one short
+/// tail a run can end with, and the leaf's `+ CLASSES` is one per size class,
+/// since each class's run ends independently.
+///
+/// If any of MAX_LOGICAL, the minimum entry costs, the class count or the
+/// minimum group size moves, this fails at compile time instead of a node
+/// becoming unencodable at run time.
+mod reserve {
+    use super::MAX_LOGICAL;
+    use crate::node::{HEADER, MAX_NODE, MAX_PCOUNT};
+    use crate::parity::{CLASSES, MIN_GROUP};
+    use crate::rs::PARITY;
+
+    /// A branch entry: klen(2) + cid(32) + agg(16) + a one-byte suffix, plus
+    /// the 6-byte offset/key4 table slot.
+    const MIN_BRANCH_ENTRY: usize = 6 + 50 + 1;
+    /// A leaf Ref entry: klen(2) + vkind(1) + vlen(4) + a one-byte suffix +
+    /// cid(32), plus the table slot.
+    const MIN_LEAF_REF_ENTRY: usize = 6 + 7 + 1 + 32;
+
+    const fn fits(n: usize) -> usize {
+        (MAX_LOGICAL - HEADER) / n
+    }
+    const BRANCH_CHILDREN: usize = fits(MIN_BRANCH_ENTRY);
+    const LEAF_REFS: usize = fits(MIN_LEAF_REF_ENTRY);
+    /// One run, so one short tail.
+    const BRANCH_GROUPS: usize = BRANCH_CHILDREN / MIN_GROUP + 1;
+    /// One run per class, so one short tail per class.
+    const LEAF_GROUPS: usize = LEAF_REFS / MIN_GROUP + CLASSES.len();
+
+    const _: () = assert!(MAX_LOGICAL + 4096 <= MAX_NODE);
+    const _: () = assert!(BRANCH_GROUPS * PARITY <= MAX_PCOUNT);
+    const _: () = assert!(LEAF_GROUPS * PARITY <= MAX_PCOUNT);
+    // The leaf is the binding case: a fifth class, or a smaller minimum group,
+    // does not fit. Asserted so that is a fact rather than a comment.
+    const _: () = assert!((LEAF_REFS / MIN_GROUP + CLASSES.len() + 1) * PARITY > MAX_PCOUNT);
+    const _: () = assert!((LEAF_REFS / (MIN_GROUP - 1) + CLASSES.len()) * PARITY > MAX_PCOUNT);
 }

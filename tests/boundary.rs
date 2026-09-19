@@ -484,6 +484,11 @@ fn frozen_vectors() {
         let (nodes, bytes, hash) = range_proof_vector(n);
         got += &format!("rproof {n} {nodes} {bytes} {}\n", hex(&hash));
     }
+    // Parity vectors are HELD until the canonical form of a parity block is
+    // settled (trailing-zero trimming, freenet-prolly#19): freezing them now
+    // would freeze bytes that are about to change. The computation is written
+    // and exercised by `the_parity_code_is_deterministic_and_repairs`; only the
+    // freezing waits.
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -620,11 +625,12 @@ fn the_two_slice_split_hash_is_the_same_hash() {
     assert!(checked > 20_000);
 }
 
-/// A node carrying parity is refused until #19 defines the rule for it: it is
-/// the one region of an otherwise valid node that nothing constrains.
+/// `pcount` is now a pure function of the entries, so a node carrying the wrong
+/// amount of parity is refused and one carrying the right amount is not. That
+/// closes the one region of an otherwise valid node nothing used to constrain.
 #[test]
-fn a_node_with_parity_is_refused_and_the_same_node_without_it_is_not() {
-    use freenet_prolly::boundary::{check_node, BoundaryError};
+fn a_node_with_the_wrong_parity_count_is_refused_and_the_right_one_is_not() {
+    use freenet_prolly::boundary::{check_node, check_parity, BoundaryError};
     use freenet_prolly::node::Agg;
     let build = |parity: usize| {
         let mut b = NodeBuilder::branch(1);
@@ -644,19 +650,32 @@ fn a_node_with_parity_is_refused_and_the_same_node_without_it_is_not() {
         }
         b.finish().unwrap()
     };
-    // The control: the same node with no parity is accepted, so the refusal is
-    // about the parity and not about the node.
-    let clean = build(0);
-    let n = Node::parse(&clean).unwrap();
-    assert_eq!(n.parity_count(), 0);
+    // Four children is one group, so the node requires exactly 3 parity ids.
+    let probe = build(3);
+    let want = freenet_prolly::parity::pcount_of(&Node::parse(&probe).expect("parses"));
+    assert_eq!(want, 3, "four children are one group");
+
+    // The control: the right count is accepted, so the refusals below are about
+    // the COUNT and not about parity being rejected wholesale.
+    let right = build(want);
+    let n = Node::parse(&right).expect("a node with parity is well-formed");
+    assert_eq!(n.parity_count(), want);
+    assert_eq!(check_parity(&n), Ok(()));
+    // `check_node` does not call it yet — see the note there — so the node
+    // passes the entry checks whatever its parity says.
     assert_eq!(check_node(&n), Ok(()));
 
-    for parity in [1usize, 3] {
+    for parity in [0usize, 1, 2, 4, 6] {
         let bytes = build(parity);
-        // It PARSES — parity is a legal part of the format — and is refused here.
+        // It PARSES — the region's size is all `parse` decides — and the count
+        // is settled here, where the entries are known.
         let n = Node::parse(&bytes).expect("a node with parity is well-formed");
         assert_eq!(n.parity_count(), parity);
-        assert_eq!(check_node(&n), Err(BoundaryError::UnexpectedParity));
+        assert_eq!(
+            check_parity(&n),
+            Err(BoundaryError::WrongParityCount(want, parity)),
+            "{parity} ids where {want} are required"
+        );
     }
 }
 
@@ -860,4 +879,117 @@ fn range_proof_vector(n: usize) -> (usize, usize, [u8; 32]) {
     assert_eq!(page.entries.len(), 32);
     let bytes = p.encode();
     (p.nodes.len(), bytes.len(), *blake3::hash(&bytes).as_bytes())
+}
+
+/// The parity code, frozen to the byte.
+///
+/// "Parity is a pure function of the children" is what makes it deduplicate,
+/// verifiable by plain hash, and repairable by anyone without a key — and it is
+/// only true if two implementations produce identical bytes. These vectors are
+/// the evidence: computed here and again in `wasm-check`, meeting only in
+/// `tests/vectors.txt`, so they check the TARGET rather than a shared helper.
+///
+/// `k = 1` is the degenerate group (three different scalar multiples of one
+/// symbol), `k = 12` the largest the grouping rule can make, and the lengths
+/// are deliberately unequal so the padding and the length prefix are exercised
+/// rather than skipped.
+pub fn parity_vector(k: usize) -> (usize, [Cid; 3]) {
+    use freenet_prolly::parity::{encode_group, group_width};
+    let states = parity_members(k);
+    let parity = encode_group(&states).expect("a codeable group");
+    let ids = [
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[0]),
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[1]),
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[2]),
+    ];
+    (group_width(&states), ids)
+}
+
+/// Deterministic members of unequal length, each a plausible block state
+/// (`kind ‖ body`).
+pub fn parity_members(k: usize) -> Vec<Vec<u8>> {
+    (0..k)
+        .map(|i| {
+            // Lengths 1, 17, 49, 97, … — no two alike, and none a multiple of
+            // the others, so a padding bug cannot cancel out.
+            let len = 1 + i * i * 8 + i * 8;
+            let mut s = Vec::with_capacity(1 + len);
+            s.push(if i % 2 == 0 {
+                freenet_prolly::kind::RAW
+            } else {
+                freenet_prolly::kind::TREE_NODE
+            });
+            s.extend((0..len).map(|b| (b as u8).wrapping_mul(i as u8 + 3)));
+            s
+        })
+        .collect()
+}
+
+/// Every way to lose three of the `k + 3`, rebuilt, digested. This is what
+/// says a repairer on another target gets the same bytes back — the claim
+/// "anyone can repair without a key" rests on it.
+pub fn parity_repair_digest(k: usize) -> [u8; 32] {
+    use freenet_prolly::parity::{encode_group, group_width, repair_group, symbol};
+    use freenet_prolly::rs::PARITY;
+    let states = parity_members(k);
+    let width = group_width(&states);
+    let parity = encode_group(&states).expect("a codeable group");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s, width))
+        .chain(parity.iter().cloned())
+        .collect();
+    let n = k + PARITY;
+    let mut h = blake3::Hasher::new();
+    let mut cases = 0usize;
+    for a in 0..n {
+        for b in a + 1..n {
+            for c in b + 1..n {
+                let have: Vec<Option<Vec<u8>>> = (0..n)
+                    .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
+                    .collect();
+                let got = repair_group(k, &have).expect("k of k+3 present");
+                assert_eq!(got, states, "k = {k}: lost {a},{b},{c}");
+                for s in &got {
+                    h.update(s);
+                }
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cases,
+        n * (n - 1) * (n - 2) / 6,
+        "k = {k}: combinations missed"
+    );
+    *h.finalize().as_bytes()
+}
+
+/// The parity code end to end, without freezing its bytes yet.
+///
+/// The vectors wait on the canonical form of a parity block, but nothing about
+/// determinism or repair does — and a test that only runs when the bytes are
+/// frozen would leave the code unexercised in the meantime.
+#[test]
+fn the_parity_code_is_deterministic_and_repairs() {
+    for k in [1usize, 7, 12] {
+        let (width, ids) = parity_vector(k);
+        assert_eq!(parity_vector(k), (width, ids), "k = {k}: not deterministic");
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2],
+            "k = {k}: parity ids repeat"
+        );
+        let states = parity_members(k);
+        assert_eq!(width, 4 + states.iter().map(|s| s.len()).max().unwrap());
+        // Every way to lose three, rebuilt and compared — the assertion lives
+        // inside the digest helper, which also counts the combinations.
+        let _ = parity_repair_digest(k);
+    }
+    // The members really are of unequal length, or padding is never exercised.
+    let states = parity_members(12);
+    let mut lens: Vec<usize> = states.iter().map(|s| s.len()).collect();
+    let before = lens.len();
+    lens.sort_unstable();
+    lens.dedup();
+    assert_eq!(lens.len(), before, "the members must differ in length");
 }
