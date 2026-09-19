@@ -16,7 +16,7 @@
 use crate::boundary::{self, MAX_LOGICAL};
 use crate::chunk::{empty_leaf, Body, Closed, LevelChunker, SplitRule};
 use crate::cursor::LevelCursor;
-use crate::node::{Agg, BuildError, HEADER, MAX_INLINE, MAX_KEY};
+use crate::node::{Agg, BuildError, Node, HEADER, MAX_INLINE, MAX_KEY};
 use crate::store::{load, load_child, Blocks, ReadError};
 use crate::{block_id, kind, Cid};
 use std::collections::{BTreeMap, HashSet};
@@ -57,8 +57,9 @@ impl From<BuildError> for ApplyError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     pub root: Cid,
-    /// Tree nodes of the old tree that the new tree no longer uses. (Value
-    /// blocks are not listed: another key may hold the same value.)
+    /// Tree nodes of the old tree that the new tree no longer uses. A hint for
+    /// caches and retention, never a delete list: another tree may still use
+    /// them. (Value blocks are not listed: another key may hold the same value.)
     pub replaced: Vec<Cid>,
 }
 
@@ -142,6 +143,11 @@ fn rewrite_level<B: Blocks>(
         let last_streamed = res.old.last().map(|(id, _)| *id);
         if opts.recheck_neighbour && !cur.node().is_empty() && cur.node().key(0) == edits[i].0 {
             if let Some((prev, agg)) = cur.prev_info()? {
+                // A run stops only when the chunker is clean, and it is clean only
+                // after a CONTENT close (a forced close happens before the next
+                // push, so a to-be-forced node is still open at the end of an old
+                // node's entries). So if the node before is where the last run
+                // stopped, it was not closed by the limit.
                 let safe = Some(prev) == last_streamed || (floor == 0 && leaf_was_not_forced(agg));
                 if !safe {
                     cur.retreat()?;
@@ -241,6 +247,10 @@ fn nodes_above<B: Blocks>(blocks: &B, root: &Cid, floor: u8) -> Result<Vec<Cid>,
 /// New blocks go to `sink` only if the whole batch succeeds. An edit that
 /// changes nothing (the same value again, a delete of an absent key) costs
 /// nothing: same root, nothing emitted.
+///
+/// On [`ReadError::Need`] the caller fetches and calls again with the same
+/// arguments, so `(root, edits)` must fit whatever the caller can keep between
+/// calls; the library sets no byte limit of its own.
 pub fn apply<B: Blocks>(
     blocks: &B,
     root: &Cid,
@@ -354,7 +364,33 @@ pub fn apply_with<B: Blocks>(
         floor = floor.checked_add(1).ok_or(BuildError::Overflow)?;
     }
 
-    // 5. Success: hand over what is new, children before parents.
+    // 5. The root is the LOWEST level with exactly one node. A level can end up
+    // with one node that no edit touched (everything around it was deleted);
+    // the levels above then shrink to branches with a single child, which a
+    // rebuild would never make. A real root branch has at least two children,
+    // so: while the root is a single-child branch, the child is the root.
+    // (Only the root: the last node of a lower level may hold one child.)
+    loop {
+        let bytes = match new_nodes.iter().find(|n| n.cid == new_root) {
+            Some(n) => n.bytes.as_slice(),
+            None => blocks
+                .get(&new_root)
+                .ok_or_else(|| ReadError::Need(vec![new_root]))?,
+        };
+        let node = Node::parse(bytes).map_err(|e| ReadError::Corrupt(new_root, e))?;
+        if node.is_leaf() || node.len() != 1 {
+            break;
+        }
+        let dropped = new_root;
+        new_root = node.child(0).0;
+        let before = new_nodes.len();
+        new_nodes.retain(|n| n.cid != dropped);
+        if new_nodes.len() == before {
+            old_ids.push(dropped); // an old node, no longer part of the tree
+        }
+    }
+
+    // 6. Success: hand over what is new, children before parents.
     let old: HashSet<Cid> = old_ids.iter().copied().collect();
     let mut sent: HashSet<Cid> = HashSet::new();
     for (cid, bytes) in value_blocks {

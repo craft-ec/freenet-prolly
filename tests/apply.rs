@@ -660,3 +660,55 @@ fn any_edit_order_reaches_the_same_root() {
     assert_eq!(roots[0], scratch(splits_after, &target).0);
     assert!(roots.iter().all(|r| *r == roots[0]));
 }
+
+/// A level can shrink to one node that the batch never touched: everything else
+/// is deleted. The survivor itself is then the root — not a branch holding it.
+#[test]
+fn deleting_everything_but_an_untouched_node_makes_that_node_the_root() {
+    let keep_leaf = |n: usize, which: &dyn Fn(usize) -> usize| {
+        let base: Map = dataset(3, n).into_iter().collect();
+        let lv = leaves(&base);
+        let (lo, hi) = lv[which(lv.len())].clone();
+        let batch: Vec<_> = base
+            .keys()
+            .filter(|k| **k < lo || **k > hi)
+            .map(|k| del(k))
+            .collect();
+        let mut m = base.clone();
+        let r = try_check(Options::default(), &mut m, batch);
+        (lv.len(), r.map(|_| ()))
+    };
+    let mut failures = 0;
+    for (n, name, which) in [
+        (200usize, "first", &(|_| 0usize) as &dyn Fn(usize) -> usize),
+        (200, "last", &|len| len - 1),
+        (6000, "#40", &|_| 40usize),
+        (30_000, "#700", &|_| 700usize),
+    ] {
+        let (leaves, r) = keep_leaf(n, which);
+        println!("n={n} leaves={leaves} keep={name}: {r:?}");
+        failures += r.is_err() as usize;
+    }
+    assert_eq!(failures, 0);
+    // One level up: keep one whole level-1 subtree of a height-3 tree.
+    let base: Map = dataset(3, 30_000).into_iter().collect();
+    let (_, nodes) = scratch(splits_after, &base);
+    let mut level1: Vec<Vec<u8>> = nodes
+        .0
+        .values()
+        .map(|b| Node::parse(b).unwrap())
+        .filter(|n| n.level() == 1)
+        .map(|n| n.key(0))
+        .collect();
+    level1.sort();
+    assert!(level1.len() > 8, "the tree has a level above level 1");
+    let (lo, hi) = (level1[3].clone(), level1[4].clone());
+    let batch: Vec<_> = base
+        .keys()
+        .filter(|k| **k < lo || **k >= hi)
+        .map(|k| del(k))
+        .collect();
+    let mut m = base.clone();
+    try_check(Options::default(), &mut m, batch).unwrap();
+    assert!(m.len() > 100);
+}

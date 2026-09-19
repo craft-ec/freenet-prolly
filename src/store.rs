@@ -11,8 +11,12 @@ use crate::node::{Node, NodeError};
 use crate::Cid;
 use std::collections::HashMap;
 
-/// A source of blocks by content id. An implementation MUST only return bytes
-/// whose BLAKE3 hash is `cid` (hash-keyed storage gives this for free).
+/// A source of blocks by id. An implementation MUST only return a body whose
+/// [`block_id`](crate::block_id) for its kind is `cid` (hash-keyed storage gives
+/// this for free). `get` lends bytes that live as long as the source, so a
+/// source is a map of blocks already in memory — not a lazy fetcher: what is
+/// missing is reported as [`ReadError::Need`], fetched by the caller, added to
+/// the map, and the operation is run again.
 pub trait Blocks {
     fn get(&self, cid: &Cid) -> Option<&[u8]>;
 }
