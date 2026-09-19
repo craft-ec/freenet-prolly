@@ -2,6 +2,8 @@
 
 #[path = "common/dataset.rs"]
 mod common;
+#[path = "common/invariants.rs"]
+mod invariants;
 use common::{dataset, rng};
 
 use freenet_prolly::aggregate::{aggregate, aggregate_verified, fraud, AggError};
@@ -25,6 +27,7 @@ fn build(m: &Map) -> (Cid, MemBlocks) {
         .map(|(k, v)| (k.clone(), Edit::Put(v.clone())))
         .collect();
     let root = apply_into(&mut blocks, &root, &edits).unwrap().root;
+    invariants::check_tree(&blocks, &root, m).unwrap();
     (root, blocks)
 }
 
