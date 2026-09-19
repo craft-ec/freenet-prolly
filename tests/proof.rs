@@ -550,3 +550,163 @@ fn proving_from_a_cold_store_costs_the_path() {
     assert_eq!(fetched, h - 1);
     println!("cold prove: {rounds} rounds, {fetched} blocks, height {h}");
 }
+
+/// The nodes an aggregate proof must contain, worked out from the SPANS alone:
+/// the root, and every node that straddles a bound of the range (a node wholly
+/// inside contributes its recorded aggregate and is never opened; one wholly
+/// outside is not looked at). Computed from a plain walk of the store, with no
+/// reference to how `aggregate` traverses anything.
+fn expected_aggregate_nodes(store: &MemBlocks, root: &Cid, r: &Range) -> Vec<Vec<u8>> {
+    fn span(store: &MemBlocks, id: &Cid) -> (Vec<u8>, Vec<u8>) {
+        let n = Node::parse(&store.0[id]).unwrap();
+        if n.is_leaf() {
+            return (n.key(0), n.key(n.len() - 1));
+        }
+        (
+            span(store, &n.child(0).0).0,
+            span(store, &n.child(n.len() - 1).0).1,
+        )
+    }
+    fn walk(store: &MemBlocks, id: &Cid, r: &Range, out: &mut Vec<Vec<u8>>) {
+        out.push(store.0[id].clone());
+        let n = Node::parse(&store.0[id]).unwrap();
+        if n.is_leaf() {
+            return;
+        }
+        for i in 0..n.len() {
+            let child = n.child(i).0;
+            let (lo, hi) = span(store, &child);
+            let wholly_in = in_r(&lo, r) && in_r(&hi, r);
+            let wholly_out = !in_r(&lo, r) && !in_r(&hi, r) && {
+                // Entirely on one side of the range.
+                let below = match &r.lo {
+                    std::ops::Bound::Unbounded => false,
+                    std::ops::Bound::Included(k) => hi < *k,
+                    std::ops::Bound::Excluded(k) => hi <= *k,
+                };
+                let above = match &r.hi {
+                    std::ops::Bound::Unbounded => false,
+                    std::ops::Bound::Included(k) => lo > *k,
+                    std::ops::Bound::Excluded(k) => lo >= *k,
+                };
+                below || above
+            };
+            if !wholly_in && !wholly_out {
+                walk(store, &child, r, out);
+            }
+        }
+    }
+    fn in_r(k: &[u8], r: &Range) -> bool {
+        let lo = match &r.lo {
+            std::ops::Bound::Unbounded => true,
+            std::ops::Bound::Included(x) => k >= x.as_slice(),
+            std::ops::Bound::Excluded(x) => k > x.as_slice(),
+        };
+        let hi = match &r.hi {
+            std::ops::Bound::Unbounded => true,
+            std::ops::Bound::Included(x) => k <= x.as_slice(),
+            std::ops::Bound::Excluded(x) => k < x.as_slice(),
+        };
+        lo && hi
+    }
+    let mut out = Vec::new();
+    walk(store, root, r, &mut out);
+    // The format's order, stated here independently of the library: level
+    // descending, then first key ascending.
+    out.sort_by_key(|b| {
+        let n = Node::parse(b).unwrap();
+        (std::cmp::Reverse(n.level()), n.key(0))
+    });
+    out
+}
+
+/// An aggregate proof's BYTES are fixed by the format, not by the order
+/// `aggregate` happens to walk in.
+#[test]
+fn an_aggregate_proofs_bytes_are_what_the_format_says() {
+    let (blocks, root, m) = tree(20_000);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut checked = 0;
+    for (what, r) in [
+        ("the whole tree", Range::default()),
+        ("a prefix", Range::prefix(b"d/")),
+        ("another prefix", Range::prefix(b"e/")),
+        (
+            "a window",
+            Range {
+                lo: std::ops::Bound::Included(keys[4_000].clone()),
+                hi: std::ops::Bound::Included(keys[15_000].clone()),
+                ..Range::default()
+            },
+        ),
+        (
+            "an open-ended window",
+            Range {
+                lo: std::ops::Bound::Included(keys[18_000].clone()),
+                ..Range::default()
+            },
+        ),
+    ] {
+        let p = prove_aggregate(&blocks, &root, &r).unwrap();
+        let want = expected_aggregate_nodes(&blocks, &root, &r);
+        assert_eq!(p.nodes, want, "{what}: the node list is not the format's");
+        verify_aggregate(&root, &r, &p).unwrap();
+        checked += 1;
+    }
+    assert_eq!(checked, 5);
+
+    // And the order rule is enforced, not merely produced: the same blocks in
+    // any other order are refused.
+    let r = Range::prefix(b"d/");
+    let p = prove_aggregate(&blocks, &root, &r).unwrap();
+    assert!(
+        p.nodes.len() >= 3,
+        "the case must have something to reorder"
+    );
+    let mut swapped = p.clone();
+    let n = swapped.nodes.len();
+    swapped.nodes.swap(n - 2, n - 1);
+    assert_eq!(
+        verify_aggregate(&root, &r, &swapped),
+        Err(ProofError::OutOfOrder)
+    );
+}
+
+/// A proof carrying blocks that were never read is refused even though the
+/// ANSWER it would give is correct.
+///
+/// This is the set rule on its own, and reaching it takes care: extra blocks
+/// usually trip the shape gate first (too many for the tree's height), and a
+/// proof verified for a key it was not built for trips `Incomplete` first. The
+/// one-node absence proof against a tall tree clears both — riders fit under
+/// the count bound, and the read stops at the root — so nothing but the set
+/// rule stands between this and acceptance.
+#[test]
+fn blocks_that_were_never_read_are_refused_although_the_answer_is_right() {
+    let (blocks, root, m) = tree(20_000);
+    let h = height(&blocks, &root);
+    assert!(h >= 4, "the tree must be tall enough for riders to fit");
+    let mut below = m.keys().next().unwrap().clone();
+    below.insert(0, 0x00);
+
+    let honest = prove(&blocks, &root, &below).unwrap();
+    assert_eq!(honest.nodes.len(), 1);
+    assert_eq!(verify(&root, &below, &honest).unwrap(), Proven::Absent);
+
+    // Valid nodes of this very tree, riding along unread.
+    let path = prove(&blocks, &root, m.keys().nth(500).unwrap()).unwrap();
+    for riders in 1..=3 {
+        let mut nodes = honest.nodes.clone();
+        nodes.extend(path.nodes[1..=riders].iter().cloned());
+        let p = Proof { nodes, value: None };
+        assert!(
+            p.nodes.len() <= h,
+            "the rider proof must clear the shape gate to test the set rule"
+        );
+        assert_eq!(
+            verify(&root, &below, &p),
+            Err(ProofError::Extra),
+            "{riders} unread block(s) must be refused, right answer or not"
+        );
+    }
+}
