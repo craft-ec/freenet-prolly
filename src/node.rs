@@ -368,6 +368,11 @@ impl<'a> Node<'a> {
         )
     }
 
+    /// How many parity cids this node carries.
+    pub fn parity_count(&self) -> usize {
+        self.pcount
+    }
+
     pub fn parity(&self) -> impl Iterator<Item = Cid> + 'a {
         let start = self.bytes.len() - self.pcount * REF_LEN;
         let b = self.bytes;
@@ -510,16 +515,27 @@ impl NodeBuilder {
 
     /// What one entry adds to [`Self::logical_len`].
     pub fn leaf_cost(key: &[u8], value: &Value<'_>) -> usize {
+        Self::leaf_cost_len(key.len(), value)
+    }
+
+    /// [`Self::leaf_cost`] from the key's LENGTH, for a reader that holds the
+    /// key in two pieces and has no reason to join them.
+    pub fn leaf_cost_len(klen: usize, value: &Value<'_>) -> usize {
         let stored = match value {
             Value::Inline(b) => b.len(),
             Value::Ref { .. } => REF_LEN,
         };
-        6 + LEAF_FIXED + key.len() + stored
+        6 + LEAF_FIXED + klen + stored
     }
 
     /// What one child adds to [`Self::logical_len`].
     pub fn child_cost(min_key: &[u8]) -> usize {
-        6 + BRANCH_FIXED + min_key.len()
+        Self::child_cost_len(min_key.len())
+    }
+
+    /// [`Self::child_cost`] from the key's LENGTH.
+    pub fn child_cost_len(klen: usize) -> usize {
+        6 + BRANCH_FIXED + klen
     }
 
     fn admit(

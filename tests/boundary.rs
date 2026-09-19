@@ -575,3 +575,218 @@ fn every_built_node_passes_the_per_node_split_check_and_a_miscut_node_does_not()
     );
     assert!(entries > 500);
 }
+
+/// Feeding BLAKE3 the node's shared prefix and then an entry's suffix must give
+/// the digest of the joined key — that identity is the only reason `check_node`
+/// can avoid building a key per entry, so it is asserted rather than assumed.
+#[test]
+fn the_two_slice_split_hash_is_the_same_hash() {
+    use freenet_prolly::boundary::{split_hash, split_hash_parts, splits_after_parts};
+    let mut r = rng(4242);
+    let mut checked = 0;
+    for _ in 0..2000 {
+        let len = (r() % 40) as usize;
+        let key: Vec<u8> = (0..len).map(|_| r() as u8).collect();
+        // Every possible split of this key, including both empty ends.
+        for cut in 0..=key.len() {
+            let (prefix, suffix) = key.split_at(cut);
+            assert_eq!(
+                split_hash_parts(0, prefix, suffix),
+                split_hash(0, &key),
+                "key {key:?} split at {cut}"
+            );
+            checked += 1;
+        }
+        // And the decision built on it agrees too, at a size where it can fire.
+        let level = r() as u8;
+        let cut = (r() as usize) % (key.len() + 1);
+        let (prefix, suffix) = key.split_at(cut);
+        assert_eq!(
+            splits_after_parts(level, prefix, suffix, 4000, 4300),
+            splits_after(level, &key, 4000, 4300)
+        );
+    }
+    println!("two-slice split hash: {checked} splits identical to the joined key");
+    assert!(checked > 20_000);
+}
+
+/// A node carrying parity is refused until #19 defines the rule for it: it is
+/// the one region of an otherwise valid node that nothing constrains.
+#[test]
+fn a_node_with_parity_is_refused_and_the_same_node_without_it_is_not() {
+    use freenet_prolly::boundary::{check_node, BoundaryError};
+    use freenet_prolly::node::Agg;
+    let build = |parity: usize| {
+        let mut b = NodeBuilder::branch(1);
+        for i in 0..4u8 {
+            b.push_child(
+                &[b'k', i],
+                [i; 32],
+                Agg {
+                    count: 1,
+                    bytes: 10,
+                },
+            )
+            .unwrap();
+        }
+        for i in 0..parity {
+            b.push_parity([0x90 + i as u8; 32]).unwrap();
+        }
+        b.finish().unwrap()
+    };
+    // The control: the same node with no parity is accepted, so the refusal is
+    // about the parity and not about the node.
+    let clean = build(0);
+    let n = Node::parse(&clean).unwrap();
+    assert_eq!(n.parity_count(), 0);
+    assert_eq!(check_node(&n), Ok(()));
+
+    for parity in [1usize, 3] {
+        let bytes = build(parity);
+        // It PARSES — parity is a legal part of the format — and is refused here.
+        let n = Node::parse(&bytes).expect("a node with parity is well-formed");
+        assert_eq!(n.parity_count(), parity);
+        assert_eq!(check_node(&n), Err(BoundaryError::UnexpectedParity));
+    }
+}
+
+/// A third shape: one buffer per NODE rather than one key per entry, so BLAKE3
+/// still sees the key as a single run of bytes. Measured alongside the other two.
+fn check_node_one_buffer(node: &Node<'_>) -> Result<(), ()> {
+    use freenet_prolly::boundary::MAX_LOGICAL;
+    use freenet_prolly::node::{NodeBuilder as NB, HEADER, MAX_KEY};
+    let prefix = node.prefix();
+    let mut key = Vec::with_capacity(MAX_KEY);
+    let mut s = HEADER;
+    for i in 0..node.len() {
+        let suffix = node.suffix(i);
+        key.clear();
+        key.extend_from_slice(prefix);
+        key.extend_from_slice(suffix);
+        let after = s + if node.is_leaf() {
+            NB::leaf_cost_len(key.len(), &node.value(i))
+        } else {
+            NB::child_cost_len(key.len())
+        };
+        if after > MAX_LOGICAL {
+            return Err(());
+        }
+        if i + 1 < node.len() && splits_after(node.level(), &key, s, after) {
+            return Err(());
+        }
+        s = after;
+    }
+    Ok(())
+}
+
+/// The old allocating implementation, kept here so the change can be MEASURED
+/// against it on the same machine rather than argued about.
+fn check_node_allocating(node: &Node<'_>) -> Result<(), ()> {
+    use freenet_prolly::boundary::MAX_LOGICAL;
+    use freenet_prolly::node::HEADER;
+    let mut s = HEADER;
+    for i in 0..node.len() {
+        let key = node.key(i);
+        let after = s + if node.is_leaf() {
+            NodeBuilder::leaf_cost(&key, &node.value(i))
+        } else {
+            NodeBuilder::child_cost(&key)
+        };
+        if after > MAX_LOGICAL {
+            return Err(());
+        }
+        if i + 1 < node.len() && splits_after(node.level(), &key, s, after) {
+            return Err(());
+        }
+        s = after;
+    }
+    Ok(())
+}
+
+/// What the per-entry work actually costs, split into its parts. Printed with
+/// `--nocapture`; the assertion only keeps the measurement honest about what it
+/// measured.
+#[test]
+fn the_cost_of_check_node_measured() {
+    use freenet_prolly::boundary::{check_node, split_hash_parts, MAX_LOGICAL};
+    // The worst case a host can be handed: ~12 KiB of minimum-size entries.
+    let mut b = NodeBuilder::leaf();
+    let mut i = 0u32;
+    loop {
+        let base = b.logical_len();
+        if base + 13 + 6 > MAX_LOGICAL {
+            break;
+        }
+        let Some(key) = (0..200u32)
+            .map(|j| format!("{i:04}{j:02}").into_bytes())
+            .find(|k| !splits_after(0, k, base, base + 13 + k.len()))
+        else {
+            break;
+        };
+        if base + 13 + key.len() > MAX_LOGICAL {
+            break;
+        }
+        b.push(&key, Value::Inline(b"")).unwrap();
+        i += 1;
+    }
+    let entries = b.len();
+    let bytes = b.finish().unwrap();
+    let node = Node::parse(&bytes).unwrap();
+    assert!(entries > 500, "{entries} entries is not the worst case");
+
+    let runs = 500;
+    let time = |mut f: Box<dyn FnMut()>| {
+        for _ in 0..20 {
+            f();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..runs {
+            f();
+        }
+        t.elapsed() / runs
+    };
+
+    let parse = time(Box::new(|| {
+        Node::parse(std::hint::black_box(&bytes)).unwrap();
+    }));
+    let old = time(Box::new(|| {
+        check_node_allocating(std::hint::black_box(&node)).unwrap();
+    }));
+    let new = time(Box::new(|| {
+        check_node(std::hint::black_box(&node)).unwrap();
+    }));
+    // How much of it is BLAKE3: the same hashes, nothing else.
+    let prefix = node.prefix();
+    let hashes = time(Box::new(|| {
+        for i in 0..node.len() {
+            std::hint::black_box(split_hash_parts(0, prefix, node.suffix(i)));
+        }
+    }));
+    let one_buf = time(Box::new(|| {
+        check_node_one_buffer(std::hint::black_box(&node)).unwrap();
+    }));
+    // And how much is the allocation alone.
+    let keys = time(Box::new(|| {
+        for i in 0..node.len() {
+            std::hint::black_box(node.key(i));
+        }
+    }));
+
+    println!(
+        "worst-case node: {entries} entries, {} B (native, opt-level 2)",
+        bytes.len()
+    );
+    println!("  Node::parse                 {parse:?}");
+    println!("  check_node, allocating      {old:?}");
+    println!("  check_node, no allocation   {new:?}");
+    println!("  check_node, one buffer/node {one_buf:?}");
+    println!("  of which BLAKE3 per entry   {hashes:?}");
+    println!("  the allocations alone       {keys:?}");
+    assert!(new < old, "the change must not be slower natively");
+    // The point of the decomposition: hashing, not key handling, is what this
+    // costs. If that ever stops being true the premise of #18 has changed.
+    assert!(
+        hashes > keys * 2,
+        "BLAKE3 {hashes:?} should dominate the key handling {keys:?}"
+    );
+}
