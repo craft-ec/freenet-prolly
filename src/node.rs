@@ -36,7 +36,8 @@ use crate::Cid;
 pub const MAGIC: &[u8; 4] = b"PT01";
 /// Hard cap on an encoded node. The chunker clamps well below this.
 pub const MAX_NODE: usize = 16 * 1024;
-const HEADER: usize = 28;
+/// Encoded size of an empty node.
+pub const HEADER: usize = 28;
 /// Longest key (prefix + suffix). Key *shapes* keep real keys far below this.
 pub const MAX_KEY: usize = 512;
 const LEAF_FIXED: usize = 2 + 1 + 4;
@@ -452,13 +453,42 @@ impl NodeBuilder {
         self.entries.is_empty()
     }
 
-    /// Size of this node with every key stored in full: header + per entry
-    /// (6 B of tables + fixed fields + key + stored value) + parity. It depends
-    /// only on the entries themselves, never on what prefix they happen to share,
-    /// and is an upper bound on the encoded size — which makes it the right
-    /// measure for deciding node boundaries.
+    /// Size of this node with every key stored in full and no parity: header +
+    /// per entry (6 B of tables + fixed fields + key + stored value). It depends
+    /// only on the entries themselves — never on what prefix they happen to
+    /// share, nor on how parity is grouped — which makes it the right measure
+    /// for deciding node boundaries.
     pub fn logical_len(&self) -> usize {
         self.logical
+    }
+
+    /// Upper bound on the encoded size: [`Self::logical_len`] plus parity.
+    pub fn encoded_bound(&self) -> usize {
+        self.logical + self.parity.len() * REF_LEN
+    }
+
+    /// Aggregate of the entries pushed so far.
+    pub fn agg(&self) -> Agg {
+        self.agg
+    }
+
+    /// The first (smallest) key pushed, if any.
+    pub fn min_key(&self) -> Option<&[u8]> {
+        self.entries.first().map(|(k, _)| k.as_slice())
+    }
+
+    /// What one entry adds to [`Self::logical_len`].
+    pub fn leaf_cost(key: &[u8], value: &Value<'_>) -> usize {
+        let stored = match value {
+            Value::Inline(b) => b.len(),
+            Value::Ref { .. } => REF_LEN,
+        };
+        6 + LEAF_FIXED + key.len() + stored
+    }
+
+    /// What one child adds to [`Self::logical_len`].
+    pub fn child_cost(min_key: &[u8]) -> usize {
+        6 + BRANCH_FIXED + min_key.len()
     }
 
     fn admit(
@@ -482,7 +512,7 @@ impl NodeBuilder {
             return Err(BuildError::TooManyEntries);
         }
         let grown = self.logical + 6 + fixed + key.len() + stored;
-        if grown > MAX_NODE {
+        if grown + self.parity.len() * REF_LEN > MAX_NODE {
             return Err(BuildError::NodeTooLarge);
         }
         self.agg = self
@@ -545,11 +575,10 @@ impl NodeBuilder {
         if self.level == 0 {
             return Err(BuildError::WrongKind);
         }
-        if self.parity.len() >= u16::MAX as usize || self.logical + REF_LEN > MAX_NODE {
+        if self.parity.len() >= u16::MAX as usize || self.encoded_bound() + REF_LEN > MAX_NODE {
             return Err(BuildError::NodeTooLarge);
         }
         self.parity.push(cid);
-        self.logical += REF_LEN;
         Ok(())
     }
 
@@ -609,7 +638,9 @@ impl NodeBuilder {
         for c in &self.parity {
             out.extend_from_slice(c);
         }
-        debug_assert!(out.len() <= self.logical && out.len() <= MAX_NODE);
+        debug_assert!(
+            out.len() <= self.logical + self.parity.len() * REF_LEN && out.len() <= MAX_NODE
+        );
         Ok(out)
     }
 }

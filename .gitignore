@@ -2,3 +2,4 @@ target/
 build/*.wasm
 .DS_Store
 node_modules/
+wasm-check/target

@@ -8,3 +8,6 @@ description = "History-independent authenticated sorted map (prolly tree). Pure 
 
 [dependencies]
 blake3 = "1"
+
+[profile.test]
+opt-level = 2
