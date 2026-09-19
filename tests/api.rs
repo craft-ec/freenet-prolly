@@ -4,7 +4,10 @@
 
 #[path = "common/dataset.rs"]
 mod common;
+#[path = "common/invariants.rs"]
+mod invariants;
 use common::{dataset, rng};
+use invariants::check_tree;
 
 use freenet_prolly::apply::{apply, apply_into, ApplyError, Edit};
 use freenet_prolly::build::{empty_root, init, TreeBuilder};
@@ -91,6 +94,7 @@ fn a_refused_batch_leaves_the_store_alone() {
     let mut blocks = MemBlocks::default();
     let root = init(&mut blocks);
     let applied = apply_into(&mut blocks, &root, &edits(&m)).unwrap();
+    check_tree(&blocks, &applied.root, &m).unwrap();
     let before: HashSet<Cid> = blocks.0.keys().copied().collect();
 
     for (what, bad) in [
@@ -166,6 +170,8 @@ fn push_bytes_builds_what_apply_builds() {
         let root = init(&mut applied);
         let incrementally = apply_into(&mut applied, &root, &edits(&m)).unwrap().root;
         assert_eq!(from_scratch, incrementally, "{n} entries");
+        check_tree(&applied, &incrementally, &m).unwrap();
+        check_tree(&built, &from_scratch, &m).unwrap();
 
         // push_bytes also hands the value blocks to the sink, so the built store
         // can serve every value on its own.
@@ -250,6 +256,7 @@ fn the_empty_tree_and_the_height_of_a_real_one() {
         let root = apply_into(&mut blocks, &root.clone(), &edits(&m))
             .unwrap()
             .root;
+        check_tree(&blocks, &root, &m).unwrap();
         let h = height(&blocks, &root).unwrap();
         if seen.last() != Some(&h) {
             seen.push(h);

@@ -4,7 +4,10 @@
 
 #[path = "common/dataset.rs"]
 mod common;
+#[path = "common/invariants.rs"]
+mod invariants;
 use common::{dataset, rng};
+use invariants::check_tree;
 
 use freenet_prolly::apply::{apply_with, Edit, Options};
 use freenet_prolly::boundary::splits_after;
@@ -61,6 +64,20 @@ impl Blocks for Counting<'_> {
         self.reads.borrow_mut().insert(*cid);
         self.inner.get(cid)
     }
+}
+
+/// Is the from-scratch comparison in force? Off under
+/// `PROLLY_NO_REBUILD_COMPARE=1`, which is how the invariant walk is shown to
+/// stand on its own: with the rebuild silenced, a write path that loses a
+/// subtree must still be caught, by the walk and nothing else.
+///
+/// It silences EVERY check derived from a rebuild — the root, the emitted set,
+/// the replaced set and the read budget — because silencing only the root
+/// comparison leaves the emitted-set check to fail first and mask the walk. The
+/// point of the control is that the walk is the thing that speaks, so nothing
+/// else may be in a position to speak instead.
+fn compare_rebuild() -> bool {
+    std::env::var_os("PROLLY_NO_REBUILD_COMPARE").is_none()
 }
 
 fn ids(b: &MemBlocks) -> HashSet<Cid> {
@@ -123,7 +140,8 @@ fn step(
     .map_err(|e| format!("apply failed: {e:?}"))?;
     let reads = counting.reads.into_inner();
 
-    if applied.root != want_root {
+    let rebuild = compare_rebuild();
+    if rebuild && applied.root != want_root {
         return Err("incremental root != from-scratch root".into());
     }
     let (old, new) = (ids(&old_nodes), ids(&new_nodes));
@@ -133,7 +151,7 @@ fn step(
         .map(|(c, _)| *c)
         .collect();
     let want_emitted: HashSet<Cid> = new.difference(&old).copied().collect();
-    if emitted_nodes != want_emitted {
+    if rebuild && emitted_nodes != want_emitted {
         return Err(format!(
             "emitted {} nodes, new∖old is {}",
             emitted_nodes.len(),
@@ -148,7 +166,7 @@ fn step(
     }
     let replaced: HashSet<Cid> = applied.replaced.iter().copied().collect();
     let want_replaced: HashSet<Cid> = old.difference(&new).copied().collect();
-    if replaced != want_replaced {
+    if rebuild && replaced != want_replaced {
         return Err(format!(
             "replaced {} nodes, old∖new is {}",
             replaced.len(),
@@ -208,7 +226,7 @@ fn step(
         .map(|b| Node::parse(b).unwrap())
         .filter(|n| !n.is_leaf() && replaced.contains(&n.child(0).0))
         .count();
-    if stray > (noops + first_key_edits + first_child_replaced) * height {
+    if rebuild && stray > (noops + first_key_edits + first_child_replaced) * height {
         let what: Vec<String> = reads
             .difference(&replaced)
             .filter(|c| !landed.contains(*c))
@@ -246,6 +264,12 @@ fn step(
         store.insert(*c, b);
     }
     *root = applied.root;
+    // The second witness. The comparisons above are all against a from-scratch
+    // rebuild; this one asks whether what we have is a tree, independently of
+    // what a rebuild would have produced. Set PROLLY_NO_REBUILD_COMPARE to turn
+    // the rebuild off and leave the walk holding the gate on its own — that is
+    // the control, and it has to fail on a broken write path.
+    check_tree(store, root, m).map_err(|e| format!("invariant walk: {e}"))?;
     stats.batches += 1;
     stats.edits += batch.len();
     stats.emitted += emitted_nodes.len();
@@ -638,6 +662,11 @@ fn a_cold_edit_resumes_round_by_round_and_emits_only_at_the_end() {
         }
         assert_eq!(applied.root, scratch(splits_after, &m).0);
         assert!(!emitted.is_empty());
+        // The walk needs every block of the NEW tree: what the rounds fetched,
+        // plus what this apply emitted.
+        let mut after = full.clone();
+        emitted.iter().for_each(|(c, b)| after.insert(*c, b));
+        check_tree(&after, &applied.root, &m).unwrap();
         println!(
             "  batch {size:2}: {rounds} rounds, {fetched} blocks fetched, widest round {widest}"
         );
@@ -698,6 +727,7 @@ fn any_edit_order_reaches_the_same_root() {
                 out.iter().for_each(|(c, b)| store.insert(*c, b));
             }
         }
+        check_tree(&store, &root, &target).unwrap();
         roots.push(root);
     }
     assert_eq!(roots[0], scratch(splits_after, &target).0);
@@ -905,6 +935,7 @@ fn twenty_thousand_appends_one_at_a_time() {
                 "diverged at {} entries",
                 m.len()
             );
+            check_tree(&store, &root, &m).unwrap();
             checks += 1;
         }
     }

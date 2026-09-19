@@ -5,7 +5,10 @@
 
 #[path = "common/dataset.rs"]
 mod common;
+#[path = "common/invariants.rs"]
+mod invariants;
 use common::{dataset, rng};
+use invariants::check_tree;
 
 use freenet_prolly::apply::{apply, Edit};
 use freenet_prolly::build::TreeBuilder;
@@ -609,6 +612,7 @@ fn a_page_resumes_into_a_newer_tree() {
                 Edit::Delete => m2.remove(k),
             };
         }
+        check_tree(&store, &root_b, &m2).unwrap();
 
         // Page 2 onwards, on the NEW root, from the same key.
         let rest = Range {
@@ -1095,6 +1099,7 @@ fn value_bytes_checks_what_it_returns() {
         store.insert(*c, b);
     }
     m.insert(key.clone(), big.clone());
+    check_tree(&store, &root, &m).unwrap();
 
     let req = Range {
         lo: Bound::Included(key.clone()),
