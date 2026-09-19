@@ -7,7 +7,7 @@
 
 use crate::boundary;
 use crate::node::{Agg, BuildError, NodeBuilder, Value};
-use crate::{cid, Cid};
+use crate::{block_id, kind, Cid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeError {
@@ -136,7 +136,7 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         };
         let bytes = done.finish()?;
         let child = ChildRef {
-            cid: cid(&bytes),
+            cid: block_id(kind::TREE_NODE, &bytes),
             ..child
         };
         (self.sink)(child.cid, &bytes);

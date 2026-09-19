@@ -461,6 +461,10 @@ fn frozen_vectors() {
         boundary::MAX_LOGICAL,
         MAX_INLINE
     );
+    for (k, body) in [(0u8, &b""[..]), (0, b"value"), (1, b"value")] {
+        let id = freenet_prolly::block_id(k, body);
+        got += &format!("id {k} {} {}\n", hex(body), hex(&id));
+    }
     for n in [0usize, 1, 5000] {
         got += &format!("root {n} {}\n", hex(&build(&dataset(1, n)).0));
     }

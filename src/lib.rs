@@ -5,12 +5,26 @@ pub mod boundary;
 pub mod build;
 pub mod node;
 
-/// Content id of a block: BLAKE3-256 of its bytes.
+/// Id of a block. It is the Block contract's key material, so a child pointer
+/// read from a parent is exactly what fetches the child from the network.
 pub type Cid = [u8; 32];
 
-/// The content id of `bytes`.
-pub fn cid(bytes: &[u8]) -> Cid {
-    *blake3::hash(bytes).as_bytes()
+/// What a block holds. The values are the Block contract's kind bytes and are
+/// part of this format: they are hashed into every id.
+pub mod kind {
+    /// Opaque bytes: a value stored outside its leaf.
+    pub const RAW: u8 = 0;
+    /// A tree node (`PT01`).
+    pub const TREE_NODE: u8 = 1;
+}
+
+/// The id of a block of `kind` holding `body`: `BLAKE3(kind ‖ body)`, which is
+/// the hash of the Block contract's state for it.
+pub fn block_id(kind: u8, body: &[u8]) -> Cid {
+    let mut h = blake3::Hasher::new();
+    h.update(&[kind]);
+    h.update(body);
+    *h.finalize().as_bytes()
 }
 
 #[cfg(test)]
@@ -18,8 +32,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cid_is_deterministic_and_content_bound() {
-        assert_eq!(cid(b"a"), cid(b"a"));
-        assert_ne!(cid(b"a"), cid(b"b"));
+    fn id_is_the_hash_of_the_contract_state() {
+        // Computed the way the contract does: hash of the encoded state.
+        let body = b"PT01 some node bytes";
+        let mut state = vec![kind::TREE_NODE];
+        state.extend_from_slice(body);
+        assert_eq!(
+            block_id(kind::TREE_NODE, body),
+            *blake3::hash(&state).as_bytes()
+        );
+        assert_ne!(block_id(kind::TREE_NODE, body), block_id(kind::RAW, body));
+        assert_ne!(block_id(kind::RAW, body), *blake3::hash(body).as_bytes());
     }
 }
