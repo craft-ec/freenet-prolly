@@ -4,7 +4,7 @@
 //! A move either completes or fails leaving the cursor where it was, so after a
 //! [`ReadError::Need`] the caller supplies the block and simply repeats it.
 
-use crate::node::{Agg, Node};
+use crate::node::{Agg, Node, Value};
 use crate::store::{load, load_child, Blocks, ReadError};
 use crate::Cid;
 
@@ -31,6 +31,25 @@ pub(crate) fn child_for(node: &Node<'_>, key: &[u8]) -> usize {
 }
 
 impl<'a, B: Blocks> LevelCursor<'a, B> {
+    /// A cursor on the LAST node of the floor level.
+    pub fn seek_last(blocks: &'a B, root: &Cid, floor: u8) -> Result<Option<Self>, ReadError> {
+        let node = load(blocks, root)?;
+        if node.level() < floor {
+            return Ok(None);
+        }
+        let mut c = LevelCursor {
+            blocks,
+            floor,
+            path: vec![Step {
+                id: *root,
+                node,
+                taken: 0,
+            }],
+        };
+        c.descend(|n| n.len() - 1)?;
+        Ok(Some(c))
+    }
+
     /// A cursor on the floor-level node that can hold `key`. `None` if the tree
     /// is not that tall.
     pub fn seek(
@@ -166,5 +185,222 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
     /// Ids of every node on the path above the floor node, root first.
     pub fn ancestors(&self) -> impl Iterator<Item = Cid> + '_ {
         self.path[..self.path.len() - 1].iter().map(|s| s.id)
+    }
+}
+
+/// A position at one entry of the tree, and the moves a scan needs.
+///
+/// This is a [`LevelCursor`] at the leaves plus an index. Kept public and
+/// separate from [`range`](crate::range): the per-device overlay (ARCHITECTURE
+/// §5) k-way merges several of these, and it owns its own limit.
+///
+/// Every move is atomic. On [`ReadError::Need`] the cursor is exactly where it
+/// was, so the caller fetches the block and repeats the same call.
+///
+/// Whether a further leaf exists is read from the ancestors, never by loading
+/// it: a scan that has reached the end of its range does not pay for one more
+/// block to discover that.
+pub struct Cursor<'a, B: Blocks> {
+    level: LevelCursor<'a, B>,
+    pos: Pos,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pos {
+    /// On entry `i` of the floor node.
+    At(usize),
+    /// Past the last entry of the tree. The level cursor is on the last leaf.
+    AfterEnd,
+    /// Before the first entry of the tree. The level cursor is on the first leaf.
+    BeforeStart,
+}
+
+impl<'a, B: Blocks> Cursor<'a, B> {
+    /// The first entry with a key ≥ `key`, or past the end if there is none.
+    pub fn seek(blocks: &'a B, root: &Cid, key: &[u8]) -> Result<Self, ReadError> {
+        let level = LevelCursor::seek(blocks, root, 0, key)?.expect("floor 0 always exists");
+        let mut c = Cursor {
+            level,
+            pos: Pos::AfterEnd,
+        };
+        let node = c.level.node();
+        let i = match node.search(key) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        if i < node.len() {
+            c.pos = Pos::At(i);
+            return Ok(c);
+        }
+        // Every entry of this leaf is below `key`. The next leaf's first entry
+        // is the answer — if there is a next leaf, which the ancestors know.
+        if c.level.next_min_key().is_some() {
+            c.level.advance()?;
+            c.pos = if c.level.node().is_empty() {
+                Pos::AfterEnd
+            } else {
+                Pos::At(0)
+            };
+        }
+        Ok(c)
+    }
+
+    /// The last entry with a key < `key`, or before the start if there is none.
+    pub fn seek_before(blocks: &'a B, root: &Cid, key: &[u8]) -> Result<Self, ReadError> {
+        let level = LevelCursor::seek(blocks, root, 0, key)?.expect("floor 0 always exists");
+        let mut c = Cursor {
+            level,
+            pos: Pos::BeforeStart,
+        };
+        let node = c.level.node();
+        let first_ge = match node.search(key) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        if first_ge > 0 {
+            c.pos = Pos::At(first_ge - 1);
+            return Ok(c);
+        }
+        if !c.level.is_first() {
+            c.level.retreat()?;
+            let len = c.level.node().len();
+            c.pos = if len == 0 {
+                Pos::BeforeStart
+            } else {
+                Pos::At(len - 1)
+            };
+        }
+        Ok(c)
+    }
+
+    /// The last entry of the tree, or before the start if it is empty.
+    pub fn seek_last(blocks: &'a B, root: &Cid) -> Result<Self, ReadError> {
+        let level = LevelCursor::seek_last(blocks, root, 0)?.expect("floor 0 always exists");
+        let len = level.node().len();
+        Ok(Cursor {
+            level,
+            pos: if len == 0 {
+                Pos::BeforeStart
+            } else {
+                Pos::At(len - 1)
+            },
+        })
+    }
+
+    /// The entry the cursor is on, if it is on one.
+    pub fn peek(&self) -> Option<(Vec<u8>, Value<'a>)> {
+        match self.pos {
+            Pos::At(i) if i < self.level.node().len() => {
+                Some((self.level.node().key(i), self.level.node().value(i)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Id of the leaf the cursor is on.
+    pub fn leaf(&self) -> Cid {
+        self.level.id()
+    }
+
+    /// Smallest key of the leaf after this one, if there is one. Read from the
+    /// ancestors, so it costs nothing.
+    pub fn next_min_key(&self) -> Option<Vec<u8>> {
+        self.level.next_min_key()
+    }
+
+    /// Smallest key of the leaf the cursor is on. Everything in the leaf BEFORE
+    /// this one is below it, which is how a reverse scan decides it has reached
+    /// the bottom of its range without loading that leaf.
+    pub fn leaf_min_key(&self) -> Option<Vec<u8>> {
+        let n = self.level.node();
+        (!n.is_empty()).then(|| n.key(0))
+    }
+
+    /// Is this the first leaf of the tree?
+    pub fn is_first_leaf(&self) -> bool {
+        self.level.is_first()
+    }
+
+    /// Is the cursor on the last entry of its leaf, so that [`Self::next`] would
+    /// have to load another block?
+    pub fn at_leaf_end(&self) -> bool {
+        matches!(self.pos, Pos::At(i) if i + 1 >= self.level.node().len())
+    }
+
+    /// Is the cursor on the first entry of its leaf, so that [`Self::prev`]
+    /// would have to load another block?
+    pub fn at_leaf_start(&self) -> bool {
+        matches!(self.pos, Pos::At(0))
+    }
+
+    /// Move to the next entry. `false` if there is none, leaving the cursor past
+    /// the end.
+    // Not `Iterator`: a step can fail with the block it needs, and the items
+    // borrow from the source rather than from the cursor.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<bool, ReadError> {
+        match self.pos {
+            Pos::AfterEnd => Ok(false),
+            Pos::BeforeStart => {
+                self.pos = if self.level.node().is_empty() {
+                    Pos::AfterEnd
+                } else {
+                    Pos::At(0)
+                };
+                Ok(!matches!(self.pos, Pos::AfterEnd))
+            }
+            Pos::At(i) if i + 1 < self.level.node().len() => {
+                self.pos = Pos::At(i + 1);
+                Ok(true)
+            }
+            Pos::At(_) => {
+                if self.level.next_min_key().is_none() {
+                    self.pos = Pos::AfterEnd;
+                    return Ok(false);
+                }
+                self.level.advance()?;
+                self.pos = if self.level.node().is_empty() {
+                    Pos::AfterEnd
+                } else {
+                    Pos::At(0)
+                };
+                Ok(!matches!(self.pos, Pos::AfterEnd))
+            }
+        }
+    }
+
+    /// Move to the previous entry. `false` if there is none, leaving the cursor
+    /// before the start.
+    pub fn prev(&mut self) -> Result<bool, ReadError> {
+        match self.pos {
+            Pos::BeforeStart => Ok(false),
+            Pos::AfterEnd => {
+                let len = self.level.node().len();
+                self.pos = if len == 0 {
+                    Pos::BeforeStart
+                } else {
+                    Pos::At(len - 1)
+                };
+                Ok(!matches!(self.pos, Pos::BeforeStart))
+            }
+            Pos::At(i) if i > 0 => {
+                self.pos = Pos::At(i - 1);
+                Ok(true)
+            }
+            Pos::At(_) => {
+                if self.level.is_first() {
+                    self.pos = Pos::BeforeStart;
+                    return Ok(false);
+                }
+                self.level.retreat()?;
+                let len = self.level.node().len();
+                self.pos = if len == 0 {
+                    Pos::BeforeStart
+                } else {
+                    Pos::At(len - 1)
+                };
+                Ok(!matches!(self.pos, Pos::BeforeStart))
+            }
+        }
     }
 }
