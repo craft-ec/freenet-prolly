@@ -50,6 +50,42 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         Ok(Some(c))
     }
 
+    /// A cursor on the floor-level node chosen by `pick` at every branch.
+    ///
+    /// The descent rule is the caller's, because a REVERSE scan needs the
+    /// mirrored one: "the last child whose first key is below the bound",
+    /// which is decided from the parent's keys and therefore never loads a
+    /// child outside the bound. `None` if the rule finds no child at all.
+    pub fn seek_pick(
+        blocks: &'a B,
+        root: &Cid,
+        floor: u8,
+        pick: impl Fn(&Node<'a>) -> Option<usize>,
+    ) -> Result<Option<Self>, ReadError> {
+        let node = load(blocks, root)?;
+        if node.level() < floor {
+            return Ok(None);
+        }
+        let mut c = LevelCursor {
+            blocks,
+            floor,
+            path: vec![Step {
+                id: *root,
+                node,
+                taken: 0,
+            }],
+        };
+        let missing = std::cell::Cell::new(false);
+        c.descend(|n| match pick(n) {
+            Some(i) => i,
+            None => {
+                missing.set(true);
+                0
+            }
+        })?;
+        Ok((!missing.get()).then_some(c))
+    }
+
     /// A cursor on the floor-level node that can hold `key`. `None` if the tree
     /// is not that tall.
     pub fn seek(
@@ -243,6 +279,63 @@ impl<'a, B: Blocks> Cursor<'a, B> {
             };
         }
         Ok(c)
+    }
+
+    /// The last entry at or below `key` (`included`) or strictly below it,
+    /// positioned WITHOUT loading a leaf outside that bound.
+    ///
+    /// This is what a reverse scan opens with. Seeking FORWARD and stepping
+    /// back looks equivalent and is not: `seek` lands inside the leaf whose
+    /// first key is `key`, a leaf that a reverse scan excluding `key` has no
+    /// business in — and if that leaf is not held, the seek fails for a block
+    /// the scan does not need. The answer is in the PREVIOUS child, and the
+    /// parent's keys say so without anything being loaded.
+    pub fn seek_back(
+        blocks: &'a B,
+        root: &Cid,
+        key: &[u8],
+        included: bool,
+    ) -> Result<Self, ReadError> {
+        let pick = |n: &Node<'a>| -> Option<usize> {
+            // The last child whose first key satisfies the bound. Every key in
+            // child i is ≥ its first key and < child i+1's, so a child whose
+            // first key satisfies the bound holds at least one entry that does.
+            let i = child_for(n, key);
+            if !included && n.key(i).as_slice() == key {
+                // Everything in this child is ≥ `key`, which is excluded.
+                i.checked_sub(1)
+            } else if included || n.key(i).as_slice() < key {
+                Some(i)
+            } else {
+                // `key` is below this node's first child.
+                None
+            }
+        };
+        let Some(level) = LevelCursor::seek_pick(blocks, root, 0, pick)? else {
+            // Nothing in the tree satisfies the bound.
+            let level = LevelCursor::seek(blocks, root, 0, key)?.expect("floor 0 always exists");
+            return Ok(Cursor {
+                level,
+                pos: Pos::BeforeStart,
+            });
+        };
+        let node = level.node();
+        // Within the leaf, the last entry satisfying the bound.
+        let first_ge = match node.search(key) {
+            Ok(i) => {
+                if included {
+                    i + 1
+                } else {
+                    i
+                }
+            }
+            Err(i) => i,
+        };
+        let pos = match first_ge.checked_sub(1) {
+            Some(i) if i < node.len() => Pos::At(i),
+            _ => Pos::BeforeStart,
+        };
+        Ok(Cursor { level, pos })
     }
 
     /// The last entry with a key < `key`, or before the start if there is none.
