@@ -168,7 +168,7 @@ fn above_lo(key: &[u8], lo: &Bound<Vec<u8>>) -> bool {
 }
 
 /// Does `key` satisfy the high end of the range?
-fn below_hi(key: &[u8], hi: &Bound<Vec<u8>>) -> bool {
+pub(crate) fn below_hi(key: &[u8], hi: &Bound<Vec<u8>>) -> bool {
     match hi {
         Bound::Unbounded => true,
         Bound::Included(k) => key <= k.as_slice(),
@@ -201,7 +201,13 @@ fn start_bound(r: &Range) -> Bound<Vec<u8>> {
 }
 
 /// How many bytes an entry costs the page.
-fn entry_bytes(key: &[u8], v: &Value<'_>) -> usize {
+/// What a page CARRIES for one entry: the key, and the value as the page holds
+/// it — a referenced value is 32 bytes of id here, whatever its real length.
+///
+/// Shared with [`diff`](crate::diff) so the two cannot drift: a byte limit that
+/// charged a reference at its referenced length would refuse to put two large
+/// values in one page while sending 64 bytes.
+pub(crate) fn entry_bytes(key: &[u8], v: &Value<'_>) -> usize {
     key.len()
         + match v {
             Value::Inline(b) => b.len(),

@@ -404,3 +404,206 @@ impl<'a, B: Blocks> Cursor<'a, B> {
         }
     }
 }
+
+/// A position that stands on a child SLOT — an id and a first key read out of
+/// the parent — without the child being loaded.
+///
+/// This is what makes a structural diff cheap. A [`LevelCursor`] descends to
+/// its floor before it can tell you anything, so "both sides are at the start of
+/// a node" would already have cost a root-to-leaf path in each tree; on a cold
+/// tree those are network fetches of blocks the diff then declares irrelevant.
+/// A slot carries everything the comparison needs — the child's id, and where
+/// its keys begin — and the child is loaded only when the ids disagree.
+///
+/// The floor therefore moves DOWN lazily and back UP on its own: finishing a
+/// descended subtree pops the path to the shallowest node that still has a
+/// sibling, so the next comparison happens as high in the tree as it can.
+pub struct SlotCursor<'a, B: Blocks> {
+    blocks: &'a B,
+    /// Loaded branches, root first. `taken` is the slot the cursor is on; the
+    /// last element's `taken` is the CURRENT slot and its child is not loaded.
+    path: Vec<Step<'a>>,
+    /// Past the last slot of the tree.
+    done: bool,
+    /// The cursor stands on the ROOT itself, as a slot: the root is loaded (its
+    /// level and first key are needed to compare it) but the cursor has not
+    /// entered it.
+    ///
+    /// Without this the first comparison would already be one level down, and
+    /// the commonest shape in this codebase would pay for it: when `b` is `a`
+    /// with a new level on top, `a`'s whole root is a CHILD of `b`'s root, and
+    /// standing on it lets one comparison skip the entire old tree. Entering
+    /// `a`'s root first would instead compare its children one by one.
+    at_root: bool,
+}
+
+/// What a slot is: where its keys start, how deep it goes, and what it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot<'a> {
+    /// A child subtree of `level`, not loaded.
+    Sub { level: u8, id: Cid },
+    /// An entry of a leaf — there is nothing below this.
+    Entry(Value<'a>),
+}
+
+impl<'a, B: Blocks> SlotCursor<'a, B> {
+    /// Open at the first slot of the tree. `None` if the tree is empty.
+    ///
+    /// Loads the root and nothing else — so two trees are compared for equality
+    /// at a cost of one block each, and at NO cost when their roots are equal,
+    /// because the caller compares the ids it already has before opening.
+    pub fn open(blocks: &'a B, root: &Cid) -> Result<Option<Self>, ReadError> {
+        let node = load(blocks, root)?;
+        if node.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(SlotCursor {
+            blocks,
+            path: vec![Step {
+                id: *root,
+                node,
+                taken: 0,
+            }],
+            done: false,
+            at_root: true,
+        }))
+    }
+
+    fn top(&self) -> &Step<'a> {
+        self.path.last().expect("non-empty")
+    }
+
+    pub fn finished(&self) -> bool {
+        self.done
+    }
+
+    /// The first key of the current slot. For an entry, the entry's key; for
+    /// the root, the smallest key in the tree.
+    pub fn key(&self) -> Vec<u8> {
+        let s = self.top();
+        if self.at_root {
+            return s.node.key(0);
+        }
+        s.node.key(s.taken)
+    }
+
+    pub fn slot(&self) -> Slot<'a> {
+        let s = self.top();
+        if self.at_root {
+            return Slot::Sub {
+                level: s.node.level(),
+                id: s.id,
+            };
+        }
+        if s.node.is_leaf() {
+            Slot::Entry(s.node.value(s.taken))
+        } else {
+            let (id, _) = s.node.child(s.taken);
+            Slot::Sub {
+                level: s.node.level() - 1,
+                id,
+            }
+        }
+    }
+
+    /// How deep this slot reaches: the child's level, or `None` for an entry.
+    /// Equal ids imply equal levels, so a comparison is only meaningful between
+    /// slots of the same depth.
+    pub fn level(&self) -> Option<u8> {
+        match self.slot() {
+            Slot::Sub { level, .. } => Some(level),
+            Slot::Entry(_) => None,
+        }
+    }
+
+    /// The first key AFTER this slot, read from the ancestors — never by
+    /// loading anything. `None` at the end of the tree.
+    ///
+    /// This is what lets a whole subtree be dismissed as lying below the other
+    /// side's position without opening it.
+    pub fn end_key(&self) -> Option<Vec<u8>> {
+        if self.at_root {
+            // Nothing follows the whole tree.
+            return None;
+        }
+        let s = self.top();
+        if s.taken + 1 < s.node.len() {
+            return Some(s.node.key(s.taken + 1));
+        }
+        self.path[..self.path.len() - 1]
+            .iter()
+            .rposition(|s| s.taken + 1 < s.node.len())
+            .map(|d| {
+                let s = &self.path[d];
+                s.node.key(s.taken + 1)
+            })
+    }
+
+    /// Load the current slot's child and stand on its first slot.
+    ///
+    /// The one call that costs a block, so every read this cursor makes is a
+    /// comparison that failed or a position that had to be reached.
+    pub fn descend(&mut self) -> Result<Cid, ReadError> {
+        if self.at_root {
+            // The root is already loaded; entering it costs nothing.
+            self.at_root = false;
+            return Ok(self.top().id);
+        }
+        let top = self.path.last().expect("non-empty");
+        debug_assert!(!top.node.is_leaf(), "an entry has nothing below it");
+        let (id, _) = top.node.child(top.taken);
+        let node = load_child(self.blocks, &top.node, top.taken)?;
+        self.path.push(Step { id, node, taken: 0 });
+        Ok(id)
+    }
+
+    /// Move past the current slot, rising to the shallowest node that still has
+    /// a slot left — so the next comparison is made as high as it can be.
+    pub fn advance(&mut self) {
+        if self.at_root {
+            self.done = true;
+            return;
+        }
+        while let Some(s) = self.path.last_mut() {
+            if s.taken + 1 < s.node.len() {
+                s.taken += 1;
+                return;
+            }
+            self.path.pop();
+        }
+        self.done = true;
+    }
+
+    /// The largest key under the current slot, when it can be known without
+    /// loading anything.
+    ///
+    /// Only at the ROOT, and only when the root is a leaf: its entries are in
+    /// hand, so the last one is the tree's largest key. Everywhere else a slot
+    /// is bounded by the key that FOLLOWS it ([`end_key`](Self::end_key)),
+    /// which the root has not got — nothing follows a whole tree.
+    pub fn last_key_if_known(&self) -> Option<Vec<u8>> {
+        let s = self.top();
+        (self.at_root && s.node.is_leaf()).then(|| s.node.key(s.node.len() - 1))
+    }
+
+    /// The current node and the index within it — what `need` is computed from.
+    pub fn parent(&self) -> (&Node<'a>, usize) {
+        let s = self.top();
+        (&s.node, s.taken)
+    }
+
+    /// The loaded node of exactly `level` on this cursor's path, and the slot
+    /// it is currently taking.
+    ///
+    /// Two cursors can sit at different DEPTHS — the normal sync shape, where
+    /// one side is held and the other is being fetched — and child-id sets from
+    /// two different levels are disjoint whatever the trees hold, so comparing
+    /// them names everything and means nothing. This is how a caller finds the
+    /// level the two sides can actually be compared at.
+    pub fn node_at_level(&self, level: u8) -> Option<(&Node<'a>, usize)> {
+        self.path
+            .iter()
+            .find(|s| s.node.level() == level)
+            .map(|s| (&s.node, s.taken))
+    }
+}
