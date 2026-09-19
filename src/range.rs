@@ -176,7 +176,7 @@ fn below_hi(key: &[u8], hi: &Bound<Vec<u8>>) -> bool {
     }
 }
 
-fn in_range(key: &[u8], r: &Range) -> bool {
+pub(crate) fn in_range(key: &[u8], r: &Range) -> bool {
     above_lo(key, &r.lo) && below_hi(key, &r.hi)
 }
 
@@ -464,7 +464,7 @@ fn frontier<B: Blocks>(
         if f.covered {
             return Visit::Stop;
         }
-        if !c.held {
+        if blocks.get(&c.id).is_none() {
             f.name(c.id, c.agg, c.span, c.is_leaf);
             return Visit::Next;
         }
@@ -555,18 +555,19 @@ impl Walk {
 ///
 /// Everything here is read from the PARENT, so it is known even for a child
 /// nobody holds. That is the point: a frontier names blocks it does not have.
+#[derive(Clone)]
 pub(crate) struct Child {
+    /// Which child of the parent this is — what `load_child` needs to check it.
+    pub idx: usize,
     pub id: Cid,
     pub agg: Agg,
     pub span: Span,
     /// A child of a level-1 branch is a leaf.
     pub is_leaf: bool,
-    /// Is the block held? A missing one can only be named, never looked into.
-    pub held: bool,
 }
 
 /// What the visitor wants done with a child it has just been shown.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Visit {
     /// Look inside it. Only a held branch can be descended; anything else is
     /// treated as `Next`.
@@ -593,17 +594,71 @@ pub(crate) fn walk<B: Blocks>(
     r: &Range,
     visit: &mut impl FnMut(&Child) -> Visit,
 ) -> Result<(), ReadError> {
-    if node.is_leaf() {
-        return Ok(());
+    // Depth-first, in scan order: a child that is descended into is finished
+    // before its next sibling is shown. The frontier's `need` is a list the
+    // caller fetches in order, so this is not a detail of the traversal.
+    //
+    // Classified one index at a time rather than through a list, so a walk
+    // allocates nothing per node either.
+    for i in scan_order(node, r) {
+        let Some(c) = classify(node, i, upper, r) else {
+            continue;
+        };
+        match visit(&c) {
+            Visit::Stop => return Ok(()),
+            Visit::Next => continue,
+            Visit::Descend => {}
+        }
+        if c.is_leaf || blocks.get(&c.id).is_none() {
+            continue;
+        }
+        let loaded = load(blocks, &c.id)?;
+        // Aggregates are believed for budgeting; how deep to recurse is not
+        // something an unverified chain gets to decide.
+        if loaded.level() + 1 != node.level() {
+            return Err(ReadError::Mismatch(c.id));
+        }
+        // Only here is a key actually built: the bound this child's own last
+        // child ends at.
+        let next = (c.idx + 1 < node.len()).then(|| node.key(c.idx + 1));
+        walk(blocks, &loaded, next.as_deref().or(upper), r, visit)?;
     }
-    let n = node.len();
-    let order: Vec<usize> = if r.reverse {
-        (0..n).rev().collect()
+    Ok(())
+}
+
+/// The children of THIS node that intersect `r`, in scan order.
+///
+/// One level only, and it loads nothing: everything a [`Child`] carries is read
+/// from this node. A caller that wants to go deeper decides how, which is what
+/// separates the frontier from the range aggregate.
+pub(crate) fn children(node: &Node<'_>, upper: Option<&[u8]>, r: &Range) -> Vec<Child> {
+    scan_order(node, r)
+        .filter_map(|i| classify(node, i, upper, r))
+        .collect()
+}
+
+/// The indices of `node`'s children, in the order a scan visits them.
+fn scan_order(node: &Node<'_>, r: &Range) -> Box<dyn Iterator<Item = usize>> {
+    let n = if node.is_leaf() { 0 } else { node.len() };
+    if r.reverse {
+        Box::new((0..n).rev())
     } else {
-        (0..n).collect()
-    };
+        Box::new(0..n)
+    }
+}
+
+/// Child `i` of `node`, if it intersects `r`.
+///
+/// Takes no store: classifying a child reads the PARENT only, so deciding that
+/// a subtree lies wholly inside a range costs nothing and touches nothing. That
+/// is what makes an aggregate cheap, so it is a property of the signature
+/// rather than of how carefully each caller uses it — including "is the block
+/// held", which is a question about a specific child and belongs to whoever
+/// wants to open one.
+fn classify(node: &Node<'_>, i: usize, upper: Option<&[u8]>, r: &Range) -> Option<Child> {
+    let n = node.len();
     let prefix = node.prefix();
-    for i in order {
+    {
         // Keys are read as the node's shared prefix plus this entry's suffix and
         // are NOT joined: a key is only built for a child the walk descends
         // into, which is a handful per walk rather than one per child.
@@ -624,7 +679,7 @@ pub(crate) fn walk<B: Blocks>(
             _ => false,
         };
         if above || below {
-            continue;
+            return None;
         }
         // Wholly within: its smallest key clears the bottom, and everything
         // under `next` clears the top.
@@ -645,32 +700,14 @@ pub(crate) fn walk<B: Blocks>(
             };
         let (id, agg) = node.child(i);
         let child = Child {
+            idx: i,
             id,
             agg,
             span: if inside { Span::Inside } else { Span::Edge },
             is_leaf: node.level() == 1,
-            held: blocks.get(&id).is_some(),
         };
-        match visit(&child) {
-            Visit::Stop => return Ok(()),
-            Visit::Next => continue,
-            Visit::Descend => {}
-        }
-        if !child.held || child.is_leaf {
-            continue;
-        }
-        let loaded = load(blocks, &id)?;
-        // Aggregates are believed for budgeting; how deep to recurse is not
-        // something an unverified chain gets to decide.
-        if loaded.level() + 1 != node.level() {
-            return Err(ReadError::Mismatch(id));
-        }
-        // Only here is a key actually built: the bound this child's own last
-        // child ends at.
-        let next_key = next.map(|k| k.to_vec());
-        walk(blocks, &loaded, next_key.as_deref(), r, visit)?;
+        Some(child)
     }
-    Ok(())
 }
 
 /// A key held as the node keeps it: a shared prefix and one entry's suffix,
@@ -705,10 +742,6 @@ impl Key<'_> {
             Bound::Included(k) => self.cmp_key(k) != Ordering::Greater,
             Bound::Excluded(k) => self.cmp_key(k) == Ordering::Less,
         }
-    }
-
-    fn to_vec(&self) -> Vec<u8> {
-        [self.0, self.1].concat()
     }
 }
 
