@@ -390,6 +390,46 @@ fn a_range_starting_past_a_leafs_last_entry_reads_one_extra_leaf() {
     // one extra read, and no more — the leaf after the range is never touched,
     // because the ancestors already give its smallest key.
     assert_eq!(leaf_reads, 2, "exactly one extra edge read");
+
+    // The mirror, which had no test until #37 and is where the false "finished"
+    // lived: a REVERSE scan whose bound sits in the same gap. It must read the
+    // leaf that holds the answer and NOT the one above the bound — the
+    // mirrored descent decides that from the parent's keys.
+    let mut gap = lv[5].1.clone();
+    gap.push(0);
+    let req = Range {
+        lo: Bound::Included(lv[5].0.clone()),
+        hi: Bound::Included(gap),
+        reverse: true,
+        max_entries: 10_000,
+        ..Range::default()
+    };
+    let c = counting(&store);
+    let p = range(&c, &root, &req).unwrap();
+    let got: Pairs = p
+        .entries
+        .iter()
+        .map(|(k, v)| (k.clone(), take(&c, v)))
+        .collect();
+    drop(p);
+    same(&got, &reference(&m, &req), "reverse ending in a gap");
+    let leaf_reads = c
+        .reads
+        .borrow()
+        .iter()
+        .filter(|id| {
+            store
+                .0
+                .get(*id)
+                .and_then(|b| Node::parse(b).ok())
+                .is_some_and(|n| n.is_leaf())
+        })
+        .count();
+    println!("reverse-into-gap: {leaf_reads} leaves read");
+    assert_eq!(
+        leaf_reads, 1,
+        "a reverse scan read a leaf above its upper bound"
+    );
 }
 
 #[test]
@@ -1293,4 +1333,86 @@ fn a_leaf_of_referenced_values_does_not_swallow_the_byte_budget() {
     let p = range(&held, &root2, &Range::default()).unwrap();
     println!("inline frontier: {} blocks named", p.need.len());
     assert!(p.need.len() > 1, "inline values still fill a round");
+}
+
+/// `seek_back` is the new descent, and it is where an off-by-one would live.
+///
+/// Checked against the map for every shape of probe: on a key, between keys,
+/// below everything, above everything — and for both bounds, since the
+/// difference between them is exactly what a reverse scan resumes on.
+#[test]
+fn seek_back_lands_where_the_map_says() {
+    let m: Map = dataset(9, 5000).into_iter().collect();
+    let (root, store) = scratch(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut r = rng(11);
+    let mut checked = 0;
+    for _ in 0..400 {
+        let i = r() as usize % keys.len();
+        let probe = match r() % 5 {
+            0 => keys[i].clone(),
+            1 => {
+                let mut k = keys[i].clone();
+                k.push(0);
+                k
+            }
+            2 => {
+                let mut k = keys[i].clone();
+                k.pop();
+                k
+            }
+            3 => vec![0x00],
+            _ => vec![0xff; 4],
+        };
+        // Included: the last key ≤ probe. Excluded: the last key < probe.
+        let c = Cursor::seek_back(&store, &root, &probe, true).unwrap();
+        assert_eq!(
+            c.peek().map(|(k, _)| k),
+            m.range(..=probe.clone())
+                .next_back()
+                .map(|(k, _)| k.clone()),
+            "seek_back inclusive at {:?}",
+            String::from_utf8_lossy(&probe)
+        );
+        let c = Cursor::seek_back(&store, &root, &probe, false).unwrap();
+        assert_eq!(
+            c.peek().map(|(k, _)| k),
+            m.range(..probe.clone()).next_back().map(|(k, _)| k.clone()),
+            "seek_back exclusive at {:?}",
+            String::from_utf8_lossy(&probe)
+        );
+        checked += 2;
+    }
+    assert!(checked >= 800);
+}
+
+/// A prefix scan reads the same entries in both directions.
+#[test]
+fn prefixes_page_in_both_directions() {
+    let m: Map = dataset(10, 6000).into_iter().collect();
+    let (root, store) = scratch(&m);
+    for p in [&b"d/"[..], b"e/", b"d/post", b"zzz"] {
+        let mut want: Vec<Vec<u8>> = m.keys().filter(|k| k.starts_with(p)).cloned().collect();
+        for limit in [1usize, 7, 1000] {
+            for reverse in [false, true] {
+                let req = Range {
+                    reverse,
+                    max_entries: limit,
+                    ..Range::prefix(p)
+                };
+                let (got, _) = scan(&store, &root, &req);
+                let mut ks: Vec<Vec<u8>> = got.iter().map(|(k, _)| k.clone()).collect();
+                if reverse {
+                    ks.reverse();
+                }
+                assert_eq!(
+                    ks,
+                    want,
+                    "prefix {:?} limit {limit} reverse {reverse}",
+                    String::from_utf8_lossy(p)
+                );
+            }
+        }
+        want.clear();
+    }
 }

@@ -149,12 +149,34 @@ pub struct Page<'a> {
     /// Blocks to fetch, in scan order: the leaf the scan stopped at, plus
     /// further blocks of the range that the held branches can name.
     pub need: Vec<Cid>,
+    /// WHY the page ended. Only [`PageEnd::Blocked`] leaves work undone, and a
+    /// reader that treats an empty `need` as "complete" cannot tell the
+    /// difference — so the scan says it outright.
+    pub end: PageEnd,
+}
+
+/// How a page ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageEnd {
+    /// The entry or byte limit was reached. More may follow.
+    Limit,
+    /// The scan walked off the end of the range.
+    EndOfRange,
+    /// The scan walked off the end of the tree.
+    EndOfTree,
+    /// A block was missing. **Nothing here says the range is exhausted** —
+    /// this is the one ending a completeness claim may not be built on.
+    Blocked,
 }
 
 impl Page<'_> {
-    /// The scan is over: nothing more to serve and nothing to fetch.
+    /// The scan is over: it ran out of range or out of tree, and it got there
+    /// by SCANNING rather than by failing to fetch something.
+    ///
+    /// Not "nothing to fetch": a scan that could not open its first leaf also
+    /// has nothing to fetch in the range, and it has served nothing.
     pub fn finished(&self) -> bool {
-        self.next.is_none() && self.need.is_empty()
+        matches!(self.end, PageEnd::EndOfRange | PageEnd::EndOfTree)
     }
 }
 
@@ -215,7 +237,39 @@ pub(crate) fn entry_bytes(key: &[u8], v: &Value<'_>) -> usize {
         }
 }
 
-/// Place a cursor at the first entry of the scan.
+/// Do the bounds already say the range is empty?
+///
+/// Decided from the bounds alone, before anything is read. It matters most on a
+/// RESUME: paging reverse past the last entry of the range leaves a start bound
+/// of `Excluded(lo)` against a lower bound of `Included(lo)`, which nothing can
+/// satisfy — and without this the scan would descend toward a neighbouring leaf
+/// it has no use for, and either fetch it or (worse, before #37) conclude from
+/// an empty frontier that it had finished.
+fn bounds_are_empty(r: &Range) -> bool {
+    let start = start_bound(r);
+    let far = if r.reverse { &r.lo } else { &r.hi };
+    match (&start, far) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(s), Bound::Included(f)) => {
+            if r.reverse {
+                s < f
+            } else {
+                s > f
+            }
+        }
+        // One end open: a key must lie strictly between them.
+        (Bound::Included(s), Bound::Excluded(f))
+        | (Bound::Excluded(s), Bound::Included(f))
+        | (Bound::Excluded(s), Bound::Excluded(f)) => {
+            if r.reverse {
+                s <= f
+            } else {
+                s >= f
+            }
+        }
+    }
+}
+
 /// Place a cursor at the first entry of the scan. `None` means the scan is over
 /// before it starts — which is not the same as an empty tree: it is reached when
 /// the only step left would cross into a leaf that lies wholly outside the
@@ -230,22 +284,19 @@ fn open<'a, B: Blocks>(
         // Both bounded cases go through `seek`, so the step backwards is one the
         // range can be consulted about first. `seek_before` would take it inside
         // the cursor, where the range is not known.
-        let (key, step_on_equal) = match &start {
+        let (key, included) = match &start {
             Bound::Unbounded => return Cursor::seek_last(blocks, root).map(Some),
-            Bound::Included(k) => (k, false),
-            Bound::Excluded(k) => (k, true),
+            Bound::Included(k) => (k, true),
+            Bound::Excluded(k) => (k, false),
         };
-        let mut c = Cursor::seek(blocks, root, key)?;
-        // `seek` lands on the first key ≥ k. A reverse scan wants the last key
-        // at or below it, so step back unless we landed exactly where we want.
-        let landed_on_key = c.peek().map(|(got, _)| got == *key) == Some(true);
-        if step_on_equal || !landed_on_key {
-            if at_edge_of_range(&c, r) {
-                return Ok(None);
-            }
-            c.prev()?;
-        }
-        return Ok(Some(c));
+        // The MIRRORED descent. Seeking forward and stepping back would land
+        // inside the leaf whose first key is `key` — a leaf a reverse scan
+        // excluding `key` has no business in, and one the scan then cannot
+        // proceed without. `seek_back` picks the last child whose first key
+        // satisfies the bound, from the parent's keys, so no such leaf is ever
+        // loaded.
+        let c = Cursor::seek_back(blocks, root, key, included)?;
+        return Ok(c.peek().is_some().then_some(c));
     }
     match &start {
         Bound::Unbounded => Cursor::seek(blocks, root, &[]).map(Some),
@@ -285,7 +336,14 @@ pub fn range_with<'a, B: Blocks>(
         entries: Vec::new(),
         next: None,
         need: Vec::new(),
+        end: PageEnd::Blocked,
     };
+    // Bounds that cannot hold a key: the scan is over before it starts, and it
+    // is the SCAN saying so — no block is read to find out.
+    if bounds_are_empty(r) {
+        page.end = PageEnd::EndOfRange;
+        return Ok(page);
+    }
     // The root itself may be missing; then there is nothing to serve and one
     // block to ask for.
     if blocks.get(root).is_none() {
@@ -294,17 +352,25 @@ pub fn range_with<'a, B: Blocks>(
     }
 
     let mut cur = match open(blocks, root, r) {
-        // The only step left would have left the range: nothing to serve and
-        // nothing to fetch.
-        Ok(None) => return Ok(page),
+        // The only step left would have left the range: the SCAN decided this,
+        // so it is a real ending.
+        Ok(None) => {
+            page.end = PageEnd::EndOfRange;
+            return Ok(page);
+        }
         Ok(Some(c)) => c,
-        Err(ReadError::Need(_)) => {
-            // Nothing served, so name what the held branches can see of the
-            // range — not only the block the descent happened to stop on, which
-            // may lie outside it. An empty frontier means nothing in range is
-            // missing, so the page is finished; naming the descent's block
-            // anyway would send the caller after one it cannot use.
+        Err(ReadError::Need(ids)) => {
+            // Nothing served. Name what the held branches can see of the range
+            // — and if that is nothing, name the block the descent stopped on
+            // anyway. An empty frontier used to be read as "nothing in range is
+            // missing, so the page is finished": it is not. Nothing to FETCH is
+            // not nothing to SERVE, and a scan that has served nothing has not
+            // finished anything. A wasted fetch costs a block; a false
+            // "finished" is a listing that lies.
             page.need = frontier(opts, blocks, root, &rest_from_start(r))?;
+            if page.need.is_empty() {
+                page.need = ids;
+            }
             return Ok(page);
         }
         Err(e) => return Err(e.into()),
@@ -317,10 +383,12 @@ pub fn range_with<'a, B: Blocks>(
     loop {
         let Some((key, value)) = cur.peek() else {
             // Ran off the end of the tree: the scan is complete.
+            page.end = PageEnd::EndOfTree;
             return Ok(page);
         };
         if !in_range(&key, r) {
             // Past the far end of the range: complete.
+            page.end = PageEnd::EndOfRange;
             return Ok(page);
         }
         let cost = entry_bytes(&key, &value);
@@ -328,28 +396,37 @@ pub fn range_with<'a, B: Blocks>(
         // when that entry alone is over the byte limit. Otherwise a single large
         // entry would stall the scan forever.
         if !page.entries.is_empty() && bytes + cost > r.max_bytes {
+            page.end = PageEnd::Limit;
             break;
         }
         bytes += cost;
         page.entries.push((key.clone(), value));
         last_served = Some(key.clone());
         if page.entries.len() >= r.max_entries {
+            page.end = PageEnd::Limit;
             break;
         }
         // Stepping to the neighbouring leaf costs a block, and the ancestors
         // already say which keys it holds. A scan that has reached the end of
         // its range stops here instead of paying for a leaf it cannot use.
         if at_edge_of_range(&cur, r) {
+            page.end = PageEnd::EndOfRange;
             return Ok(page);
         }
         // Step. A missing next leaf ends the page with a frontier.
         let moved = if r.reverse { cur.prev() } else { cur.next() };
         match moved {
             Ok(true) => {}
-            Ok(false) => return Ok(page), // end of the tree
-            Err(ReadError::Need(_)) => {
+            Ok(false) => {
+                page.end = PageEnd::EndOfTree;
+                return Ok(page);
+            }
+            Err(ReadError::Need(ids)) => {
                 page.next = last_served.clone();
                 page.need = frontier(opts, blocks, root, &rest_after(r, &key))?;
+                if page.need.is_empty() {
+                    page.need = ids;
+                }
                 return Ok(page);
             }
             Err(e) => return Err(e.into()),
