@@ -16,9 +16,9 @@
 use crate::boundary::{self, MAX_LOGICAL};
 use crate::chunk::{empty_leaf, Body, Closed, LevelChunker, SplitRule};
 use crate::cursor::LevelCursor;
-use crate::node::{Agg, BuildError, Node, HEADER, MAX_INLINE, MAX_KEY};
-use crate::store::{load, load_child, Blocks, ReadError};
-use crate::{block_id, kind, Cid};
+use crate::node::{Agg, BuildError, Node, Value, HEADER, MAX_INLINE, MAX_KEY};
+use crate::store::{load, load_child, Blocks, BlocksMut, ReadError};
+use crate::Cid;
 use std::collections::{BTreeMap, HashSet};
 
 pub use crate::node::MAX_VALUE;
@@ -251,6 +251,24 @@ fn nodes_above<B: Blocks>(blocks: &B, root: &Cid, floor: u8) -> Result<Vec<Cid>,
 /// On [`ReadError::Need`] the caller fetches and calls again with the same
 /// arguments, so `(root, edits)` must fit whatever the caller can keep between
 /// calls; the library sets no byte limit of its own.
+/// [`apply`], writing every block it emits back into `blocks`.
+///
+/// The loop this replaces is the same in every consumer, and getting it wrong —
+/// dropping a value block, say — is silent until a read. A refused batch emits
+/// nothing, so nothing is written and the store is left exactly as it was.
+pub fn apply_into<B: BlocksMut>(
+    blocks: &mut B,
+    root: &Cid,
+    edits: &[(Vec<u8>, Edit)],
+) -> Result<Applied, ApplyError> {
+    let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
+    let applied = apply(&*blocks, root, edits, |c, b| emitted.push((c, b.to_vec())))?;
+    for (c, b) in emitted {
+        blocks.insert_block(c, &b);
+    }
+    Ok(applied)
+}
+
 pub fn apply<B: Blocks>(
     blocks: &B,
     root: &Cid,
@@ -280,18 +298,18 @@ pub fn apply_with<B: Blocks>(
             return Err(ApplyError::ValueTooLong);
         }
     }
-    // 2. The library owns the inline-or-reference decision.
+    // 2. The library owns the inline-or-reference decision, in one place:
+    //    `Value::for_bytes`. A caller building the same tree by hand calls the
+    //    same function, so an oracle cannot drift from the rule.
     let mut values: Vec<Option<(Cid, &[u8])>> = Vec::with_capacity(edits.len());
     let mut level: LevelEdits = Vec::with_capacity(edits.len());
     for (key, edit) in edits {
         let (body, block) = match edit {
             Edit::Delete => (None, None),
-            Edit::Put(v) if v.len() <= MAX_INLINE => (Some(Body::Inline(v.clone())), None),
-            Edit::Put(v) => {
-                let cid = block_id(kind::RAW, v);
-                let len = v.len() as u32;
-                (Some(Body::Ref { cid, len }), Some((cid, v.as_slice())))
-            }
+            Edit::Put(v) => match Value::for_bytes(v) {
+                (Value::Inline(b), _) => (Some(Body::Inline(b.to_vec())), None),
+                (Value::Ref { cid, len }, block) => (Some(Body::Ref { cid, len }), block),
+            },
         };
         values.push(block);
         level.push((key.clone(), body));

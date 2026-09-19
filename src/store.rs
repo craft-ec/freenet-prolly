@@ -21,6 +21,16 @@ pub trait Blocks {
     fn get(&self, cid: &Cid) -> Option<&[u8]>;
 }
 
+/// A block source that can also be written to.
+///
+/// [`apply_into`](crate::apply::apply_into) uses it so that no caller has to
+/// write the loop that feeds emitted blocks back into its own store — getting
+/// that loop wrong is silent until a read, which makes it exactly the kind of
+/// thing a library should do once.
+pub trait BlocksMut: Blocks {
+    fn insert_block(&mut self, cid: Cid, bytes: &[u8]);
+}
+
 /// Blocks held in memory.
 #[derive(Default, Clone)]
 pub struct MemBlocks(pub HashMap<Cid, Vec<u8>>);
@@ -28,6 +38,12 @@ pub struct MemBlocks(pub HashMap<Cid, Vec<u8>>);
 impl MemBlocks {
     pub fn insert(&mut self, cid: Cid, bytes: &[u8]) {
         self.0.insert(cid, bytes.to_vec());
+    }
+}
+
+impl BlocksMut for MemBlocks {
+    fn insert_block(&mut self, cid: Cid, bytes: &[u8]) {
+        self.insert(cid, bytes);
     }
 }
 

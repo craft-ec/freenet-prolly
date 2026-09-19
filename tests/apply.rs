@@ -30,12 +30,23 @@ fn value_of(v: &[u8]) -> Value<'_> {
     }
 }
 
-/// The oracle: build `m` from scratch. Returns the root and the tree's nodes.
+/// The oracle: build `m` from scratch. Returns the root and the tree's blocks.
+///
+/// It pushes RAW BYTES, so the inline-or-reference choice is made by the
+/// library's own `Value::for_bytes` — the same call `apply` makes. An oracle
+/// that restated the rule could drift from it, and then this gate would be
+/// comparing two implementations of one mistake.
 fn scratch(rule: SplitRule, m: &Map) -> (Cid, MemBlocks) {
     let mut nodes = MemBlocks::default();
-    let mut t = TreeBuilder::with_rule(rule, |c, b: &[u8]| nodes.insert(c, b));
+    let mut t = TreeBuilder::with_rule(rule, |c, b: &[u8]| {
+        // Only the NODES: this oracle is about the tree's shape, and everything
+        // downstream reads every block here as one.
+        if Node::parse(b).is_ok() {
+            nodes.insert(c, b);
+        }
+    });
     for (k, v) in m {
-        t.push(k, value_of(v)).unwrap();
+        t.push_bytes(k, v).unwrap();
     }
     (t.finish().unwrap(), nodes)
 }

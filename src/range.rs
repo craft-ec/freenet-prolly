@@ -634,3 +634,15 @@ pub fn value_bytes<'a>(
     }
     Ok(body)
 }
+
+/// The bytes of a value, wherever the format put it.
+///
+/// A leaf holds a short value inline and a long one by reference, so every
+/// reader has to handle both. Doing it here means a caller does not write the
+/// match — and does not forget the length check on the reference arm.
+pub fn read_value<'a>(blocks: &'a impl Blocks, v: Value<'a>) -> Result<&'a [u8], ReadError> {
+    match v {
+        Value::Inline(b) => Ok(b),
+        Value::Ref { cid, len } => value_bytes(blocks, &cid, len),
+    }
+}
