@@ -49,10 +49,21 @@ const LAMBDA4: u128 = (LAMBDA as u128).pow(4);
 
 /// The per-entry split hash.
 pub fn split_hash(level: u8, key: &[u8]) -> u32 {
+    split_hash_parts(level, key, &[])
+}
+
+/// [`split_hash`] of `prefix ‖ suffix`, without joining them.
+///
+/// A node stores each key as the node's shared prefix plus that entry's suffix,
+/// and BLAKE3 is a streaming hash: feeding the two pieces in order is the same
+/// digest as feeding the concatenation. So a reader checking a whole node never
+/// has to allocate a key — which was almost the entire cost of [`check_node`].
+pub fn split_hash_parts(level: u8, prefix: &[u8], suffix: &[u8]) -> u32 {
     let mut h = blake3::Hasher::new();
     h.update(DOMAIN);
     h.update(&[level]);
-    h.update(key);
+    h.update(prefix);
+    h.update(suffix);
     let d = h.finalize();
     let b = d.as_bytes();
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
@@ -61,12 +72,23 @@ pub fn split_hash(level: u8, key: &[u8]) -> u32 {
 /// Whether a node at `level` closes after the entry with `key`, which grew the
 /// node's `logical_len` from `s_before` to `s_after`.
 pub fn splits_after(level: u8, key: &[u8], s_before: usize, s_after: usize) -> bool {
+    splits_after_parts(level, key, &[], s_before, s_after)
+}
+
+/// [`splits_after`] for a key held as `prefix ‖ suffix`.
+pub fn splits_after_parts(
+    level: u8,
+    prefix: &[u8],
+    suffix: &[u8],
+    s_before: usize,
+    s_after: usize,
+) -> bool {
     debug_assert!(s_before < s_after && s_after <= MAX_LOGICAL);
     if s_after < MIN_SPLIT {
         return false;
     }
     let p4 = |s: usize| (s as u128).pow(4);
-    let lhs = split_hash(level, key) as u128 * LAMBDA4;
+    let lhs = split_hash_parts(level, prefix, suffix) as u128 * LAMBDA4;
     let rhs = (p4(s_after) - p4(s_before)) << 32;
     lhs < rhs
 }
@@ -77,6 +99,10 @@ pub enum BoundaryError {
     InteriorSplit(usize),
     /// The entries measure more than `MAX_LOGICAL`.
     TooLarge,
+    /// The node carries parity cids. Nothing emits them yet, and they are the
+    /// only region of an otherwise valid node no rule constrains — so until the
+    /// parity rule exists (#19) a node that has any is refused.
+    UnexpectedParity,
 }
 
 /// The part of the split rule that one node can be held to: no entry but the
@@ -87,19 +113,49 @@ pub enum BoundaryError {
 ///
 /// For hosts: a parsed node that fails this was not produced by the format's
 /// chunker, and keeping it would poison dedup and diff for its readers.
+///
+/// # What this cannot prove
+///
+/// The split hash is salted with the node's own `level` field, and nothing here
+/// constrains it — so a node cut anywhere could in principle be relabelled to a
+/// level under which its cut passes, a search over at most 255 values done
+/// offline. Two things make that worthless rather than dangerous, and both
+/// belong here rather than in a reviewer's memory:
+///
+/// - A **leaf cannot be relabelled at all.** Level 0 has a different entry shape,
+///   so a leaf claiming to be a branch fails [`Node::parse`] outright — and
+///   leaves are about 98 % of a tree's nodes.
+/// - A **relabelled branch is unreachable.** [`load_child`](crate::store::load_child)
+///   requires a child's level to be its parent's minus one, anchored at the
+///   leaves, so no reader following a root will ever arrive at it. It is orphan
+///   garbage under a different id: it costs its writer a PUT and gains nothing.
+///
+/// So this check guards against accidents and lazy writers. The reader is the
+/// enforcer.
 pub fn check_node(node: &Node<'_>) -> Result<(), BoundaryError> {
+    // The parity region is the one part of a valid node no rule constrains, and
+    // nothing emits it yet. One comparison closes it until #19 defines the rule.
+    if node.parity_count() != 0 {
+        return Err(BoundaryError::UnexpectedParity);
+    }
+    // Keys are read as the node's shared prefix plus each entry's suffix and are
+    // never joined: this runs on every tree-node block on every hosting node, and
+    // an allocation per entry was almost the whole of its cost.
+    let prefix = node.prefix();
+    let level = node.level();
     let mut s = HEADER;
     for i in 0..node.len() {
-        let key = node.key(i);
+        let suffix = node.suffix(i);
+        let klen = prefix.len() + suffix.len();
         let after = s + if node.is_leaf() {
-            NodeBuilder::leaf_cost(&key, &node.value(i))
+            NodeBuilder::leaf_cost_len(klen, &node.value(i))
         } else {
-            NodeBuilder::child_cost(&key)
+            NodeBuilder::child_cost_len(klen)
         };
         if after > MAX_LOGICAL {
             return Err(BoundaryError::TooLarge);
         }
-        if i + 1 < node.len() && splits_after(node.level(), &key, s, after) {
+        if i + 1 < node.len() && splits_after_parts(level, prefix, suffix, s, after) {
             return Err(BoundaryError::InteriorSplit(i));
         }
         s = after;
