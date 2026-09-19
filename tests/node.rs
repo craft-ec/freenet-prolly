@@ -34,10 +34,10 @@ fn reencode(n: &Node) -> Vec<u8> {
     };
     for i in 0..n.len() {
         if n.is_leaf() {
-            b.push(n.key(i), n.value(i)).unwrap();
+            b.push(&n.key(i), n.value(i)).unwrap();
         } else {
             let (c, a) = n.child(i);
-            b.push_child(n.key(i), c, a).unwrap();
+            b.push_child(&n.key(i), c, a).unwrap();
         }
     }
     for p in n.parity() {
@@ -53,6 +53,8 @@ fn leaf_round_trips() {
     assert!(n.is_leaf());
     assert_eq!(n.len(), 3);
     assert_eq!(n.key(0), b"aa");
+    assert_eq!(n.prefix(), b""); // "aa" and "bbb-…" share nothing
+    assert_eq!(n.suffix(2), b"bbb-longer-key");
     assert_eq!(n.value(0), Value::Inline(b"one"));
     assert_eq!(
         n.value(1),
@@ -165,8 +167,9 @@ fn builder_refuses_to_exceed_the_node_cap() {
     Node::parse(&bytes).unwrap();
 }
 
-// Header: magic 0..4, level 4, flags 5, count 6..8, agg.count 8..16, agg.bytes 16..24, pcount 24..26
-// then offs [u16; n] at 26, keys4 [u32; n] at 26 + 2n.
+// Header: magic 0..4, level 4, flags 5, count 6..8, agg.count 8..16, agg.bytes 16..24,
+// pcount 24..26, plen 26..28; then prefix, offs [u16; n], keys4 [u32; n], entries.
+// "aaaa"/"bbbb" share no prefix, so plen = 0: offs at 28, keys4 at 32, entries at 40.
 fn two_key_leaf() -> Vec<u8> {
     let mut b = NodeBuilder::leaf();
     b.push(b"aaaa", Value::Inline(b"x")).unwrap();
@@ -190,18 +193,18 @@ fn each_malformation_is_named() {
     assert_eq!(with(&|v| v[16] ^= 1), NodeError::AggMismatch);
     assert_eq!(
         with(&|v| {
-            v[26] = 0xFF;
-            v[27] = 0xFF;
+            v[28] = 0xFF;
+            v[29] = 0xFF;
         }),
         NodeError::OffsetOutOfRange
     );
-    assert_eq!(with(&|v| v[28] += 1), NodeError::BadTiling); // second entry's offset
-    assert_eq!(with(&|v| v[30] ^= 0xFF), NodeError::BadKeyPrefix); // keys4[0]
+    assert_eq!(with(&|v| v[30] += 1), NodeError::BadTiling); // second entry's offset
+    assert_eq!(with(&|v| v[32] ^= 0xFF), NodeError::BadKeyPrefix); // keys4[0]
     assert_eq!(with(&|v| v.push(0)), NodeError::TrailingBytes);
     assert_eq!(with(&|v| v.truncate(10)), NodeError::TooShort);
     assert_eq!(with(&|v| v.resize(MAX_NODE + 1, 0)), NodeError::TooLarge);
-    // value kind 2 does not exist: first entry starts at 26 + 2*6 = 38; vkind at +2
-    assert_eq!(with(&|v| v[40] = 2), NodeError::BadEntry);
+    // value kind 2 does not exist: first entry starts at 40; vkind at +2
+    assert_eq!(with(&|v| v[42] = 2), NodeError::BadEntry);
     // A branch header over leaf entries is not a branch.
     assert!(Node::parse(&{
         let mut v = good.clone();
@@ -216,9 +219,9 @@ fn unsorted_keys_are_refused_even_with_consistent_prefixes() {
     // Make key[0] = "cccc" > key[1] = "bbbb", and fix its keys4 so that ONLY the
     // ordering is wrong — otherwise BadKeyPrefix would mask the check under test.
     let mut v = two_key_leaf();
-    let key0_at = 38 + 7;
+    let key0_at = 40 + 7;
     v[key0_at..key0_at + 4].copy_from_slice(b"cccc");
-    v[30..34].copy_from_slice(&key4(b"cccc").to_be_bytes());
+    v[32..36].copy_from_slice(&key4(b"cccc").to_be_bytes());
     assert_eq!(
         Node::parse(&v).map(|_| ()).unwrap_err(),
         NodeError::KeysNotSorted
@@ -226,7 +229,7 @@ fn unsorted_keys_are_refused_even_with_consistent_prefixes() {
     // equal keys are also disorder
     let mut v = two_key_leaf();
     v[key0_at..key0_at + 4].copy_from_slice(b"bbbb");
-    v[30..34].copy_from_slice(&key4(b"bbbb").to_be_bytes());
+    v[32..36].copy_from_slice(&key4(b"bbbb").to_be_bytes());
     assert_eq!(
         Node::parse(&v).map(|_| ()).unwrap_err(),
         NodeError::KeysNotSorted
@@ -236,15 +239,16 @@ fn unsorted_keys_are_refused_even_with_consistent_prefixes() {
 #[test]
 fn search_agrees_with_a_linear_scan() {
     let mut next = rng(42);
-    for round in 0..200 {
-        // keys of length 0..8 over a tiny alphabet: many shared 4-byte prefixes,
-        // and keys shorter than the prefix.
+    for round in 0..300 {
+        // Half the rounds put every key under a shared prefix, as real nodes do.
+        let shared: &[u8] = if round % 2 == 0 { b"\x01posts/" } else { b"" };
+        let word = |next: &mut dyn FnMut() -> u64| -> Vec<u8> {
+            (0..(next() % 9))
+                .map(|_| b'a' + (next() % 3) as u8)
+                .collect()
+        };
         let mut keys: Vec<Vec<u8>> = (0..(next() % 60))
-            .map(|_| {
-                (0..(next() % 9))
-                    .map(|_| b'a' + (next() % 3) as u8)
-                    .collect()
-            })
+            .map(|_| [shared, &word(&mut next)].concat())
             .collect();
         keys.sort();
         keys.dedup();
@@ -255,9 +259,13 @@ fn search_agrees_with_a_linear_scan() {
         let bytes = b.finish().unwrap();
         let n = Node::parse(&bytes).unwrap();
         for _ in 0..200 {
-            let probe: Vec<u8> = (0..(next() % 9))
-                .map(|_| b'a' + (next() % 3) as u8)
-                .collect();
+            // Probes inside the prefix, shorter than it, diverging from it, unrelated.
+            let probe: Vec<u8> = match next() % 4 {
+                0 => [shared, &word(&mut next)].concat(),
+                1 => shared[..(next() % (shared.len() as u64 + 1)) as usize].to_vec(),
+                2 => [&shared[..shared.len().saturating_sub(1)], b"zz".as_slice()].concat(),
+                _ => word(&mut next),
+            };
             assert_eq!(
                 n.search(&probe),
                 keys.binary_search(&probe),
@@ -265,6 +273,127 @@ fn search_agrees_with_a_linear_scan() {
             );
         }
     }
+}
+
+/// The reason for this format: with realistic keys the 4-byte index must tell
+/// entries apart. Taken over full keys it could not — they all start "\x01pos".
+#[test]
+fn the_suffix_index_discriminates_where_a_full_key_index_cannot() {
+    let mut next = rng(9);
+    let mut keys: Vec<Vec<u8>> = (0..40)
+        .map(|_| {
+            [
+                b"\x01posts/".as_slice(),
+                &next().to_be_bytes(),
+                &next().to_be_bytes(),
+            ]
+            .concat()
+        })
+        .collect();
+    keys.sort();
+    let mut b = NodeBuilder::leaf();
+    for k in &keys {
+        b.push(k, Value::Inline(b"")).unwrap();
+    }
+    let bytes = b.finish().unwrap();
+    let n = Node::parse(&bytes).unwrap();
+    assert!(n.prefix().starts_with(b"\x01posts/"));
+    let distinct = |f: &dyn Fn(usize) -> u32| {
+        (0..n.len())
+            .map(f)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    assert_eq!(
+        distinct(&|i| key4(&n.key(i))),
+        1,
+        "control: full-key prefixes are all identical"
+    );
+    assert!(
+        distinct(&|i| key4(n.suffix(i))) > 30,
+        "suffix prefixes must differ"
+    );
+    // the shared bytes are stored once: smaller than storing every key in full
+    let full: usize = 28 + keys.iter().map(|k| 6 + 7 + k.len()).sum::<usize>();
+    assert_eq!(bytes.len(), full - 39 * n.prefix().len()); // 40 keys, prefix kept once
+}
+
+/// Hand-encode a leaf so tests can produce encodings the builder never would.
+fn raw_leaf(prefix: &[u8], entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let n = entries.len();
+    let base = 28 + prefix.len() + n * 6;
+    let (mut body, mut offs, mut bytes_agg) = (Vec::new(), Vec::new(), 0u64);
+    for (suffix, val) in entries {
+        offs.push((base + body.len()) as u16);
+        body.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
+        body.push(0);
+        body.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        body.extend_from_slice(suffix);
+        body.extend_from_slice(val);
+        bytes_agg += (prefix.len() + suffix.len() + val.len()) as u64;
+    }
+    let mut out = b"PT01".to_vec();
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&bytes_agg.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(prefix.len() as u16).to_le_bytes());
+    out.extend_from_slice(prefix);
+    for o in offs {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+    for (suffix, _) in entries {
+        out.extend_from_slice(&key4(suffix).to_be_bytes());
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+#[test]
+fn only_the_maximal_prefix_is_accepted() {
+    let err = |v: Vec<u8>| Node::parse(&v).map(|_| ()).unwrap_err();
+    // control: the hand encoder produces exactly what the builder produces
+    let mut b = NodeBuilder::leaf();
+    b.push(b"xa", Value::Inline(b"1")).unwrap();
+    b.push(b"xb", Value::Inline(b"2")).unwrap();
+    assert_eq!(
+        raw_leaf(b"x", &[(b"a", b"1"), (b"b", b"2")]),
+        b.finish().unwrap()
+    );
+    // same keys, prefix too short: a second encoding of the same node
+    assert_eq!(
+        err(raw_leaf(b"", &[(b"xa", b"1"), (b"xb", b"2")])),
+        NodeError::NonCanonicalPrefix
+    );
+    // a lone key must be all prefix
+    assert_eq!(
+        err(raw_leaf(b"k", &[(b"ey", b"v")])),
+        NodeError::NonCanonicalPrefix
+    );
+    Node::parse(&raw_leaf(b"key", &[(b"", b"v")])).unwrap();
+    // the empty tree has no prefix
+    assert_eq!(err(raw_leaf(b"p", &[])), NodeError::BadShape);
+}
+
+#[test]
+fn over_long_keys_are_refused_by_builder_and_parser() {
+    let long = vec![b'k'; MAX_KEY + 1];
+    assert_eq!(
+        NodeBuilder::leaf().push(&long, Value::Inline(b"")),
+        Err(BuildError::KeyTooLong)
+    );
+    NodeBuilder::leaf()
+        .push(&long[..MAX_KEY], Value::Inline(b""))
+        .unwrap();
+    // prefix + suffix over the cap, hand-encoded: 300 shared bytes + 300-byte suffixes
+    let p = vec![b'p'; 300];
+    let (a, z) = (vec![b'a'; 300], vec![b'z'; 300]);
+    let v = raw_leaf(&p, &[(&a, b""), (&z, b"")]);
+    assert_eq!(
+        Node::parse(&v).map(|_| ()).unwrap_err(),
+        NodeError::KeyTooLong
+    );
 }
 
 /// Corrupt valid nodes at random. `parse` must never panic, and anything it
@@ -288,7 +417,12 @@ fn parse_never_panics_and_accepts_only_canonical_bytes() {
         )
         .unwrap();
     branch.push_parity([5; 32]).unwrap();
+    let mut shared = NodeBuilder::leaf();
+    for k in [b"\x01posts/aa".as_slice(), b"\x01posts/ab", b"\x01posts/zz"] {
+        shared.push(k, Value::Inline(b"v")).unwrap();
+    }
     let seeds = [
+        shared.finish().unwrap(),
         sample_leaf(),
         two_key_leaf(),
         branch.finish().unwrap(),
