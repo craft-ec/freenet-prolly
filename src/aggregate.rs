@@ -43,13 +43,42 @@ use crate::{block_id, kind, Cid};
 /// length, counting a referenced value at its real size rather than the 32
 /// bytes of the reference that stands for it in the leaf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Claimed(pub Agg);
+pub struct Claimed(Agg);
 
 /// A count where every node in the range was read and checked against its
 /// parent. Same fields, same meaning of `bytes` — a different amount of trust,
 /// which is why it is a different type.
+/// ```
+/// # use freenet_prolly::{aggregate::aggregate_verified, build::init, store::MemBlocks};
+/// # let mut b = MemBlocks::default(); let root = init(&mut b);
+/// let v = aggregate_verified(&b, &root, &Default::default()).unwrap();
+/// assert_eq!(v.agg().count, 0);
+/// ```
+///
+/// The field is private, so this is the ONLY way to get one. A `Verified` that
+/// could be written by hand would be a `Claimed` with a better name:
+///
+/// ```compile_fail
+/// # use freenet_prolly::{aggregate::Verified, node::Agg};
+/// // no: only `aggregate_verified` may say a number was verified
+/// let lie = Verified(Agg::default());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Verified(pub Agg);
+pub struct Verified(Agg);
+
+impl Claimed {
+    /// The numbers, with whatever trust the type carries. Named rather than
+    /// public so the type has to be said out loud at every use.
+    pub fn agg(&self) -> Agg {
+        self.0
+    }
+}
+
+impl Verified {
+    pub fn agg(&self) -> Agg {
+        self.0
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AggError {
@@ -118,6 +147,10 @@ fn whole_range(r: &Range) -> Result<(), AggError> {
     }
     // The defaults mean "no opinion" — `Range::default()` and `Range::prefix`
     // carry them, and both must work here. Anything else is a paging request.
+    //
+    // Which makes this check DEFINITIONAL rather than absolute: "no opinion" is
+    // defined as equal to the default rather than as the absence of a limit, so
+    // if `Range`'s defaults ever change meaning, this moves with them.
     if r.max_entries != d.max_entries || r.max_bytes != d.max_bytes {
         return Err(AggError::NotWholeRange("a limit"));
     }
@@ -190,21 +223,40 @@ fn count<B: Blocks>(
     Ok(())
 }
 
-/// Does `parent` record an aggregate for `child` that the child itself refutes?
+/// Do these two blocks refute each other?
 ///
-/// A lying aggregate has a two-block proof. Both blocks are hash-keyed, so
-/// whoever is shown them can check they are the blocks their ids say they are;
-/// the parent names a child id and an aggregate, and the child's own header
-/// folds to something else. Nothing but these two blocks is needed, and no
-/// trust in whoever produced them.
+/// A parent records three things about each child: its id, its first key, and
+/// what its subtree adds up to. The child's own header states the last two. If
+/// they disagree, the pair is a proof: both blocks are hash-keyed, so whoever
+/// is shown them can check they are the blocks their ids say they are, and
+/// nothing else is needed — no third block, no trust in whoever produced them.
+/// `true` means *these two cannot both be right*, which is all a proof from two
+/// blocks can ever establish; it does not say which of them is the liar.
 ///
-/// `false` if the two are consistent, or if `child` is not a child of `parent`.
+/// It is `false` — never a panic — for anything that is not such a pair:
+/// garbage, a leaf where a branch was expected, a block this parent does not
+/// name, an empty node. **This function exists so a stranger can hand a keeper
+/// or a client two blocks**, so every accessor below is reached only after the
+/// shape that makes it valid has been checked. It is conservative by
+/// construction: it returns `true` only when it can point at two concrete
+/// values that disagree.
+///
+/// A child at the wrong level counts, and is the reason the level is compared
+/// rather than assumed: a branch may only name children one level below it, so
+/// a parent naming a block at any other level has recorded something that block
+/// contradicts, exactly like a wrong aggregate.
 pub fn fraud(parent: &[u8], child: &[u8]) -> bool {
     let (Ok(p), Ok(c)) = (Node::parse(parent), Node::parse(child)) else {
         return false;
     };
+    // A leaf names no children, so it can hold no claim about this block.
+    if p.is_leaf() {
+        return false;
+    }
     let id = block_id(kind::TREE_NODE, child);
-    (0..p.len())
-        .filter(|i| p.child(*i).0 == id)
-        .any(|i| p.child(i).1 != c.agg())
+    (0..p.len()).filter(|i| p.child(*i).0 == id).any(|i| {
+        p.child(i).1 != c.agg()
+            || c.level() + 1 != p.level()
+            || (!c.is_empty() && p.key(i) != c.key(0))
+    })
 }

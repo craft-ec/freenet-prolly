@@ -4,9 +4,7 @@
 mod common;
 use common::{dataset, rng};
 
-use freenet_prolly::aggregate::{
-    aggregate, aggregate_verified, fraud, AggError, Claimed, Verified,
-};
+use freenet_prolly::aggregate::{aggregate, aggregate_verified, fraud, AggError};
 use freenet_prolly::apply::{apply_into, Edit};
 use freenet_prolly::build::init;
 use freenet_prolly::node::{Agg, Node, NodeBuilder, MAX_INLINE};
@@ -133,13 +131,13 @@ fn both_answers_equal_the_reference_for_random_ranges() {
         };
         let want = reference(&m, &req);
         assert_eq!(
-            aggregate(&blocks, &root, &req).unwrap(),
-            Claimed(want),
+            aggregate(&blocks, &root, &req).unwrap().agg(),
+            want,
             "{req:?}"
         );
         assert_eq!(
-            aggregate_verified(&blocks, &root, &req).unwrap(),
-            Verified(want),
+            aggregate_verified(&blocks, &root, &req).unwrap().agg(),
+            want,
             "{req:?}"
         );
         checked += 1;
@@ -148,14 +146,14 @@ fn both_answers_equal_the_reference_for_random_ranges() {
     for p in [&b"d/"[..], b"e/", b"z/big/", b"nothing"] {
         let req = Range::prefix(p);
         assert_eq!(
-            aggregate(&blocks, &root, &req).unwrap(),
-            Claimed(reference(&m, &req))
+            aggregate(&blocks, &root, &req).unwrap().agg(),
+            reference(&m, &req)
         );
         checked += 1;
     }
-    let whole = aggregate(&blocks, &root, &Range::default()).unwrap();
-    assert_eq!(whole, Claimed(reference(&m, &Range::default())));
-    assert_eq!(whole.0.count, m.len() as u64);
+    let whole = aggregate(&blocks, &root, &Range::default()).unwrap().agg();
+    assert_eq!(whole, reference(&m, &Range::default()));
+    assert_eq!(whole.count, m.len() as u64);
     println!("{checked} ranges: claimed and verified both equal the reference");
 }
 
@@ -185,7 +183,7 @@ fn the_fast_path_reads_two_paths_and_the_verified_one_reads_everything() {
         let c = counting(&blocks);
         let got = aggregate(&c, &root, &req).unwrap();
         let reads = c.reads.borrow().len();
-        assert_eq!(got, Claimed(reference(&m, &req)), "{what}");
+        assert_eq!(got.agg(), reference(&m, &req), "{what}");
         println!("  {what:14}: {reads} nodes read (height {height}, tree {nodes} nodes)");
         assert!(
             reads <= 2 * height + 1,
@@ -197,7 +195,7 @@ fn the_fast_path_reads_two_paths_and_the_verified_one_reads_everything() {
     let c = counting(&blocks);
     let v = aggregate_verified(&c, &root, &Range::default()).unwrap();
     let reads = c.reads.borrow().len();
-    assert_eq!(v.0, reference(&m, &Range::default()));
+    assert_eq!(v.agg(), reference(&m, &Range::default()));
     println!("  verified whole : {reads} nodes read");
     assert_eq!(
         c.reads.borrow().iter().copied().collect::<HashSet<_>>(),
@@ -262,7 +260,7 @@ fn a_cold_count_resumes_and_names_only_the_edges() {
             Err(e) => panic!("{e:?}"),
         }
     };
-    assert_eq!(got, Claimed(reference(&m, &req)));
+    assert_eq!(got.agg(), reference(&m, &req));
     println!(
         "cold count: {rounds} rounds, {} blocks fetched, height {height}",
         named.len()
@@ -311,7 +309,7 @@ fn a_lying_aggregate_is_believed_refused_and_provable() {
     // Claimed believes it. That is the documented limit, asserted as such.
     let claimed = aggregate(&blocks, &liar_id, &Range::default()).unwrap();
     assert_eq!(
-        claimed.0.count,
+        claimed.agg().count,
         truth.count + 1_000_000,
         "the fast path must return the writer's number, wrong or not"
     );
@@ -421,8 +419,8 @@ fn the_cost_of_a_count_measured() {
         let slow = t.elapsed();
         let slow_reads = c.reads.borrow().len();
 
-        assert_eq!(got.0, want);
-        assert_eq!(v.0, want);
+        assert_eq!(got.agg(), want);
+        assert_eq!(v.agg(), want);
         println!(
             "count of prefix over {n:>7} entries ({} in range): claimed {fast:>10?} / {fast_reads:>5} reads · verified {slow:>10?} / {slow_reads:>5} reads",
             want.count
@@ -431,5 +429,119 @@ fn the_cost_of_a_count_measured() {
             fast_reads * 10 < slow_reads,
             "the fast path must be a different shape"
         );
+    }
+}
+
+/// `fraud` is handed two blocks by a stranger. Nothing a stranger can send may
+/// make it panic — a keeper or a client calling it on submitted bytes would go
+/// down with it, which turns a fraud PROOF into a way to kill the checker.
+#[test]
+fn nothing_a_stranger_can_send_makes_the_fraud_check_panic() {
+    let m: Map = dataset(37, 4000).into_iter().collect();
+    let (root, store) = build(&m);
+    let r = Node::parse(store.0.get(&root).unwrap()).unwrap();
+    let branch = store.0.get(&root).unwrap().clone();
+    let child = store.0.get(&r.child(0).0).unwrap().clone();
+    let leaf = store
+        .0
+        .values()
+        .find(|b| Node::parse(b).is_ok_and(|n| n.is_leaf()))
+        .unwrap()
+        .clone();
+    let empty = {
+        let mut blocks = MemBlocks::default();
+        let e = init(&mut blocks);
+        blocks.0.get(&e).unwrap().clone()
+    };
+    // A branch that is not this child's parent: same shape, different subtree.
+    let other: Vec<u8> = (1..r.len())
+        .filter_map(|i| store.0.get(&r.child(i).0).cloned())
+        .find(|b| Node::parse(b).is_ok_and(|n| !n.is_leaf()))
+        .unwrap_or_else(|| branch.clone());
+
+    for (what, p, c) in [
+        ("a leaf as the parent", leaf.clone(), leaf.clone()),
+        (
+            "garbage as the parent",
+            b"not a node at all".to_vec(),
+            child.clone(),
+        ),
+        ("garbage as the child", branch.clone(), b"\0\0\0".to_vec()),
+        ("the empty string", Vec::new(), Vec::new()),
+        ("an empty node", branch.clone(), empty.clone()),
+        ("an empty node as the parent", empty.clone(), child.clone()),
+        (
+            "a block this parent does not name",
+            branch.clone(),
+            leaf.clone(),
+        ),
+        ("a child of a different branch", other, child.clone()),
+        (
+            "the parent as its own child",
+            branch.clone(),
+            branch.clone(),
+        ),
+        ("an honest pair", branch.clone(), child.clone()),
+    ] {
+        assert!(!fraud(&p, &c), "{what} must not read as fraud");
+        // And the same bytes the other way round, which nobody promised is a
+        // valid pair either.
+        assert!(!fraud(&c, &p) || what == "a child of a different branch");
+    }
+}
+
+/// The same question put to the counting path: a store is not trusted either.
+#[test]
+fn a_hostile_store_cannot_make_a_count_panic() {
+    let m: Map = dataset(38, 4000).into_iter().collect();
+    let (root, full) = build(&m);
+    let r = Node::parse(full.0.get(&root).unwrap()).unwrap();
+    let victim = r.child(0).0;
+    let leaf_bytes = full
+        .0
+        .values()
+        .find(|b| Node::parse(b).is_ok_and(|n| n.is_leaf()))
+        .unwrap()
+        .clone();
+
+    for (what, served) in [
+        ("a leaf served where a branch belongs", leaf_bytes),
+        ("raw bytes served as a node", b"nonsense".to_vec()),
+        ("an empty body", Vec::new()),
+    ] {
+        let mut blocks = full.clone();
+        blocks.insert(victim, &served);
+        // A range whose lower edge runs through the tampered child, so the
+        // claimed path has to open it rather than believing its aggregate.
+        let req = Range {
+            // Not the first key: that would put the tampered child WHOLLY
+            // inside the range, where the claimed path believes its aggregate
+            // and never opens it — correct behaviour, and a vacuous test.
+            lo: Bound::Included(m.keys().nth(5).unwrap().clone()),
+            hi: Bound::Included(m.keys().nth(3000).unwrap().clone()),
+            ..Range::default()
+        };
+        // Reached as a CHILD, the parent's claim about it is contradicted, so
+        // both paths must refuse rather than fold in whatever was served.
+        for got in [
+            aggregate(&blocks, &root, &req).err(),
+            aggregate_verified(&blocks, &root, &req).err(),
+        ] {
+            assert!(
+                matches!(
+                    got,
+                    Some(AggError::Read(
+                        ReadError::Mismatch(_) | ReadError::Corrupt(..)
+                    ))
+                ),
+                "{what}: expected a refusal, got {got:?}"
+            );
+        }
+        // Handed in as a ROOT, nothing claims anything about it, so there is
+        // nothing to contradict: a leaf root is a legitimate one-node tree and
+        // answering is correct. The requirement here is only that a count over
+        // an arbitrary block decides something instead of panicking.
+        let _ = aggregate(&blocks, &victim, &Range::default());
+        let _ = aggregate_verified(&blocks, &victim, &Range::default());
     }
 }
