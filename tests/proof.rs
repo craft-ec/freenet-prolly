@@ -1261,3 +1261,142 @@ fn a_blocked_page_can_never_be_proved_complete() {
     assert!(blocked > 0, "nothing was blocked; the test proves nothing");
     println!("{blocked} blocked pages, none of them provable");
 }
+
+/// Page a listing to its END, both directions, and verify every page —
+/// including the last, which is empty.
+///
+/// The last page of a paged listing is the one nobody writes a test for: the
+/// resume key has reached the far bound, so the bounds cannot hold a key and
+/// `range` answers before reading anything. The honest proof for it has ZERO
+/// blocks, and refusing that tells a light client its gateway lied at exactly
+/// the moment it finished reading a feed. Limits are chosen to land on the
+/// range's last entry, which is what makes the empty page appear.
+#[test]
+fn the_final_page_of_a_listing_verifies_in_both_directions() {
+    let m: Map = dataset(29, 9_000).into_iter().collect();
+    let (blocks, root) = build(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut empties = 0;
+    let mut pages = 0;
+    for (lo, hi) in [(100usize, 140usize), (2_000, 2_057), (5_000, 5_005), (0, 3)] {
+        let span = hi - lo + 1;
+        // Limits that divide the span exactly, so a page ends on its last entry.
+        for limit in [1usize, span, span / 2 + 1, span + 5] {
+            if limit == 0 {
+                continue;
+            }
+            for reverse in [false, true] {
+                let base = Range {
+                    lo: std::ops::Bound::Included(keys[lo].clone()),
+                    hi: std::ops::Bound::Included(keys[hi].clone()),
+                    reverse,
+                    max_entries: limit,
+                    ..Range::default()
+                };
+                let mut after: Option<Vec<u8>> = None;
+                let mut seen = 0usize;
+                for _ in 0..(span + 3) {
+                    let req = Range {
+                        after: after.clone(),
+                        ..base.clone()
+                    };
+                    let p = prove_range(&blocks, &root, &req)
+                        .unwrap_or_else(|e| panic!("honest prover refused: {e:?} ({req:?})"));
+                    let page = verify_range(&root, &req, &p).unwrap_or_else(|e| {
+                        panic!(
+                            "an HONEST proof was refused as {e:?}: reverse={reverse} \
+                             limit={limit} after={} nodes={}",
+                            after.is_some(),
+                            p.nodes.len()
+                        )
+                    });
+                    pages += 1;
+                    if page.entries.is_empty() {
+                        empties += 1;
+                        assert!(p.nodes.is_empty() || page.next.is_some());
+                    }
+                    seen += page.entries.len();
+                    match page.next {
+                        Some(n) => after = Some(n),
+                        None => break,
+                    }
+                }
+                assert_eq!(seen, span, "reverse={reverse} limit={limit}");
+            }
+        }
+    }
+    assert!(
+        empties > 0,
+        "no empty final page occurred; the test proves nothing"
+    );
+    println!("{pages} pages proved to the end, {empties} of them the empty final page");
+}
+
+/// The empty answer has exactly one proof: the empty one.
+#[test]
+fn an_empty_bounds_question_takes_the_empty_proof_and_nothing_else() {
+    let m: Map = dataset(30, 5_000).into_iter().collect();
+    let (blocks, root) = build(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+
+    // Reverse, resumed exactly at its lower bound: nothing can satisfy both.
+    let empty_q = Range {
+        lo: std::ops::Bound::Included(keys[100].clone()),
+        hi: std::ops::Bound::Included(keys[200].clone()),
+        reverse: true,
+        after: Some(keys[100].clone()),
+        max_entries: 10,
+        ..Range::default()
+    };
+    let p = prove_range(&blocks, &root, &empty_q).unwrap();
+    assert!(
+        p.nodes.is_empty(),
+        "the honest proof of an empty question is empty"
+    );
+    let page = verify_range(&root, &empty_q, &p).unwrap();
+    assert!(page.entries.is_empty() && page.next.is_none());
+
+    // The forward mirror: resumed at its upper bound.
+    let fwd = Range {
+        reverse: false,
+        after: Some(keys[200].clone()),
+        ..empty_q.clone()
+    };
+    let pf = prove_range(&blocks, &root, &fwd).unwrap();
+    assert!(pf.nodes.is_empty());
+    assert!(verify_range(&root, &fwd, &pf).unwrap().entries.is_empty());
+
+    // Blocks attached to an empty question are Extra — one answer, one proof.
+    let real = prove_range(
+        &blocks,
+        &root,
+        &Range {
+            after: None,
+            ..empty_q.clone()
+        },
+    )
+    .unwrap();
+    assert!(!real.nodes.is_empty());
+    assert_eq!(
+        verify_range(&root, &empty_q, &real),
+        Err(ProofError::Extra),
+        "blocks attached to an empty-bounds question must be refused"
+    );
+
+    // And a NON-empty question still refuses a zero-node proof.
+    let nonempty = Range {
+        after: None,
+        ..empty_q.clone()
+    };
+    assert!(
+        verify_range(&root, &nonempty, &Proof::default()).is_err(),
+        "a zero-node proof answered a question with entries in it"
+    );
+    for after in [None, Some(keys[150].clone())] {
+        let q = Range {
+            after,
+            ..nonempty.clone()
+        };
+        assert!(verify_range(&root, &q, &Proof::default()).is_err());
+    }
+}

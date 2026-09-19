@@ -118,7 +118,7 @@
 
 use crate::aggregate::{aggregate, AggError, Claimed};
 use crate::node::{Node, Value, MAX_NODE, MAX_VALUE};
-use crate::range::{range, PageEnd, Range};
+use crate::range::{bounds_are_empty, range, PageEnd, Range};
 use crate::read::get;
 use crate::store::{Blocks, ReadError};
 use crate::{block_id, kind, Cid};
@@ -731,6 +731,25 @@ pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof
 /// the proof does not carry is refused rather than guessed at.
 pub fn verify_range(root: &Cid, r: &Range, proof: &Proof) -> Result<ProvenPage, ProofError> {
     let per_page = bounded(r)?;
+    // A question whose BOUNDS cannot hold a key is answered by the verifier
+    // itself, from its own range — nothing in the proof is consulted, because
+    // nothing in a proof could change the answer. This is the last page of a
+    // paged listing: `after` has reached the far bound, `range` answers
+    // EndOfRange before reading anything, so the honest proof has ZERO blocks.
+    // Refusing it (as this did) makes a light client paging a feed to its end
+    // see its final page rejected and conclude the gateway lied.
+    //
+    // The canonical proof for such a question is the EMPTY one, so blocks
+    // attached to it are `Extra`.
+    if bounds_are_empty(r) {
+        if !proof.nodes.is_empty() {
+            return Err(ProofError::Extra);
+        }
+        return Ok(ProvenPage {
+            entries: Vec::new(),
+            next: None,
+        });
+    }
     // Shape first, as ever: the root's level bounds the two edge paths, the
     // entry limit bounds the leaves, and both are known from the first block.
     //
