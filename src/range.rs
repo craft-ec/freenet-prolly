@@ -245,7 +245,7 @@ pub(crate) fn entry_bytes(key: &[u8], v: &Value<'_>) -> usize {
 /// satisfy — and without this the scan would descend toward a neighbouring leaf
 /// it has no use for, and either fetch it or (worse, before #37) conclude from
 /// an empty frontier that it had finished.
-fn bounds_are_empty(r: &Range) -> bool {
+pub(crate) fn bounds_are_empty(r: &Range) -> bool {
     let start = start_bound(r);
     let far = if r.reverse { &r.lo } else { &r.hi };
     match (&start, far) {

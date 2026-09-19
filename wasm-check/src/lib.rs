@@ -80,3 +80,123 @@ pub extern "C" fn proof_verify(n: u32) -> i32 {
         _ => 0,
     }
 }
+
+/// The frozen RANGE proof for `dataset(1, n)`: a 32-entry page from the first
+/// key. Same duplication rule as `proof_vector`.
+fn range_proof_vector(n: u32) -> (freenet_prolly::proof::Proof, Cid, freenet_prolly::range::Range) {
+    use freenet_prolly::range::Range;
+    use freenet_prolly::store::MemBlocks;
+    let e = common::dataset(1, n as usize);
+    let mut store = MemBlocks::default();
+    let root = build(
+        e.iter().map(|(k, v)| (k.as_slice(), Value::Inline(v))),
+        |c, b| store.insert(c, b),
+    )
+    .unwrap();
+    let mut keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    let r = Range {
+        lo: core::ops::Bound::Included(keys[0].clone()),
+        max_entries: 32,
+        ..Range::default()
+    };
+    let p = freenet_prolly::proof::prove_range(&store, &root, &r).unwrap();
+    (p, root, r)
+}
+
+#[no_mangle]
+pub extern "C" fn range_proof_hash(n: u32) -> *const u8 {
+    static mut OUT: [u8; 32] = [0; 32];
+    let (p, _, _) = range_proof_vector(n);
+    unsafe {
+        OUT = *blake3::hash(&p.encode()).as_bytes();
+        &raw const OUT as *const u8
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn range_proof_shape(n: u32) -> u64 {
+    let (p, _, _) = range_proof_vector(n);
+    ((p.nodes.len() as u64) << 32) | p.encode().len() as u64
+}
+
+/// 1 if the page this target proved verifies here and holds 32 entries.
+#[no_mangle]
+pub extern "C" fn range_proof_verify(n: u32) -> i32 {
+    use freenet_prolly::proof::{verify_range_bytes, Proof};
+    let (p, root, r) = range_proof_vector(n);
+    let bytes = p.encode();
+    if Proof::decode(&bytes).is_err() {
+        return 0;
+    }
+    match verify_range_bytes(&root, &r, &bytes) {
+        Ok(page) if page.entries.len() == 32 => 1,
+        _ => 0,
+    }
+}
+
+/// 1 if the EMPTY final page of a reverse listing verifies here, at the wire
+/// door, and if blocks attached to that question are refused.
+///
+/// The page a light client sees when it finishes reading a feed. It was
+/// refused on this path while passing on the other one, so it is checked on
+/// the target and through the bytes.
+#[no_mangle]
+pub extern "C" fn empty_final_page_ok(n: u32) -> i32 {
+    use freenet_prolly::proof::{prove_range, verify_range_bytes, Proof};
+    use freenet_prolly::range::Range;
+    use freenet_prolly::store::MemBlocks;
+    let e = common::dataset(1, n as usize);
+    let mut store = MemBlocks::default();
+    let root = build(
+        e.iter().map(|(k, v)| (k.as_slice(), Value::Inline(v))),
+        |c, b| store.insert(c, b),
+    )
+    .unwrap();
+    let mut keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    // Reverse, resumed at the lower bound: the bounds cannot hold a key.
+    let q = Range {
+        lo: core::ops::Bound::Included(keys[10].clone()),
+        hi: core::ops::Bound::Included(keys[50].clone()),
+        reverse: true,
+        after: Some(keys[10].clone()),
+        max_entries: 8,
+        ..Range::default()
+    };
+    let Ok(p) = prove_range(&store, &root, &q) else {
+        return 0;
+    };
+    if !p.nodes.is_empty() {
+        return 0;
+    }
+    match verify_range_bytes(&root, &q, &p.encode()) {
+        Ok(page) if page.entries.is_empty() && page.next.is_none() => {}
+        _ => return 0,
+    }
+    // And a non-empty proof for that question is refused.
+    let Ok(real) = prove_range(
+        &store,
+        &root,
+        &Range {
+            after: None,
+            ..q.clone()
+        },
+    ) else {
+        return 0;
+    };
+    if verify_range_bytes(&root, &q, &real.encode()).is_ok() {
+        return 0;
+    }
+    // A zero-node proof still cannot answer a question with entries in it.
+    let nonempty = Range {
+        after: None,
+        ..q.clone()
+    };
+    if verify_range_bytes(&root, &nonempty, &Proof::default().encode()).is_ok() {
+        return 0;
+    }
+    1
+}
