@@ -9,17 +9,34 @@ cargo build --quiet --release --target wasm32-unknown-unknown --manifest-path wa
 node - <<'JS'
 const fs = require('fs');
 const wasm = fs.readFileSync('wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm');
-const want = fs.readFileSync('tests/vectors.txt', 'utf8').split('\n')
-  .filter(l => l.startsWith('root ')).map(l => l.split(' '));
+const lines = fs.readFileSync('tests/vectors.txt', 'utf8').split('\n');
+const want = lines.filter(l => l.startsWith('root ')).map(l => l.split(' '));
+const proofs = lines.filter(l => l.startsWith('proof ')).map(l => l.split(' '));
 if (want.length === 0) { console.error('no root vectors found'); process.exit(1); }
+if (proofs.length === 0) { console.error('no proof vectors found'); process.exit(1); }
 WebAssembly.instantiate(wasm).then(({ instance }) => {
   let bad = 0;
+  const read32 = p => Buffer.from(new Uint8Array(instance.exports.memory.buffer, p, 32)).toString('hex');
   for (const [, n, hex] of want) {
-    const p = instance.exports.root(Number(n));
-    const got = Buffer.from(new Uint8Array(instance.exports.memory.buffer, p, 32)).toString('hex');
+    const got = read32(instance.exports.root(Number(n)));
     if (got !== hex) { bad++; console.error(`root ${n}: wasm32 ${got} != native ${hex}`); }
   }
-  console.log(`wasm32 roots: ${want.length - bad}/${want.length} match native`);
+  // A proof must be the same BYTES here and verify HERE. Byte equality alone
+  // would pass for a proof this target cannot check.
+  for (const [, n, , nodes, bytes, hex] of proofs) {
+    const got = read32(instance.exports.proof_hash(Number(n)));
+    if (got !== hex) { bad++; console.error(`proof ${n}: wasm32 ${got} != native ${hex}`); }
+    const shape = instance.exports.proof_shape(Number(n));
+    const gotNodes = Number(shape >> 32n), gotBytes = Number(shape & 0xffffffffn);
+    if (gotNodes !== Number(nodes) || gotBytes !== Number(bytes)) {
+      bad++;
+      console.error(`proof ${n}: wasm32 ${gotNodes} nodes/${gotBytes} B != native ${nodes}/${bytes}`);
+    }
+    if (instance.exports.proof_verify(Number(n)) !== 1) {
+      bad++; console.error(`proof ${n}: does not verify on wasm32`);
+    }
+  }
+  console.log(`wasm32: ${want.length - bad} roots and ${proofs.length} proofs match native and verify`);
   process.exit(bad ? 1 : 0);
 });
 JS

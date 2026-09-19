@@ -474,6 +474,12 @@ fn frozen_vectors() {
     for n in [0usize, 1, 5000] {
         got += &format!("root {n} {}\n", hex(&build(&dataset(1, n)).0));
     }
+    // Proof vectors: a proof must be the same bytes on every target, and must
+    // VERIFY there — `check-wasm.sh` checks both against these lines.
+    for n in [1000usize, 5000] {
+        let (key, nodes, bytes, hash) = proof_vector(n);
+        got += &format!("proof {n} {} {nodes} {bytes} {}\n", hex(&key), hex(&hash));
+    }
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -789,4 +795,37 @@ fn the_cost_of_check_node_measured() {
         hashes > keys * 2,
         "BLAKE3 {hashes:?} should dominate the key handling {keys:?}"
     );
+}
+
+/// The frozen proof for `dataset(1, n)`: the median key, its path, and the
+/// hash of the encoded proof.
+///
+/// Duplicated in `wasm-check` on purpose — the two computations meet only in
+/// `tests/vectors.txt`, which is what makes the file a check of the TARGET
+/// rather than of a shared helper.
+fn proof_vector(n: usize) -> (Vec<u8>, usize, usize, [u8; 32]) {
+    use freenet_prolly::proof::{prove, verify, Proven};
+    use freenet_prolly::store::MemBlocks;
+    let e = dataset(1, n);
+    let (root, nodes) = build(&e);
+    let mut store = MemBlocks::default();
+    for (c, b) in &nodes {
+        store.insert(*c, b);
+    }
+    let mut keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    let key = keys[keys.len() / 2].clone();
+    let p = prove(&store, &root, &key).unwrap();
+    assert!(matches!(
+        verify(&root, &key, &p).unwrap(),
+        Proven::Present(_)
+    ));
+    let bytes = p.encode();
+    (
+        key,
+        p.nodes.len(),
+        bytes.len(),
+        *blake3::hash(&bytes).as_bytes(),
+    )
 }
