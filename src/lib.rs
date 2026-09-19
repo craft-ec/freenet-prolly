@@ -1,6 +1,8 @@
 //! Prolly tree: a sorted `key -> value` map whose shape and root hash are a pure
 //! function of its contents. See ARCHITECTURE.md §5. Built in phase 1.
 
+pub mod node;
+
 /// Content id of a block: BLAKE3-256 of its bytes.
 pub type Cid = [u8; 32];
 
