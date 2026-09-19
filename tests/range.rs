@@ -930,3 +930,218 @@ fn a_branch_with_lying_aggregates_cannot_make_a_scan_misbehave() {
     }
     same(&got, &all(&m), "served entries must be the honest ones");
 }
+
+/// Every node of the tree with the key span it covers, computed by walking the
+/// store from the root — an oracle that owes nothing to `range`.
+fn spans(store: &MemBlocks, root: &Cid) -> Vec<(Cid, Vec<u8>, Vec<u8>, bool)> {
+    fn go(store: &MemBlocks, id: Cid, out: &mut Vec<(Cid, Vec<u8>, Vec<u8>, bool)>) {
+        let n = Node::parse(&store.0[&id]).unwrap();
+        if n.is_empty() {
+            return;
+        }
+        if n.is_leaf() {
+            out.push((id, n.key(0), n.key(n.len() - 1), true));
+            return;
+        }
+        let before = out.len();
+        for i in 0..n.len() {
+            go(store, n.child(i).0, out);
+        }
+        // A branch covers whatever its children cover.
+        let lo = out[before..].iter().map(|s| s.1.clone()).min().unwrap();
+        let hi = out[before..].iter().map(|s| s.2.clone()).max().unwrap();
+        out.push((id, lo, hi, false));
+    }
+    let mut out = Vec::new();
+    go(store, *root, &mut out);
+    out
+}
+
+/// `need` is an assertion this library makes to its caller, and every id in it
+/// becomes a network GET. Naming a block the scan can never use is invisible —
+/// the entries still come out right — so it is asserted directly: every id ever
+/// named must be a node whose key span overlaps the range.
+#[test]
+fn a_scan_never_names_a_block_outside_its_range() {
+    let m: Map = dataset(15, 20_000).into_iter().collect();
+    let (root, full) = scratch(&m);
+    let lv = leaves(&full);
+    let spans = spans(&full, &root);
+    assert!(lv.len() > 500 && spans.len() > lv.len());
+
+    let mid = lv.len() / 2;
+    let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        // inside a single leaf
+        ("inside one leaf", lv[mid].0.clone(), lv[mid].1.clone()),
+        // spanning three leaves in the middle
+        ("three leaves", lv[mid].0.clone(), lv[mid + 2].1.clone()),
+        // at each end of the tree
+        ("first leaf", lv[0].0.clone(), lv[0].1.clone()),
+        (
+            "last leaf",
+            lv[lv.len() - 1].0.clone(),
+            lv[lv.len() - 1].1.clone(),
+        ),
+    ];
+    for (what, lo, hi) in cases {
+        for reverse in [false, true] {
+            // No limit, so the aggregate bound cannot mask an over-wide frontier.
+            let req = Range {
+                lo: Bound::Included(lo.clone()),
+                hi: Bound::Included(hi.clone()),
+                reverse,
+                max_entries: 1_000_000,
+                max_bytes: usize::MAX,
+                ..Range::default()
+            };
+            let mut held = MemBlocks::default();
+            held.insert(root, &full.0[&root]);
+            let mut named: HashSet<Cid> = HashSet::new();
+            let mut got = Pairs::new();
+            let mut req = req;
+            let mut pages = 0;
+            loop {
+                let p = range(&held, &root, &req).unwrap();
+                pages += 1;
+                for (k, v) in &p.entries {
+                    got.push((k.clone(), take(&full, v)));
+                }
+                let (need, next, done) = (p.need.clone(), p.next.clone(), p.finished());
+                drop(p);
+                if done {
+                    break;
+                }
+                for id in &need {
+                    named.insert(*id);
+                    held.insert(*id, &full.0[id]);
+                }
+                if let Some(k) = next {
+                    req.after = Some(k);
+                }
+                assert!(pages < 10_000, "{what}: did not terminate");
+            }
+            same(&got, &reference(&m, &req_of(&req)), what);
+
+            // Every named block overlaps the range, by the oracle's spans.
+            let outside: Vec<String> = named
+                .iter()
+                .map(|id| {
+                    spans
+                        .iter()
+                        .find(|(s, ..)| s == id)
+                        .unwrap_or_else(|| panic!("{what}: named an id that is not in the tree"))
+                })
+                .filter(|(_, smin, smax, _)| *smax < lo || *smin > hi)
+                .map(|(_, smin, smax, leaf)| {
+                    format!(
+                        "{}{}..{}",
+                        if *leaf { "leaf " } else { "branch " },
+                        hex(smin),
+                        hex(smax)
+                    )
+                })
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "{what} (reverse {reverse}): named {} blocks outside the range: {:?}",
+                outside.len(),
+                &outside[..outside.len().min(4)]
+            );
+
+            // And no more than the overlapping nodes exist to be fetched.
+            let overlapping = spans
+                .iter()
+                .filter(|(_, smin, smax, _)| !(*smax < lo || *smin > hi))
+                .count();
+            assert!(
+                named.len() <= overlapping,
+                "{what}: fetched {} blocks, only {overlapping} overlap the range",
+                named.len()
+            );
+            if !reverse && what == "three leaves" {
+                println!(
+                    "  {what:16}: {} blocks fetched, {overlapping} overlap the range",
+                    named.len()
+                );
+            }
+        }
+    }
+}
+
+/// `value_bytes` is the other assertion this library makes: it hands back bytes
+/// and says they are the value. Nothing tested it.
+#[test]
+fn value_bytes_checks_what_it_returns() {
+    use freenet_prolly::apply::apply;
+    // A value too large to inline, written through `apply` and read back out
+    // through a scan — the whole path a caller actually takes.
+    let mut m: Map = dataset(16, 2000).into_iter().collect();
+    let (root, mut store) = scratch(&m);
+    let big = vec![0x5au8; 3000];
+    let key = m.keys().nth(500).unwrap().clone();
+    let mut out = Vec::new();
+    let root = apply(
+        &store,
+        &root,
+        &[(key.clone(), Edit::Put(big.clone()))],
+        |c, b| out.push((c, b.to_vec())),
+    )
+    .unwrap()
+    .root;
+    for (c, b) in &out {
+        store.insert(*c, b);
+    }
+    m.insert(key.clone(), big.clone());
+
+    let req = Range {
+        lo: Bound::Included(key.clone()),
+        hi: Bound::Included(key.clone()),
+        ..Range::default()
+    };
+    let p = range(&store, &root, &req).unwrap();
+    assert_eq!(p.entries.len(), 1);
+    let cid = match p.entries[0].1 {
+        Value::Ref { cid, len } => {
+            assert_eq!(len as usize, big.len());
+            cid
+        }
+        Value::Inline(_) => panic!("a 3000 B value must live in its own block"),
+    };
+    drop(p);
+    assert_eq!(
+        value_bytes(&store, &cid, big.len() as u32).unwrap(),
+        &big[..]
+    );
+
+    // A length that disagrees with the block is refused, both ways.
+    for wrong in [big.len() as u32 - 1, big.len() as u32 + 1, 0] {
+        assert_eq!(
+            value_bytes(&store, &cid, wrong),
+            Err(ReadError::Mismatch(cid)),
+            "length {wrong} must not be accepted"
+        );
+    }
+    // A block that is not held names exactly itself.
+    let absent = block_id(kind::RAW, b"nobody has this");
+    assert_eq!(
+        value_bytes(&store, &absent, 15),
+        Err(ReadError::Need(vec![absent]))
+    );
+
+    // And the claim the doc comment makes: a tree node cannot come back as a
+    // value, because an id binds the kind. The same bytes have two different
+    // ids, and only the RAW one is what a leaf's `Ref` can carry.
+    let node_bytes = store.0[&root].clone();
+    assert!(Node::parse(&node_bytes).is_ok());
+    let as_node = block_id(kind::TREE_NODE, &node_bytes);
+    let as_value = block_id(kind::RAW, &node_bytes);
+    assert_eq!(as_node, root, "the root is addressed as a tree node");
+    assert_ne!(
+        as_node, as_value,
+        "kind is hashed into the id, so one body has two ids"
+    );
+    assert!(
+        !store.0.contains_key(&as_value),
+        "nothing in the store answers to the RAW id of a node"
+    );
+}

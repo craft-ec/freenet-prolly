@@ -357,6 +357,10 @@ fn rest_from_start(r: &Range) -> Range {
 }
 
 /// Which part of the range a child covers.
+///
+/// The frontier treats both the same — see [`Walk::name`] — so this exists for
+/// the range aggregate of #7, which reuses this walk and needs to know whether a
+/// child's recorded aggregate is the exact answer or an upper bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Span {
     /// Wholly inside the range: its aggregate counts exactly.
@@ -422,12 +426,28 @@ impl Walk {
             return;
         }
         self.out.push(id);
+        // The recount comes after the push, so the block that stopped the scan
+        // is always named however tight the limit is.
+        self.add(agg);
+    }
+
+    /// A leaf that is already HELD needs no fetch, but it still fills the
+    /// caller's limit — so it counts against the budget too, or blocks beyond it
+    /// get named for entries the caller will never ask for.
+    fn hold(&mut self, agg: Agg) {
+        // Never before something has been named: the block that stopped the scan
+        // has to be in the frontier, or the caller cannot make progress at all.
+        if self.out.is_empty() {
+            return;
+        }
+        self.add(agg);
+    }
+
+    fn add(&mut self, agg: Agg) {
         self.entries = self.entries.saturating_add(agg.count);
         self.bytes = self.bytes.saturating_add(agg.bytes);
-        // The check comes after the push, so the block that stopped the scan is
-        // always named however tight the limit is.
-        // EITHER limit ends a page, so either one being covered means the
-        // blocks named can already fill it. Requiring both would name a byte
+        // EITHER limit ends a page, so either one being covered means what has
+        // been named can already fill it. Requiring both would name a byte
         // budget's worth of leaves to serve twenty entries — the exact waste
         // this bound exists to prevent.
         let enough =
@@ -498,9 +518,12 @@ fn walk<B: Blocks>(
         match blocks.get(&id) {
             None => f.name(id, agg, span),
             Some(_) => {
-                // Held: nothing to fetch here, but its children may be missing.
+                // Held: nothing to fetch here, but its children may be missing —
+                // and what it already holds counts against the caller's limit.
                 let child = load(blocks, &id)?;
-                if !child.is_leaf() {
+                if child.is_leaf() {
+                    f.hold(agg);
+                } else {
                     walk(blocks, &child, next.as_deref(), r, f)?;
                 }
             }
