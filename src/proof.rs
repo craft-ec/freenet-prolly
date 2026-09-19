@@ -92,7 +92,7 @@
 
 use crate::aggregate::{aggregate, AggError, Claimed};
 use crate::node::{Node, Value, MAX_NODE, MAX_VALUE};
-use crate::range::Range;
+use crate::range::{range, Range};
 use crate::read::get;
 use crate::store::{Blocks, ReadError};
 use crate::{block_id, kind, Cid};
@@ -160,6 +160,11 @@ pub enum ProofError {
     /// possibly need, or a block larger than a block can be. Refused before
     /// the work of parsing and hashing them is done — see [`verify`].
     TooLarge(&'static str),
+    /// A request a proof cannot be made for.
+    Unsupported(&'static str),
+    /// The page is short because a block was missing, so the listing is not
+    /// complete for the span it claims. The lie a gateway would tell.
+    NotComplete,
 }
 
 impl std::fmt::Display for ProofError {
@@ -175,6 +180,10 @@ impl std::fmt::Display for ProofError {
             ProofError::BadValue => write!(f, "the carried value is not the one the leaf names"),
             ProofError::WrongRange => write!(f, "the proof is for a different range"),
             ProofError::TooLarge(w) => write!(f, "the proof is impossibly large: {w}"),
+            ProofError::Unsupported(w) => write!(f, "a proof cannot be made for {w}"),
+            ProofError::NotComplete => {
+                write!(f, "the listing is missing entries it should contain")
+            }
         }
     }
 }
@@ -224,6 +233,8 @@ impl Proof {
             if len as usize > MAX_NODE {
                 return Err(ProofError::TooLarge("a node"));
             }
+            #[cfg(test)]
+            COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             nodes.push(r.take(len as usize)?.to_vec());
         }
         let vlen = u32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes"));
@@ -375,6 +386,11 @@ fn shape<'a>(proof: &'a Proof, root: &Cid, per_level: usize) -> Result<Node<'a>,
 /// can impose, counted so a test can assert on it rather than on a clock.
 #[cfg(test)]
 pub(crate) static HASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Node bodies COPIED out of the wire form by [`Proof::decode`] — the other
+/// half of the cost, and the one a shape check on the bytes avoids.
+#[cfg(test)]
+pub(crate) static COPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A store holding exactly the proof's blocks, keyed the way every block is
 /// keyed, recording which ones were asked for.
@@ -610,5 +626,361 @@ mod tests {
         b.extend_from_slice(&0u16.to_le_bytes());
         b.extend_from_slice(&(u32::MAX - 1).to_le_bytes()); // a value the same
         assert_eq!(Proof::decode(&b), Err(ProofError::TooLarge("a value")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// range proofs: a LISTING is complete
+// ---------------------------------------------------------------------------
+
+/// A page must be bounded for a proof to exist: the shape gate needs a count
+/// bound, and an unlimited page can be the whole tree.
+///
+/// Both limits at zero means "no limit" to [`range`], so it is refused here.
+/// The defaults are 1024 entries and 256 KiB, so an ordinary caller never meets
+/// this.
+fn bounded(r: &Range) -> Result<usize, ProofError> {
+    // `range` refuses `max_entries == 0` itself, so this looks redundant — it
+    // is not. The bound has to exist BEFORE the proof is parsed: without it
+    // there is nothing to gate the shape on, and a padded proof would be
+    // parsed and hashed in full before `range` ever ran to refuse the request.
+    //
+    // A FINITE entry limit specifically. A page limited only by bytes has no
+    // leaf count derivable from the root — an entry's minimum size is not a
+    // number this format wants to depend on — so there would be nothing to
+    // gate the cost of refusing on.
+    if r.max_entries == 0 {
+        return Err(ProofError::Unsupported("a page with no entry limit"));
+    }
+    Ok(r.max_entries)
+}
+
+/// A proof that a page of `range` is COMPLETE: the entries it contains are
+/// every entry under `root` in the span it covers.
+///
+/// This is what a gateway can lie about. One key is checkable with [`prove`];
+/// a LISTING — "here are the posts under `d/post/`" — is only checkable if
+/// omission is detectable, and it is: drop a leaf and the scan stops early and
+/// names what is missing; drop an entry from a leaf and the leaf's id changes,
+/// so the block is not found at all.
+pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof, ProofError> {
+    bounded(r)?;
+    let rec = Recording {
+        inner: blocks,
+        read: RefCell::default(),
+    };
+    let page = range(&rec, root, r).map_err(|e| match e {
+        crate::range::RangeError::Read(e) => read_err(e),
+        _ => ProofError::Unsupported("this range"),
+    })?;
+    if !page.need.is_empty() {
+        // The prover itself could not complete the page.
+        return Err(ProofError::Incomplete);
+    }
+    let mut nodes: Vec<Vec<u8>> = rec.read.into_inner().into_iter().map(|(_, b)| b).collect();
+    sort_canonical(&mut nodes);
+    Ok(Proof { nodes, value: None })
+}
+
+/// Check a page against a root, from the proof alone.
+///
+/// Returns the page the proof establishes. **The claim is exactly: under this
+/// root, the entries of `r` from its start up to `page.next` are these and no
+/// others.** A continuation page proves its own span and says nothing about the
+/// pages before it — each page carries its own proof.
+///
+/// Canonical **for** the (root, `Range`-with-limits) it was produced for: one
+/// byte string per question. That is not the same as "no other question can be
+/// answered from it" — exactly as a key proof is one proof per (root, PATH) and
+/// answers for every key on that path, a page proof's leaves can answer for a
+/// slightly larger limit or a slightly later start, and those answers are true
+/// for their own spans because `next` moves with them. What never happens is a
+/// question getting a different answer from the tree's: anything needing blocks
+/// the proof does not carry is refused rather than guessed at.
+pub fn verify_range(root: &Cid, r: &Range, proof: &Proof) -> Result<ProvenPage, ProofError> {
+    let per_page = bounded(r)?;
+    // Shape first, as ever: the root's level bounds the two edge paths, the
+    // entry limit bounds the leaves, and both are known from the first block.
+    //
+    // The bound is deliberately LOOSE — a 1,024-entry page is about 78 blocks
+    // against a bound near 1,030 — because it exists to cap the cost of
+    // REFUSING, not to describe a proof anyone would send.
+    let height = node_height(proof, root)?;
+    shape_bounded(proof, root, 2 * height + per_page)?;
+    let store = ProofStore::new(proof)?;
+    let page = range(&store, root, r).map_err(|e| match e {
+        crate::range::RangeError::Read(e) => read_err(e),
+        _ => ProofError::Unsupported("this range"),
+    })?;
+    // The one check that makes this a COMPLETENESS proof: a page that is short
+    // because a block was missing is not a complete listing, and this is where
+    // every omission lands.
+    if !page.need.is_empty() {
+        return Err(ProofError::NotComplete);
+    }
+    store.check_canonical()?;
+    Ok(ProvenPage {
+        entries: page
+            .entries
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    match v {
+                        Value::Inline(b) => ProvenValue::Inline(b.to_vec()),
+                        Value::Ref { cid, len } => ProvenValue::Ref {
+                            cid: *cid,
+                            len: *len,
+                        },
+                    },
+                )
+            })
+            .collect(),
+        next: page.next.clone(),
+    })
+}
+
+/// A page a proof establishes, owned.
+///
+/// Owned rather than borrowed because the store that checked the blocks is
+/// dropped when verification finishes, and a page is at most `max_entries`
+/// entries the caller asked for anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenPage {
+    pub entries: Vec<(Vec<u8>, ProvenValue)>,
+    /// Where the proved span ends. The claim is about `[start of r, next)`.
+    pub next: Option<Vec<u8>>,
+}
+
+/// A value as a proven page carries it: the bytes, or the reference the leaf
+/// holds. The same two claims as [`Proven`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenValue {
+    Inline(Vec<u8>),
+    Ref { cid: Cid, len: u32 },
+}
+
+/// The root's height, from the first block only.
+fn node_height(proof: &Proof, root: &Cid) -> Result<usize, ProofError> {
+    let first = proof.nodes.first().ok_or(ProofError::Incomplete)?;
+    if block_id(kind::TREE_NODE, first) != *root {
+        return Err(ProofError::WrongRoot);
+    }
+    let n = Node::parse(first).map_err(|_| ProofError::NotANode)?;
+    Ok(n.level() as usize + 1)
+}
+
+/// The shape gate with an explicit bound, for proofs whose size is not one node
+/// per level.
+fn shape_bounded<'a>(
+    proof: &'a Proof,
+    root: &Cid,
+    max_nodes: usize,
+) -> Result<Node<'a>, ProofError> {
+    let first = proof.nodes.first().ok_or(ProofError::Incomplete)?;
+    if block_id(kind::TREE_NODE, first) != *root {
+        return Err(ProofError::WrongRoot);
+    }
+    if proof.nodes.len() > max_nodes {
+        return Err(ProofError::TooLarge("more blocks than the page can need"));
+    }
+    Node::parse(first).map_err(|_| ProofError::NotANode)
+}
+
+// ---------------------------------------------------------------------------
+// refusing without allocating
+// ---------------------------------------------------------------------------
+
+/// Read the proof's shape out of its wire bytes without copying any of it.
+///
+/// `decode` copies every node before anything can look at the root, so a 3.4
+/// MiB proof costs 3.4 MiB of copying to refuse — the shape gate stops the
+/// hashing but not the allocation. These read the first node in place, so the
+/// price of refusing stops depending on what a stranger attached.
+fn peek_first(bytes: &[u8]) -> Result<(usize, &[u8]), ProofError> {
+    let mut r = Reader { b: bytes, at: 0 };
+    if r.take(4)? != MAGIC {
+        return Err(ProofError::Malformed("magic"));
+    }
+    let count = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes")) as usize;
+    let len = u32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes")) as usize;
+    if len > MAX_NODE {
+        return Err(ProofError::TooLarge("a node"));
+    }
+    Ok((count, r.take(len)?))
+}
+
+/// The count a proof against `root` may claim, decided from the first node
+/// alone — without decoding the rest.
+fn shape_of_bytes(
+    bytes: &[u8],
+    root: &Cid,
+    per_level: usize,
+    extra: usize,
+) -> Result<(), ProofError> {
+    let (count, first) = peek_first(bytes)?;
+    if block_id(kind::TREE_NODE, first) != *root {
+        return Err(ProofError::WrongRoot);
+    }
+    let node = Node::parse(first).map_err(|_| ProofError::NotANode)?;
+    let height = node.level() as usize + 1;
+    if count > per_level * height + extra + 1 {
+        return Err(ProofError::TooLarge("more blocks than the tree is tall"));
+    }
+    Ok(())
+}
+
+/// [`verify`] from the wire form, refusing an impossible proof before it is
+/// copied.
+///
+/// The answer is owned, for the same reason [`ProvenPage`] is: the checking
+/// borrows the decoded proof, which this call owns. There is still exactly one
+/// verifier — this decodes, then calls [`verify`].
+pub fn verify_bytes(root: &Cid, key: &[u8], bytes: &[u8]) -> Result<ProvenOwned, ProofError> {
+    shape_of_bytes(bytes, root, 1, 0)?;
+    let proof = Proof::decode(bytes)?;
+    Ok(match verify(root, key, &proof)? {
+        Proven::Absent => ProvenOwned::Absent,
+        Proven::Present(Value::Inline(b)) => ProvenOwned::Present(ProvenValue::Inline(b.to_vec())),
+        Proven::Present(Value::Ref { cid, len }) => {
+            ProvenOwned::Present(ProvenValue::Ref { cid, len })
+        }
+    })
+}
+
+/// [`Proven`], owned — what [`verify_bytes`] answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenOwned {
+    Present(ProvenValue),
+    Absent,
+}
+
+/// [`verify_range`] from the wire form, refusing before copying.
+pub fn verify_range_bytes(root: &Cid, r: &Range, bytes: &[u8]) -> Result<ProvenPage, ProofError> {
+    let per_page = bounded(r)?;
+    shape_of_bytes(bytes, root, 2, per_page)?;
+    verify_range(root, r, &Proof::decode(bytes)?)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::apply::{apply_into, Edit};
+    use crate::build::init;
+    use crate::node::NodeBuilder;
+    use crate::store::MemBlocks;
+    use std::sync::atomic::Ordering;
+
+    fn tree() -> (MemBlocks, Cid, Vec<Vec<u8>>) {
+        let mut blocks = MemBlocks::default();
+        let root = init(&mut blocks);
+        let edits: Vec<(Vec<u8>, Edit)> = (0..20_000u32)
+            .map(|i| {
+                (
+                    format!("k/{i:08}").into_bytes(),
+                    Edit::Put(vec![(i % 251) as u8; 120]),
+                )
+            })
+            .collect();
+        let root = apply_into(&mut blocks, &root, &edits).unwrap().root;
+        let keys = edits.into_iter().map(|(k, _)| k).collect();
+        (blocks, root, keys)
+    }
+
+    fn padded(honest: &Proof, n: usize) -> Proof {
+        let mut nodes = honest.nodes.clone();
+        for i in 0..n {
+            let mut b = NodeBuilder::leaf();
+            b.push(format!("pad/{i:012}").as_bytes(), Value::Inline(&[0u8; 64]))
+                .unwrap();
+            nodes.push(b.finish().unwrap());
+        }
+        Proof { nodes, value: None }
+    }
+
+    /// The cost of refusing a padded LISTING proof, in blocks hashed and node
+    /// bodies copied — including for a range with no limit, where the bound
+    /// has to come from somewhere before anything is parsed.
+    #[test]
+    fn a_padded_range_proof_costs_nothing_to_refuse() {
+        let (blocks, root, keys) = tree();
+        let r = Range {
+            lo: std::ops::Bound::Included(keys[500].clone()),
+            max_entries: 50,
+            ..Range::default()
+        };
+        let honest = prove_range(&blocks, &root, &r).unwrap();
+        HASHED.store(0, Ordering::Relaxed);
+        verify_range(&root, &r, &honest).unwrap();
+        let honest_work = HASHED.load(Ordering::Relaxed);
+        assert_eq!(honest_work, honest.nodes.len());
+
+        let big = padded(&honest, 20_000);
+        HASHED.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            verify_range(&root, &r, &big),
+            Err(ProofError::TooLarge(_))
+        ));
+        assert_eq!(
+            HASHED.load(Ordering::Relaxed),
+            0,
+            "padding must not be hashed"
+        );
+
+        // With NO entry limit there is no bound to derive, so it must be
+        // refused before the proof is touched — not after `range` declines.
+        let unlimited = Range {
+            max_entries: 0,
+            ..r.clone()
+        };
+        HASHED.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            verify_range(&root, &unlimited, &big),
+            Err(ProofError::Unsupported(_))
+        ));
+        assert_eq!(
+            HASHED.load(Ordering::Relaxed),
+            0,
+            "an unlimited range must be refused before the proof is parsed"
+        );
+
+        // And from the wire: refused before the bytes are copied.
+        let wire = big.encode();
+        COPIED.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            verify_range_bytes(&root, &r, &wire),
+            Err(ProofError::TooLarge(_))
+        ));
+        assert_eq!(
+            COPIED.load(Ordering::Relaxed),
+            0,
+            "{} B of padding was copied before being refused",
+            wire.len()
+        );
+        println!(
+            "listing proof: honest {honest_work} blocks; 20,000 pad nodes ({} B) cost 0 hashed, 0 copied",
+            wire.len()
+        );
+    }
+
+    /// A prover cannot pass off a page it could not complete itself.
+    #[test]
+    fn a_prover_that_cannot_complete_the_page_refuses() {
+        let (blocks, root, keys) = tree();
+        let r = Range {
+            lo: std::ops::Bound::Included(keys[500].clone()),
+            max_entries: 50,
+            ..Range::default()
+        };
+        assert!(prove_range(&blocks, &root, &r).is_ok());
+
+        // A store with only the root: the scan cannot finish the page.
+        let mut partial = MemBlocks::default();
+        partial.insert(root, blocks.get(&root).unwrap());
+        assert_eq!(
+            prove_range(&partial, &root, &r),
+            Err(ProofError::Incomplete),
+            "a prover missing blocks must refuse, not ship a short page"
+        );
     }
 }

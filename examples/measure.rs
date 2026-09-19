@@ -454,6 +454,23 @@ fn proofs(name: &str, b: &Built) {
         verify_aggregate(&b.root, &r, &p).unwrap();
         println!("| {what} | {} | {} |", p.nodes.len(), p.bytes());
     }
+    // A listing is the expensive one: the leaves of the page plus two edge
+    // paths, so it scales with the page and not with the tree.
+    for entries in [20usize, 100, 1000] {
+        let r = Range {
+            lo: std::ops::Bound::Included(keys[keys.len() / 3].clone()),
+            max_entries: entries,
+            ..Range::default()
+        };
+        let p = freenet_prolly::proof::prove_range(&b.blocks, &b.root, &r).unwrap();
+        let page = freenet_prolly::proof::verify_range(&b.root, &r, &p).unwrap();
+        assert_eq!(page.entries.len(), entries);
+        println!(
+            "| a complete listing of {entries} entries | {} | {} |",
+            p.nodes.len(),
+            p.bytes()
+        );
+    }
     println!();
 }
 

@@ -480,6 +480,10 @@ fn frozen_vectors() {
         let (key, nodes, bytes, hash) = proof_vector(n);
         got += &format!("proof {n} {} {nodes} {bytes} {}\n", hex(&key), hex(&hash));
     }
+    for n in [1000usize, 5000] {
+        let (nodes, bytes, hash) = range_proof_vector(n);
+        got += &format!("rproof {n} {nodes} {bytes} {}\n", hex(&hash));
+    }
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -828,4 +832,32 @@ fn proof_vector(n: usize) -> (Vec<u8>, usize, usize, [u8; 32]) {
         bytes.len(),
         *blake3::hash(&bytes).as_bytes(),
     )
+}
+
+/// The frozen RANGE proof for `dataset(1, n)`: a 32-entry page from the first
+/// key, and the hash of its encoded proof. Same duplication rule as
+/// [`proof_vector`] — the two computations meet only in `tests/vectors.txt`.
+fn range_proof_vector(n: usize) -> (usize, usize, [u8; 32]) {
+    use freenet_prolly::proof::{prove_range, verify_range};
+    use freenet_prolly::range::Range;
+    use freenet_prolly::store::MemBlocks;
+    let e = dataset(1, n);
+    let (root, nodes) = build(&e);
+    let mut store = MemBlocks::default();
+    for (c, b) in &nodes {
+        store.insert(*c, b);
+    }
+    let mut keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    let r = Range {
+        lo: std::ops::Bound::Included(keys[0].clone()),
+        max_entries: 32,
+        ..Range::default()
+    };
+    let p = prove_range(&store, &root, &r).unwrap();
+    let page = verify_range(&root, &r, &p).unwrap();
+    assert_eq!(page.entries.len(), 32);
+    let bytes = p.encode();
+    (p.nodes.len(), bytes.len(), *blake3::hash(&bytes).as_bytes())
 }

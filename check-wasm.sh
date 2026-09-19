@@ -36,7 +36,23 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
       bad++; console.error(`proof ${n}: does not verify on wasm32`);
     }
   }
-  console.log(`wasm32: ${want.length - bad} roots and ${proofs.length} proofs match native and verify`);
+  // Range proofs: a LISTING must be the same bytes here and verify here.
+  const rproofs = lines.filter(l => l.startsWith('rproof ')).map(l => l.split(' '));
+  if (rproofs.length === 0) { console.error('no range-proof vectors found'); process.exit(1); }
+  for (const [, n, nodes, bytes, hex] of rproofs) {
+    const got = read32(instance.exports.range_proof_hash(Number(n)));
+    if (got !== hex) { bad++; console.error(`rproof ${n}: wasm32 ${got} != native ${hex}`); }
+    const shape = instance.exports.range_proof_shape(Number(n));
+    const gotNodes = Number(shape >> 32n), gotBytes = Number(shape & 0xffffffffn);
+    if (gotNodes !== Number(nodes) || gotBytes !== Number(bytes)) {
+      bad++;
+      console.error(`rproof ${n}: wasm32 ${gotNodes} nodes/${gotBytes} B != native ${nodes}/${bytes}`);
+    }
+    if (instance.exports.range_proof_verify(Number(n)) !== 1) {
+      bad++; console.error(`rproof ${n}: does not verify on wasm32`);
+    }
+  }
+  console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs and ${rproofs.length} range proofs match native and verify (${bad} bad)`);
   process.exit(bad ? 1 : 0);
 });
 JS

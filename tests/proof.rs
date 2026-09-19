@@ -710,3 +710,358 @@ fn blocks_that_were_never_read_are_refused_although_the_answer_is_right() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// range proofs: a listing is COMPLETE
+// ---------------------------------------------------------------------------
+
+use freenet_prolly::proof::{prove_range, verify_range, verify_range_bytes, ProvenValue};
+
+fn page_range(lo: &[u8], entries: usize) -> Range {
+    Range {
+        lo: std::ops::Bound::Included(lo.to_vec()),
+        max_entries: entries,
+        ..Range::default()
+    }
+}
+
+/// What a gateway would lie about: a listing with something left out. Every
+/// way of omitting must be unprovable.
+#[test]
+fn an_omitted_entry_makes_a_listing_unprovable() {
+    let (blocks, root, m) = tree(20_000);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let r = page_range(&keys[4_000], 200);
+
+    let honest = prove_range(&blocks, &root, &r).unwrap();
+    let page = verify_range(&root, &r, &honest).unwrap();
+    assert_eq!(page.entries.len(), 200);
+    // The control: it says what the tree says.
+    let want: Vec<Vec<u8>> = keys[4_000..4_200].to_vec();
+    let got: Vec<Vec<u8>> = page.entries.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(got, want);
+    // And the VALUES are the tree's, not only the keys — a listing with the
+    // right keys and wrong values would be the same lie in a different place.
+    for (k, v) in &page.entries {
+        match v {
+            ProvenValue::Inline(b) => assert_eq!(b, &m[k]),
+            ProvenValue::Ref { cid, len } => {
+                assert_eq!(*len as usize, m[k].len());
+                assert_eq!(*cid, block_id(kind::RAW, &m[k]));
+            }
+        }
+    }
+
+    // A leaf of ANOTHER tree covering the same span — the substitution a
+    // gateway would reach for.
+    let (other_blocks, other_root, _) = {
+        let mut m2 = m.clone();
+        // Same keys, one value changed, so the leaf spans match.
+        let k = keys[4_100].clone();
+        m2.insert(k, vec![0xee; 140]);
+        let (b, rt) = build(&m2);
+        (b, rt, ())
+    };
+    let other = prove_range(&other_blocks, &other_root, &r).unwrap();
+
+    let leaves: Vec<usize> = (0..honest.nodes.len())
+        .filter(|i| Node::parse(&honest.nodes[*i]).unwrap().is_leaf())
+        .collect();
+    assert!(leaves.len() >= 3, "the page must span several leaves");
+
+    for (what, p) in [
+        (
+            "a leaf dropped from the middle",
+            Proof {
+                nodes: {
+                    let mut v = honest.nodes.clone();
+                    v.remove(leaves[leaves.len() / 2]);
+                    v
+                },
+                value: None,
+            },
+        ),
+        (
+            "the first leaf dropped — the page starts late",
+            Proof {
+                nodes: {
+                    let mut v = honest.nodes.clone();
+                    v.remove(leaves[0]);
+                    v
+                },
+                value: None,
+            },
+        ),
+        (
+            "the last leaf dropped — the page stops early",
+            Proof {
+                nodes: {
+                    let mut v = honest.nodes.clone();
+                    v.remove(leaves[leaves.len() - 1]);
+                    v
+                },
+                value: None,
+            },
+        ),
+        (
+            "a leaf swapped for another tree's leaf over the same span",
+            Proof {
+                nodes: {
+                    let mut v = honest.nodes.clone();
+                    let i = leaves[leaves.len() / 2];
+                    // A leaf from the other tree, same position in the page.
+                    let theirs: Vec<Vec<u8>> = other
+                        .nodes
+                        .iter()
+                        .filter(|b| Node::parse(b).unwrap().is_leaf())
+                        .cloned()
+                        .collect();
+                    v[i] = theirs[leaves.len() / 2].clone();
+                    v
+                },
+                value: None,
+            },
+        ),
+    ] {
+        match verify_range(&root, &r, &p) {
+            Err(_) => {}
+            Ok(page) => panic!(
+                "{what}: accepted a listing of {} entries",
+                page.entries.len()
+            ),
+        }
+    }
+
+    // An entry removed from a leaf: the leaf's bytes change, so its id changes,
+    // and the block is not the one its parent names.
+    let i = leaves[1];
+    let leaf = Node::parse(&honest.nodes[i]).unwrap();
+    let mut rebuilt = freenet_prolly::node::NodeBuilder::leaf();
+    for j in 0..leaf.len() {
+        if j == 1 {
+            continue; // the omission
+        }
+        rebuilt.push(&leaf.key(j), leaf.value(j)).unwrap();
+    }
+    let mut nodes = honest.nodes.clone();
+    nodes[i] = rebuilt.finish().unwrap();
+    assert!(
+        verify_range(&root, &r, &Proof { nodes, value: None }).is_err(),
+        "an entry dropped from a leaf must be unprovable"
+    );
+}
+
+/// A proof answers a QUESTION, and every question it answers it answers truly.
+///
+/// Not "any other question is refused": a page proof's blocks can answer for a
+/// slightly larger limit or a slightly later start, because those entries live
+/// in leaves the proof already carries and `next` moves with them. Measured: a
+/// proof for 100 entries (11 blocks) behaves like this:
+///
+/// | limit asked | result |
+/// |---|---|
+/// | 1 | `TooLarge` |
+/// | 50, 99 | `Extra` — a smaller page reads fewer blocks, leaving some unread |
+/// | 100, 101, 110 | `Ok`, and complete and true for its own span |
+/// | 120, 200, 400, 1024 | `NotComplete` — needs leaves the proof does not carry |
+///
+/// What matters — and what is asserted here — is that no question yields a
+/// FALSE answer, and that any question needing blocks the proof does not carry
+/// is refused rather than guessed at.
+#[test]
+fn a_range_proof_is_for_exactly_its_question() {
+    let (blocks, root, m) = tree(20_000);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let r = page_range(&keys[1_000], 100);
+    let p = prove_range(&blocks, &root, &r).unwrap();
+    assert!(verify_range(&root, &r, &p).is_ok());
+
+    // Changing the entry limit: what matters is not that every other limit is
+    // REFUSED — some are answerable from the same blocks — but that no limit
+    // can extract a FALSE claim. Measured: a proof for 100 entries answers for
+    // 100 to 110 (the entries its leaves hold), and every one of those answers
+    // is complete and true for its own span, because `next` moves with it.
+    let mut answered = 0;
+    for limit in [1usize, 50, 99, 100, 101, 110, 120, 200, 400, 1024] {
+        let other = Range {
+            max_entries: limit,
+            ..r.clone()
+        };
+        match verify_range(&root, &other, &p) {
+            Err(_) => {}
+            Ok(page) => {
+                // Answered — so it must be the truth, entry for entry.
+                let want: Vec<Vec<u8>> = keys[1_000..1_000 + page.entries.len()].to_vec();
+                let got: Vec<Vec<u8>> = page.entries.iter().map(|(k, _)| k.clone()).collect();
+                assert_eq!(got, want, "limit {limit} answered, and answered wrongly");
+                assert!(
+                    page.entries.len() >= 100,
+                    "limit {limit} answered with fewer entries than were proved"
+                );
+                answered += 1;
+            }
+        }
+    }
+    assert!(
+        answered >= 2,
+        "the band of answerable limits must be exercised"
+    );
+    // A limit needing blocks the proof does not carry is refused, not guessed.
+    assert_eq!(
+        verify_range(
+            &root,
+            &Range {
+                max_entries: 400,
+                ..r.clone()
+            },
+            &p
+        ),
+        Err(ProofError::NotComplete)
+    );
+    // A smaller limit reads fewer blocks, so the proof carries blocks that were
+    // never read — the set rule.
+    assert_eq!(
+        verify_range(
+            &root,
+            &Range {
+                max_entries: 50,
+                ..r.clone()
+            },
+            &p
+        ),
+        Err(ProofError::Extra)
+    );
+
+    // A different lo behaves the same way, and for the same reason: the entries
+    // for a slightly later start are in leaves the proof already carries, so
+    // the answer is available AND true. Nothing false can be extracted.
+    for shift in [1usize, 2, 5, 50, 500] {
+        let moved = page_range(&keys[1_000 + shift], 100);
+        if let Ok(page) = verify_range(&root, &moved, &p) {
+            let want: Vec<Vec<u8>> =
+                keys[1_000 + shift..1_000 + shift + page.entries.len()].to_vec();
+            let got: Vec<Vec<u8>> = page.entries.iter().map(|(k, _)| k.clone()).collect();
+            assert_eq!(
+                got, want,
+                "a shifted start was answered, and answered wrongly"
+            );
+        }
+    }
+
+    // A different root.
+    let mut b2 = blocks.clone();
+    let root2 = apply_into(
+        &mut b2,
+        &root,
+        &[(keys[19_000].clone(), Edit::Put(vec![3u8; 90]))],
+    )
+    .unwrap()
+    .root;
+    assert_eq!(verify_range(&root2, &r, &p), Err(ProofError::WrongRoot));
+
+    // An unbounded page cannot be proved at all.
+    let unbounded = Range {
+        max_entries: 0,
+        max_bytes: 0,
+        ..Range::default()
+    };
+    assert!(matches!(
+        prove_range(&blocks, &root, &unbounded),
+        Err(ProofError::Unsupported(_))
+    ));
+    // Nor one bounded only by bytes: there is no leaf count to derive.
+    let bytes_only = Range {
+        max_entries: 0,
+        max_bytes: 4096,
+        ..Range::default()
+    };
+    assert!(matches!(
+        prove_range(&blocks, &root, &bytes_only),
+        Err(ProofError::Unsupported(_))
+    ));
+}
+
+/// Pages are proved one at a time, and each says nothing about the others.
+#[test]
+fn a_continuation_page_proves_its_own_span() {
+    let (blocks, root, m) = tree(20_000);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut at = keys[0].clone();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let r = Range {
+            after: (pages > 0).then(|| at.clone()),
+            lo: std::ops::Bound::Included(keys[0].clone()),
+            max_entries: 250,
+            ..Range::default()
+        };
+        let p = prove_range(&blocks, &root, &r).unwrap();
+        let page = verify_range(&root, &r, &p).unwrap();
+        seen.extend(page.entries.iter().map(|(k, _)| k.clone()));
+        pages += 1;
+        assert!(pages < 10);
+        match page.next {
+            Some(n) => at = n,
+            None => break,
+        }
+        if pages == 4 {
+            break;
+        }
+    }
+    assert_eq!(seen, keys[..seen.len()].to_vec(), "the pages concatenate");
+    assert!(pages >= 4);
+    println!(
+        "range proof: {pages} pages of 250, {} entries proved",
+        seen.len()
+    );
+}
+
+/// Hostile input, cheaply refused, never a panic — and the wire form refuses
+/// before it copies.
+#[test]
+fn a_hostile_range_proof_is_refused_cheaply() {
+    let (blocks, root, m) = tree(20_000);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let r = page_range(&keys[500], 50);
+    let honest = prove_range(&blocks, &root, &r).unwrap();
+    assert!(verify_range(&root, &r, &honest).is_ok());
+    let wire = honest.encode();
+    assert!(verify_range_bytes(&root, &r, &wire).is_ok());
+
+    // Padding a stranger attached must not be copied before it is refused.
+    let mut padded = honest.clone();
+    let filler = Node::parse(&honest.nodes[honest.nodes.len() - 1])
+        .unwrap()
+        .is_leaf();
+    assert!(filler);
+    for i in 0..5_000 {
+        let mut b = freenet_prolly::node::NodeBuilder::leaf();
+        b.push(format!("pad/{i:012}").as_bytes(), Value::Inline(&[0u8; 64]))
+            .unwrap();
+        padded.nodes.push(b.finish().unwrap());
+    }
+    let big = padded.encode();
+    assert!(big.len() > 500_000, "the case must be large: {}", big.len());
+    assert!(matches!(
+        verify_range_bytes(&root, &r, &big),
+        Err(ProofError::TooLarge(_))
+    ));
+
+    for junk in [&b""[..], b"PP01", &[0xff; 200]] {
+        assert!(verify_range_bytes(&root, &r, junk).is_err());
+    }
+    let mut rr = rng(3);
+    for _ in 0..300 {
+        let mut b = wire.clone();
+        let at = rr() as usize % b.len();
+        b[at] ^= (rr() % 255) as u8 + 1;
+        let _ = verify_range_bytes(&root, &r, &b);
+    }
+    println!(
+        "range proof: {} blocks, {} B; 5,000 pad nodes refused from {} B",
+        honest.nodes.len(),
+        wire.len(),
+        big.len()
+    );
+}
