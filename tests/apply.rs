@@ -14,7 +14,7 @@ use freenet_prolly::read::get;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::{block_id, kind, Cid};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -156,8 +156,39 @@ fn step(
         }
     }
     // Reads: only nodes that were replaced — plus, per no-op edit, its path.
-    let stray = reads.difference(&replaced).count();
     let height = Node::parse(&old_nodes.0[root]).unwrap().level() as usize + 1;
+    // Which node an edit LANDS in, at each level: the last one whose first key
+    // is at or below the edit's — the rule the descent itself uses.
+    //
+    // A node's ENTRIES are not its coverage. A key in the gap after a node's
+    // last entry still lands in that node, and re-chunking it can leave it
+    // byte-identical: an insert that starts a node of its own leaves everything
+    // before it alone. So the node is read, is not "replaced", and is exactly
+    // the one the edit went to. Judging that by "does an edit fall between this
+    // node's first and last entry" calls a legitimate read a stray one.
+    let mut by_level: HashMap<u8, Vec<(Vec<u8>, Cid)>> = HashMap::new();
+    for (id, b) in old_nodes.0.iter() {
+        let n = Node::parse(b).unwrap();
+        if !n.is_empty() {
+            by_level.entry(n.level()).or_default().push((n.key(0), *id));
+        }
+    }
+    let mut landed: HashSet<Cid> = HashSet::new();
+    for nodes in by_level.values_mut() {
+        nodes.sort();
+        for (k, _) in batch {
+            let i = match nodes.binary_search_by(|(min, _)| min.cmp(k)) {
+                Ok(i) => i,
+                Err(0) => 0,
+                Err(i) => i - 1,
+            };
+            landed.insert(nodes[i].1);
+        }
+    }
+    let stray = reads
+        .difference(&replaced)
+        .filter(|c| !landed.contains(*c))
+        .count();
     // Above the leaves the neighbour is always re-read when a branch's first
     // child is replaced (no aggregate bound exists there; upper levels are warm).
     let first_child_replaced = old_nodes
@@ -169,6 +200,7 @@ fn step(
     if stray > (noops + first_key_edits + first_child_replaced) * height {
         let what: Vec<String> = reads
             .difference(&replaced)
+            .filter(|c| !landed.contains(*c))
             .map(|c| {
                 let n = Node::parse(&old_nodes.0[c]).unwrap();
                 let touched = batch
@@ -711,4 +743,165 @@ fn deleting_everything_but_an_untouched_node_makes_that_node_the_root() {
     let mut m = base.clone();
     try_check(Options::default(), &mut m, batch).unwrap();
     assert!(m.len() > 100);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    /// Every key above the last: an append-only log, a feed, records keyed by
+    /// time. This is the pattern the gate never ran, and #22 lived in it.
+    Ascending,
+    /// Every key below the first.
+    Descending,
+    /// Ends inward, so both edges of the tree move.
+    Alternating,
+}
+
+fn ordered_keys(n: usize, order: Order) -> Vec<Vec<u8>> {
+    let k = |i: usize| format!("k/{i:08}").into_bytes();
+    match order {
+        Order::Ascending => (0..n).map(k).collect(),
+        Order::Descending => (0..n).rev().map(k).collect(),
+        Order::Alternating => (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    k(i / 2)
+                } else {
+                    k(n - 1 - i / 2)
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Write `n` entries in `order`, `per_batch` at a time, through the full gate —
+/// which compares against a from-scratch build AND checks that exactly the new
+/// nodes were emitted. The second part matters here: the fix must not start
+/// re-emitting a node that survived unchanged, only reference it.
+fn run_ordered(vlen: usize, order: Order, per_batch: usize, n: usize) -> Result<(), String> {
+    let mut m = Map::new();
+    let (mut root, mut store) = scratch(splits_after, &m);
+    let mut stats = Stats::default();
+    let keys = ordered_keys(n, order);
+    for (b, chunk) in keys.chunks(per_batch).enumerate() {
+        let mut batch: Vec<(Vec<u8>, Edit)> = chunk
+            .iter()
+            .map(|k| (k.clone(), Edit::Put(vec![(b % 251) as u8; vlen])))
+            .collect();
+        // The gate takes a sorted batch; which ORDER the batches arrive in is
+        // what this test varies.
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        step(
+            Options::default(),
+            &mut m,
+            &mut store,
+            &mut root,
+            &batch,
+            &mut stats,
+        )
+        .map_err(|e| {
+            format!(
+                "vlen {vlen} {order:?} batch {per_batch} at {}: {e}",
+                b * per_batch
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// #22: an append that lands in a new node leaves everything before it
+/// byte-identical. When that happens at the old ROOT's level, nothing holds the
+/// surviving node — the level above does not exist yet — so it has to be passed
+/// up along with its new sibling.
+#[test]
+fn writing_in_key_order_equals_a_rebuild() {
+    let mut runs = 0;
+    for vlen in [0usize, 150, 900] {
+        // Enough entries to cross several splits at every size.
+        let n = (20_000 / (vlen + 12) + 30).min(400);
+        for order in [Order::Ascending, Order::Descending, Order::Alternating] {
+            for per_batch in [1usize, 5] {
+                run_ordered(vlen, order, per_batch, n).unwrap();
+                runs += 1;
+            }
+        }
+    }
+    assert_eq!(runs, 18);
+}
+
+/// The same shape one level up: a height-2 tree whose ROOT BRANCH splits while
+/// its first branch survives byte-identically.
+#[test]
+fn an_append_that_splits_a_root_branch_keeps_the_tree() {
+    let mut m = Map::new();
+    let (mut root, mut store) = scratch(splits_after, &m);
+    let mut stats = Stats::default();
+    let mut heights = Vec::new();
+    for i in 0..4000u32 {
+        let batch = vec![(
+            format!("k/{i:08}").into_bytes(),
+            Edit::Put(vec![(i % 251) as u8; 300]),
+        )];
+        step(
+            Options::default(),
+            &mut m,
+            &mut store,
+            &mut root,
+            &batch,
+            &mut stats,
+        )
+        .unwrap_or_else(|e| panic!("append {i}: {e}"));
+        let h = Node::parse(&store.0[&root]).unwrap().level() + 1;
+        if heights.last() != Some(&h) {
+            heights.push(h);
+        }
+    }
+    println!("appending 4000 entries: heights seen {heights:?}");
+    assert!(
+        heights.contains(&3),
+        "the tree must have grown past height 2, so a root BRANCH split: {heights:?}"
+    );
+    assert_eq!(m.len(), 4000);
+}
+
+/// The SDK's real pattern, at a size where it would be noticed: 20k appends one
+/// at a time, checked against the oracle as it goes. `step` is O(n) per call, so
+/// this drives `apply` directly and rebuilds only at checkpoints.
+#[test]
+fn twenty_thousand_appends_one_at_a_time() {
+    use freenet_prolly::apply::apply;
+    let mut m = Map::new();
+    let (mut root, mut store) = scratch(splits_after, &m);
+    let mut checks = 0;
+    for i in 0..20_000u32 {
+        let (k, v) = (format!("k/{i:08}").into_bytes(), vec![(i % 251) as u8; 120]);
+        let mut out = Vec::new();
+        root = apply(
+            &store,
+            &root,
+            &[(k.clone(), Edit::Put(v.clone()))],
+            |c, b| out.push((c, b.to_vec())),
+        )
+        .unwrap()
+        .root;
+        for (c, b) in &out {
+            store.insert(*c, b);
+        }
+        m.insert(k, v);
+        if i % 1000 == 999 || i < 40 {
+            assert_eq!(
+                root,
+                scratch(splits_after, &m).0,
+                "diverged at {} entries",
+                m.len()
+            );
+            checks += 1;
+        }
+    }
+    let h = Node::parse(&store.0[&root]).unwrap().level() + 1;
+    println!("20k appends: final height {h}, {} checkpoints", checks);
+    assert!(h >= 3, "20k entries should be at least three levels deep");
+    // And the whole tree still reads back.
+    for (k, v) in m.iter().step_by(97) {
+        assert_eq!(get(&store, &root, k).unwrap(), Some(value_of(v)));
+    }
 }

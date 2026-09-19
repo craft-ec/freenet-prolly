@@ -316,6 +316,17 @@ pub fn apply_with<B: Blocks>(
     }
 
     // 4. Rewrite level by level.
+    //
+    // The level the old root sits on is the last one that EXISTS. Above it
+    // there are no parents holding anything, which changes what has to be
+    // passed up (see below).
+    let old_root_level = Node::parse(
+        blocks
+            .get(root)
+            .ok_or_else(|| ReadError::Need(vec![*root]))?,
+    )
+    .map_err(|e| ReadError::Corrupt(*root, e))?
+    .level();
     let mut new_nodes: Vec<Closed> = Vec::new();
     let mut old_ids: Vec<Cid> = Vec::new();
     let mut value_blocks: Vec<(Cid, &[u8])> = Vec::new();
@@ -350,8 +361,21 @@ pub fn apply_with<B: Blocks>(
                 up.insert(min_key.clone(), None);
             }
         }
+        // Normally only the DIFFERENCE goes up: a node whose bytes did not
+        // change is already recorded by its parent, so re-stating it would just
+        // rewrite the parent to say the same thing.
+        //
+        // That reasoning needs a parent. When this level is the old root's, the
+        // level above does not exist yet, and if the rewrite ends with more than
+        // one node the tree is about to grow one. Nothing holds ANY of these
+        // nodes, so every one of them has to go up — including a node that
+        // survived byte-identically, which is exactly what an append produces:
+        // it fills a new node at the end and leaves everything before it alone.
+        // Sending only the new sibling up built a parent with one child, and the
+        // single-child-root rule then threw the rest of the tree away.
+        let growing = floor == old_root_level && r.new.len() > 1;
         for n in &r.new {
-            if !was.contains(&n.cid) {
+            if growing || !was.contains(&n.cid) {
                 let e = n.as_child();
                 up.insert(e.key, Some(e.body));
             }
