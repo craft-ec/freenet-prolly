@@ -4,6 +4,8 @@
 pub mod boundary;
 pub mod build;
 pub mod node;
+pub mod read;
+pub mod store;
 
 /// Id of a block. It is the Block contract's key material, so a child pointer
 /// read from a parent is exactly what fetches the child from the network.
