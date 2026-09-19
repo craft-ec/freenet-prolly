@@ -7,6 +7,7 @@ pub mod boundary;
 pub mod build;
 pub mod chunk;
 pub mod cursor;
+pub mod diff;
 pub mod node;
 pub mod range;
 pub mod read;

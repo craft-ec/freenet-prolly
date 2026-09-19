@@ -168,7 +168,7 @@ fn above_lo(key: &[u8], lo: &Bound<Vec<u8>>) -> bool {
 }
 
 /// Does `key` satisfy the high end of the range?
-fn below_hi(key: &[u8], hi: &Bound<Vec<u8>>) -> bool {
+pub(crate) fn below_hi(key: &[u8], hi: &Bound<Vec<u8>>) -> bool {
     match hi {
         Bound::Unbounded => true,
         Bound::Included(k) => key <= k.as_slice(),
