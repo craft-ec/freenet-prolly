@@ -574,9 +574,36 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
         self.done = true;
     }
 
+    /// The largest key under the current slot, when it can be known without
+    /// loading anything.
+    ///
+    /// Only at the ROOT, and only when the root is a leaf: its entries are in
+    /// hand, so the last one is the tree's largest key. Everywhere else a slot
+    /// is bounded by the key that FOLLOWS it ([`end_key`](Self::end_key)),
+    /// which the root has not got — nothing follows a whole tree.
+    pub fn last_key_if_known(&self) -> Option<Vec<u8>> {
+        let s = self.top();
+        (self.at_root && s.node.is_leaf()).then(|| s.node.key(s.node.len() - 1))
+    }
+
     /// The current node and the index within it — what `need` is computed from.
     pub fn parent(&self) -> (&Node<'a>, usize) {
         let s = self.top();
         (&s.node, s.taken)
+    }
+
+    /// The loaded node of exactly `level` on this cursor's path, and the slot
+    /// it is currently taking.
+    ///
+    /// Two cursors can sit at different DEPTHS — the normal sync shape, where
+    /// one side is held and the other is being fetched — and child-id sets from
+    /// two different levels are disjoint whatever the trees hold, so comparing
+    /// them names everything and means nothing. This is how a caller finds the
+    /// level the two sides can actually be compared at.
+    pub fn node_at_level(&self, level: u8) -> Option<(&Node<'a>, usize)> {
+        self.path
+            .iter()
+            .find(|s| s.node.level() == level)
+            .map(|s| (&s.node, s.taken))
     }
 }

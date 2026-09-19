@@ -48,6 +48,24 @@
 //! refused for the same reason: it cannot carry them, so there is one resume
 //! mechanism rather than two that can disagree.
 //!
+//! Resuming is by KEY, so each page re-opens the path down to where it carries
+//! on. That is what lets a resume survive anything but the roots moving, and it
+//! is what a small page costs. Measured, 189 changes over 6,000 entries
+//! (`small_pages_cost_reads_and_repeat_new_blocks`):
+//!
+//! | page | pages | distinct blocks | lookups | `new_blocks` repeats |
+//! |---|---|---|---|---|
+//! | 1 | 190 | 339 | 1,473 | 567 |
+//! | 7 | 28 | 339 | 501 | 81 |
+//! | 100 | 2 | 339 | 345 | 3 |
+//! | unlimited | 1 | 339 | 339 | 0 |
+//!
+//! The SET of blocks touched does not change — 339 at every size. What changes
+//! is how often each is asked for: paging one change at a time asks four times
+//! as often. A caller with a cache in front of the store pays little of that;
+//! one without pays all of it. So page a diff at whatever size the consumer
+//! needs, but do not page a bulk sync at 1.
+//!
 //! # What is believed, and what is not
 //!
 //! Values are compared by `(id, len)` for a referenced value and by bytes for
@@ -119,6 +137,14 @@ pub struct DiffPage<'a> {
     pub need: Vec<Cid>,
     /// The `b`-side nodes this page had to open — the ones for which no
     /// equal-id counterpart was found on the `a` side.
+    ///
+    /// Within one page each block appears **once**. Across pages it can appear
+    /// again: resuming re-opens the path to where it carries on, and the nodes
+    /// on that path are named by each page that walks them. So a caller
+    /// collecting this across a paged diff must dedupe — the UNION over the
+    /// pages is exact (it is `nodes(b) ∖ nodes(a)` at every page size), the
+    /// concatenation is not. The smaller the page the more repeats: 567 of them
+    /// at one change per page, 0 in a single page, for the same 169 blocks.
     ///
     /// What a keeper told "the head moved from `a` to `b`" must fetch, and no
     /// more. Defined by comparison, never by "we happened to descend it": under
@@ -194,7 +220,14 @@ pub fn diff<'a, B: Blocks>(
         need: Vec::new(),
         new_blocks: Vec::new(),
         bytes: 0,
-        last: None,
+        // ECHOED, not started fresh. A page that stops on a missing block
+        // before deciding any key would otherwise report `next: None`, which
+        // also means "finished" — and the natural caller loop (`resume =
+        // page.next`) would restart from the top and re-deliver every change it
+        // had already been given, silently, and only when paging a cold store.
+        // With the token echoed the rule is uniform: always take `next`;
+        // finished is `next == None` AND `need` empty.
+        last: resume.map(|r| r.after.clone()),
         stopped: false,
     };
     let ca = open(blocks, a, &mut s);
@@ -203,10 +236,13 @@ pub fn diff<'a, B: Blocks>(
         (Ok(x), Ok(y)) => (x, y),
         (Err(e), _) | (_, Err(e)) => return Err(e.into()),
     };
-    if let Some(c) = &cb {
-        s.new_blocks.push(*b);
-        let _ = c;
-    }
+    // `b`'s root is NOT named here. With the cursor standing on the root as a
+    // slot, the root is reported by the same rule as every other node: if the
+    // comparison against `a` fails, entering it is a `descend` that names it.
+    // Naming it up front was wrong twice over — it listed the root a second
+    // time in the ordinary case, and it claimed a new block in the case where
+    // `b`'s root is a node `a` already has (b = one leaf of a, the collapse
+    // shape), where the right answer is that nothing is new.
     match run(&mut s, &mut ca, &mut cb) {
         Ok(()) => {}
         Err(ReadError::Need(ids)) => {
@@ -214,7 +250,7 @@ pub fn diff<'a, B: Blocks>(
             for id in ids {
                 push_need(&mut s.need, id);
             }
-            name_siblings(&mut s, &ca, &cb);
+            name_siblings(blocks, &mut s, &ca, &cb);
         }
         Err(e) => return Err(e.into()),
     }
@@ -285,6 +321,16 @@ fn window<B: Blocks>(c: &SlotCursor<'_, B>, r: &Range) -> Window {
     // bound, every one of them is under it.
     if let (Some(end), Bound::Included(lo) | Bound::Excluded(lo)) = (c.end_key(), &r.lo) {
         if end <= *lo {
+            return Window::Below;
+        }
+    }
+    // A root has no key after it, so the test above cannot dismiss one — and a
+    // side that cannot dismiss ground the other side has already left behind
+    // gets DRAINED over it, which opens blocks for position rather than for
+    // difference. Where the root is a leaf its own last entry settles it.
+    if let (Some(last), Bound::Included(lo) | Bound::Excluded(lo)) = (c.last_key_if_known(), &r.lo)
+    {
+        if last < *lo || (last == *lo && matches!(&r.lo, Bound::Excluded(_))) {
             return Window::Below;
         }
     }
@@ -364,7 +410,8 @@ fn step_together<'a, B: Blocks>(
                 b.advance();
             } else {
                 a.descend()?;
-                s.new_blocks.push(b.descend()?);
+                let id = b.descend()?;
+                s.push_new(id);
             }
         }
         // Different depths cannot be equal (equal ids imply equal levels), so
@@ -373,14 +420,16 @@ fn step_together<'a, B: Blocks>(
             if la > lb {
                 a.descend()?;
             } else {
-                s.new_blocks.push(b.descend()?);
+                let id = b.descend()?;
+                s.push_new(id);
             }
         }
         (Slot::Sub { .. }, Slot::Entry(_)) => {
             a.descend()?;
         }
         (Slot::Entry(_), Slot::Sub { .. }) => {
-            s.new_blocks.push(b.descend()?);
+            let id = b.descend()?;
+            s.push_new(id);
         }
         (Slot::Entry(old), Slot::Entry(new)) => {
             let key = a.key();
@@ -431,7 +480,7 @@ fn drain<'a, B: Blocks>(
         Slot::Sub { .. } => {
             let id = c.descend()?;
             if matches!(side, Side::B) {
-                s.new_blocks.push(id);
+                s.push_new(id);
             }
         }
     }
@@ -451,6 +500,15 @@ impl<'a> State<'a, '_> {
         self.last = Some(key.to_vec());
     }
 
+    /// A `b`-side block with no counterpart in `a`.
+    ///
+    /// No de-duplication: a descent moves forward, so within one page a node is
+    /// entered at most once. A set here would only hide a bug — and hide it
+    /// from the test that asserts this list has no repeats.
+    fn push_new(&mut self, id: Cid) {
+        self.new_blocks.push(id);
+    }
+
     fn emit(&mut self, c: Change<'a>) {
         self.bytes += c.key().len() as u64 + c.weight();
         let key = c.key().to_vec();
@@ -460,13 +518,16 @@ impl<'a> State<'a, '_> {
 }
 
 impl Change<'_> {
-    /// What this change counts against a byte limit: the values it carries, a
-    /// referenced value at its real length.
+    /// What this change counts against a byte limit: what the PAGE carries.
+    ///
+    /// A referenced value is 32 bytes of id here, not its referenced length —
+    /// the page holds the reference, and nothing fetches the bytes. Charging
+    /// the real length would put one `Changed` between two 200 KiB files over a
+    /// 256 KiB page on its own, so exactly the domains that reference their
+    /// values would get one change per page, each page re-walking from the
+    /// roots. Shared with `range` so the two accountings cannot drift.
     fn weight(&self) -> u64 {
-        let of = |v: &Value<'_>| match v {
-            Value::Inline(b) => b.len() as u64,
-            Value::Ref { len, .. } => *len as u64,
-        };
+        let of = |v: &Value<'_>| crate::range::entry_bytes(&[], v) as u64;
         match self {
             Change::Added { new, .. } => of(new),
             Change::Removed { old, .. } => of(old),
@@ -476,10 +537,24 @@ impl Change<'_> {
 }
 
 /// Fill `need` with the blocks of BOTH trees that the position which stopped
-/// can already name: at the two parents, the children whose ids are absent from
-/// the other side's child-id set — exactly "on a differing path", computable
-/// from the two parents alone, and enough to fill a round with siblings.
+/// can already name.
+///
+/// Two things make this harder than it looks, and both come from the shape a
+/// real sync has — one side held, the other being fetched:
+///
+/// 1. **The two cursors can be at different DEPTHS.** `step_together` descends
+///    `a` first; if `a` is the held tree that succeeds, and then `b`'s descend
+///    fails for a missing block, so at the stop `a` stands one level deeper
+///    than `b`. Child-id sets taken from two different levels are disjoint
+///    whatever the trees contain, so comparing them names every remaining
+///    sibling on both sides — hundreds of blocks, most already held, crowding
+///    the real ones out of a capped round. So the comparison is made at the
+///    level the two sides share, and if there is no such level nothing is
+///    named beyond the block that stopped.
+/// 2. **`need` means MISSING.** A block already in the store is not named,
+///    whatever the comparison says about it.
 fn name_siblings<'a, B: Blocks>(
+    blocks: &B,
     s: &mut State<'a, '_>,
     ca: &Option<SlotCursor<'a, B>>,
     cb: &Option<SlotCursor<'a, B>>,
@@ -490,7 +565,12 @@ fn name_siblings<'a, B: Blocks>(
     if a.finished() || b.finished() {
         return;
     }
-    let ((an, ai), (bn, bi)) = (a.parent(), b.parent());
+    // The shallower of the two parents: the deeper side has an ancestor there,
+    // the shallower side has nothing loaded below it.
+    let level = a.parent().0.level().max(b.parent().0.level());
+    let (Some((an, ai)), Some((bn, bi))) = (a.node_at_level(level), b.node_at_level(level)) else {
+        return;
+    };
     if an.is_leaf() || bn.is_leaf() {
         return;
     }
@@ -504,19 +584,13 @@ fn name_siblings<'a, B: Blocks>(
     for (n, from, other) in [(an, ai, &b_ids), (bn, bi, &a_ids)] {
         for i in from..n.len() {
             let k = n.key(i);
-            if k > hi || !in_range_slot(&k, s.r) {
+            if k > hi || !crate::range::below_hi(&k, &s.r.hi) {
                 continue;
             }
             let (id, _) = n.child(i);
-            if !other.contains(&id) {
+            if !other.contains(&id) && blocks.get(&id).is_none() {
                 push_need(&mut s.need, id);
             }
         }
     }
-}
-
-/// A slot may be named when its first key is not already past the range; its
-/// lower end is handled by the window test once it is held.
-fn in_range_slot(key: &[u8], r: &Range) -> bool {
-    crate::range::below_hi(key, &r.hi)
 }

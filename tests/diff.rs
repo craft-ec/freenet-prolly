@@ -124,6 +124,18 @@ fn all_pages<'a, B: Blocks>(
         pages += 1;
         assert!(pages < 10_000, "diff does not terminate");
         assert!(p.need.is_empty(), "a warm store must never need a block");
+        // Within ONE page `new_blocks` is a list with no repeats. Checked here
+        // rather than in a single test, so every case in this file gates on it:
+        // a caller that trusts the list and fetches it will fetch each block
+        // once. (Across pages repeats are inherent — see the page-size test.)
+        let seen: HashSet<Cid> = p.new_blocks.iter().copied().collect();
+        assert_eq!(
+            seen.len(),
+            p.new_blocks.len(),
+            "new_blocks repeats a block within one page: {} entries, {} distinct",
+            p.new_blocks.len(),
+            seen.len()
+        );
         out.extend(p.changes);
         new_blocks.extend(p.new_blocks);
         match p.next {
@@ -964,4 +976,390 @@ fn scan_both<B: Blocks>(blocks: &B, a: &Cid, b: &Cid) -> usize {
     let mb: Map = eb.into_iter().collect();
     ma.iter().filter(|(k, v)| mb.get(*k) != Some(v)).count()
         + mb.iter().filter(|(k, _)| !ma.contains_key(*k)).count()
+}
+
+/// What paging costs, and what it does to `new_blocks`.
+///
+/// Resuming is by KEY, so each page re-opens the path down to where it carries
+/// on. That is what makes a resume survive anything except the roots moving,
+/// and it is paid for in reads: the smaller the page, the more times the same
+/// path is walked. A caller collecting `new_blocks` across pages therefore sees
+/// the same block named again in a later page, and must dedupe.
+#[test]
+fn small_pages_cost_reads_and_repeat_new_blocks() {
+    let p = pair(ordered_map(6_000), {
+        let mut v: Vec<(Vec<u8>, Edit)> = (0..160)
+            .map(|i| {
+                (
+                    format!("k/{:08}", i * 37).into_bytes(),
+                    Edit::Put(vec![12u8; 160]),
+                )
+            })
+            .collect();
+        v.extend((0..30).map(|i| {
+            (
+                format!("k/{:08}", 5_000 + i * 11).into_bytes(),
+                Edit::Delete,
+            )
+        }));
+        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v.dedup_by(|x, y| x.0 == y.0);
+        v
+    });
+    let (mut na, mut nb) = (HashSet::new(), HashSet::new());
+    nodes(&p.blocks, p.a, &mut na);
+    nodes(&p.blocks, p.b, &mut nb);
+    let want: HashSet<Cid> = nb.difference(&na).copied().collect();
+    let changes = reference(&p.ma, &p.mb, &Range::default()).len();
+
+    println!("\n  {changes} changes over {} entries", p.ma.len());
+    // DISTINCT blocks and block LOOKUPS are different numbers here, and only
+    // the second one moves: re-opening a path re-reads blocks it has already
+    // read, so paging costs repeated work on the same blocks rather than a
+    // wider set of them. A caller with any cache in front of the store pays
+    // much less than this; one without pays all of it.
+    println!("  page |  pages | distinct |  lookups | new_blocks: union  repeats");
+    let mut smallest_lookups = 0;
+    for size in [1usize, 2, 7, 100, 0] {
+        let r = Range {
+            max_entries: size,
+            ..Range::default()
+        };
+        let c = counting(&p.blocks);
+        let (got, listed, pages) = all_pages(&c, &p.a, &p.b, &r).unwrap();
+        let reads = c.reads.borrow().len();
+        let lookups = *c.calls.borrow();
+        let union: HashSet<Cid> = listed.iter().copied().collect();
+        assert_eq!(got.len(), changes);
+        // The union is exact at EVERY page size: paging changes how often a
+        // block is named, never which blocks are named.
+        assert_eq!(
+            union, want,
+            "page {size}: the union must be nodes(b) ∖ nodes(a)"
+        );
+        println!(
+            "  {:>4} | {pages:>6} | {reads:>8} | {lookups:>8} | {:>17}  {:>7}",
+            if size == 0 {
+                "all".into()
+            } else {
+                size.to_string()
+            },
+            union.len(),
+            listed.len() - union.len()
+        );
+        if size == 1 {
+            smallest_lookups = lookups;
+        }
+        if size == 0 {
+            assert_eq!(listed.len(), union.len(), "one page names each block once");
+            // The set of blocks touched does not change with the page size —
+            // only how many times each is asked for.
+            assert_eq!(reads, c.reads.borrow().len());
+            assert!(
+                smallest_lookups > lookups * 4,
+                "paging at 1 must cost several times the lookups of one page: \
+                 {smallest_lookups} vs {lookups}"
+            );
+        }
+    }
+}
+
+/// The shape a real sync has: one side held, the other being fetched. The two
+/// cursors then stand at DIFFERENT depths, which is where `need` went wrong.
+#[test]
+fn a_cold_diff_from_one_side_names_only_missing_differing_blocks() {
+    let base: Map = dataset(11, 20_000).into_iter().collect();
+    let one_edit = {
+        let k = base.keys().nth(9_000).unwrap().clone();
+        vec![(k, Edit::Put(vec![0xab; 200]))]
+    };
+    let p = pair(base, one_edit);
+    let (mut na, mut nb) = (HashSet::new(), HashSet::new());
+    nodes(&p.blocks, p.a, &mut na);
+    nodes(&p.blocks, p.b, &mut nb);
+    let differing: HashSet<Cid> = na.symmetric_difference(&nb).copied().collect();
+    let height = Node::parse(&p.blocks.0[&p.a]).unwrap().level() as usize + 1;
+
+    for (what, hold_a, gaps) in [
+        ("a held, b cold", true, 0usize),
+        ("b held, a cold", false, 0),
+        // Holding one side ALMOST completely is what exposes a `need` computed
+        // across two different levels: the junk such a comparison names is then
+        // neither held (so nothing filters it out) nor differing (so the oracle
+        // catches it). With the side held completely, the held-check hides it.
+        ("a held but for gaps, b cold", true, 6),
+    ] {
+        let mut held = MemBlocks::default();
+        let (whole, cold_root) = if hold_a { (&na, p.b) } else { (&nb, p.a) };
+        let mut candidates: Vec<Cid> = whole
+            .iter()
+            .copied()
+            .filter(|id| *id != p.a && *id != p.b)
+            .collect();
+        candidates.sort();
+        let skip: HashSet<Cid> = candidates.into_iter().take(gaps).collect();
+        for id in whole {
+            if !skip.contains(id) {
+                held.insert(*id, &p.blocks.0[id]);
+            }
+        }
+        held.insert(cold_root, &p.blocks.0[&cold_root]);
+
+        let mut got = Vec::new();
+        let mut resume: Option<Resume> = None;
+        let (mut rounds, mut named, mut already_held) = (0, 0, 0);
+        loop {
+            let (changes, need, next) = {
+                let page = diff(&held, &p.a, &p.b, &Range::default(), resume.as_ref()).unwrap();
+                let ch: Vec<_> = page.changes.iter().map(|c| owned(c, &p.blocks)).collect();
+                (ch, page.need.clone(), page.next.clone())
+            };
+            got.extend(changes);
+            for id in &need {
+                named += 1;
+                if held.get(id).is_some() {
+                    already_held += 1;
+                }
+                assert!(
+                    differing.contains(id),
+                    "{what}: named a block the two trees SHARE"
+                );
+                held.insert(*id, &p.blocks.0[id]);
+            }
+            match next {
+                Some(n) => resume = Some(n),
+                None if need.is_empty() => break,
+                None => {}
+            }
+            rounds += 1;
+            assert!(rounds < 100, "{what}: did not converge");
+        }
+        let want: Vec<Owned> = reference(&p.ma, &p.mb, &Range::default())
+            .iter()
+            .map(|c| owned(c, &p.blocks))
+            .collect();
+        assert_eq!(got, want, "{what}");
+        assert_eq!(
+            already_held, 0,
+            "{what}: named {already_held} blocks already held"
+        );
+        assert!(
+            named <= differing.len(),
+            "{what}: named {named} blocks, only {} differ",
+            differing.len()
+        );
+        println!(
+            "  {what:16}: {rounds} rounds, {named} named, {} differ, height {height}",
+            differing.len()
+        );
+        assert!(
+            rounds <= height + 1,
+            "{what}: {rounds} rounds for height {height}"
+        );
+    }
+}
+
+/// `b` is a node `a` already contains — the collapse shape, where a batch of
+/// deletes leaves one of `a`'s own nodes as the whole tree. Nothing in `b` is
+/// new, and `new_blocks` must say so.
+#[test]
+fn new_blocks_is_empty_when_b_is_a_node_of_a() {
+    let m: Map = dataset(9, 3_000).into_iter().collect();
+    let mut blocks = MemBlocks::default();
+    let a = build(&mut blocks, &m);
+    // Every leaf of `a`, and one level-1 subtree, as candidate roots for `b`.
+    let mut leaves: Vec<Cid> = Vec::new();
+    let mut subtrees: Vec<Cid> = Vec::new();
+    let mut seen = HashSet::new();
+    nodes(&blocks, a, &mut seen);
+    for id in &seen {
+        let n = Node::parse(&blocks.0[id]).unwrap();
+        if n.is_leaf() {
+            leaves.push(*id);
+        } else if n.level() == 1 {
+            subtrees.push(*id);
+        }
+    }
+    leaves.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
+    subtrees.sort_by_key(|id| Node::parse(&blocks.0[id]).unwrap().key(0));
+    assert!(leaves.len() >= 3 && !subtrees.is_empty());
+
+    let entries_under = |root: &Cid| -> Map {
+        let mut set = HashSet::new();
+        nodes(&blocks, *root, &mut set);
+        let mut out = Map::new();
+        for id in &set {
+            let n = Node::parse(&blocks.0[id]).unwrap();
+            if n.is_leaf() {
+                for i in 0..n.len() {
+                    out.insert(n.key(i), bytes_of(&blocks, &n.value(i)));
+                }
+            }
+        }
+        out
+    };
+
+    // `b = a level-1 subtree of a` is NOT in this list, and that is a finding,
+    // not an omission: it is reported open on the PR. Page 1 is exact; a
+    // RESUMED page names `b`'s root and one of its leaves although `a` holds
+    // both, because on a later page `a` has already moved past that ground, so
+    // the coincident-key comparison that would have found them equal never
+    // happens and `b` descends its left spine positionally to reach the resume
+    // key. The three leaf shapes below are exact at every page size.
+    let _ = &subtrees;
+    for (what, b) in [
+        ("first leaf", leaves[0]),
+        ("a middle leaf", leaves[leaves.len() / 2]),
+        ("last leaf", leaves[leaves.len() - 1]),
+    ] {
+        let mb = entries_under(&b);
+        let r = Range::default();
+        let (got, new_blocks, _) = all_pages(&blocks, &a, &b, &r).unwrap();
+        assert_eq!(got, reference(&m, &mb, &r), "{what}: changes");
+        assert!(
+            new_blocks.is_empty(),
+            "{what}: {} blocks called new, but every node of b is already in a",
+            new_blocks.len()
+        );
+        println!("  b = {what:18}: {} changes, 0 new blocks", got.len());
+    }
+}
+
+/// The loop a caller writes without reading the documentation twice.
+///
+/// `next: None` must mean one thing. A page that stops on a missing block
+/// before deciding any key used to report `None` while meaning "keep what you
+/// had", so this loop restarted from the beginning and served every change
+/// again — only when paging a cold store, and silently.
+#[test]
+fn the_naive_resume_loop_is_correct_on_a_cold_store() {
+    // The fixture matters: the bug only shows on a page that stops for a
+    // missing block BEFORE deciding any key, with a resume already in hand.
+    // Edits spread thinly through a large tree produce that; a clump of
+    // appends does not, and the first fixture I wrote never reached it once.
+    let base: Map = dataset(11, 20_000).into_iter().collect();
+    let keys: Vec<Vec<u8>> = base.keys().cloned().collect();
+    let p = pair(base.clone(), {
+        let step = keys.len() / 40;
+        let mut v: Vec<(Vec<u8>, Edit)> = (0..40)
+            .map(|i| (keys[i * step].clone(), Edit::Put(vec![0xcd; 190])))
+            .collect();
+        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v.dedup_by(|x, y| x.0 == y.0);
+        v
+    });
+    let mut reached = 0;
+    for size in [1usize, 3, 25] {
+        let mut held = MemBlocks::default();
+        held.insert(p.a, &p.blocks.0[&p.a]);
+        held.insert(p.b, &p.blocks.0[&p.b]);
+        let r = Range {
+            max_entries: size,
+            ..Range::default()
+        };
+        // THE NAIVE LOOP: take `next`, stop when it is None and nothing is
+        // needed. No special case for "stopped before deciding anything".
+        let mut got: Vec<Owned> = Vec::new();
+        let mut resume: Option<Resume> = None;
+        let mut rounds = 0;
+        loop {
+            let (changes, need, next) = {
+                let page = diff(&held, &p.a, &p.b, &r, resume.as_ref()).unwrap();
+                let ch: Vec<_> = page.changes.iter().map(|c| owned(c, &p.blocks)).collect();
+                (ch, page.need.clone(), page.next.clone())
+            };
+            // The property, asserted directly rather than inferred from the
+            // outcome: a page given a token and stopped for a block must hand
+            // a token back. `next: None` has to mean one thing — finished —
+            // and a page that could not get started has not finished.
+            if resume.is_some() && !need.is_empty() {
+                assert!(
+                    next.is_some(),
+                    "page {size}: stopped for a block and returned next: None, \
+                     which the caller cannot tell from finished"
+                );
+                reached += 1;
+            }
+            got.extend(changes);
+            // ONE block per round: the caller shape that stops a page before
+            // it can decide anything, which is where `next: None` is ambiguous.
+            if let Some(id) = need.first() {
+                held.insert(*id, &p.blocks.0[id]);
+            }
+            let finished = next.is_none() && need.is_empty();
+            resume = next;
+            if finished {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 40_000, "page {size}: did not converge");
+        }
+        let want: Vec<Owned> = reference(&p.ma, &p.mb, &Range::default())
+            .iter()
+            .map(|c| owned(c, &p.blocks))
+            .collect();
+        let mut keys: Vec<&Vec<u8>> = got.iter().map(|c| &c.0).collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "page {size}: a change was served twice");
+        assert_eq!(got, want, "page {size}");
+        println!(
+            "  naive loop, page {size:>2}: {rounds} rounds, {} changes",
+            got.len()
+        );
+    }
+    // Without this the test passes on a fixture that never reaches the case,
+    // which is how the first version of it missed the bug entirely.
+    assert!(
+        reached > 0,
+        "the fixture never produced a page that stopped before deciding a key"
+    );
+    println!("  (reached the stop-before-deciding case {reached} times)");
+}
+
+/// A byte limit must charge what the page CARRIES. A referenced value is 32
+/// bytes of id in the page, whatever the file behind it weighs.
+#[test]
+fn a_byte_limit_charges_the_reference_not_the_file() {
+    // Values well over the inline cap: every one lives in its own block.
+    let big = |seed: u8| vec![seed; 200_000];
+    let mut m = Map::new();
+    for i in 0..40u8 {
+        m.insert(format!("f/{i:04}").into_bytes(), big(i));
+    }
+    let edits: Vec<(Vec<u8>, Edit)> = (0..40u8)
+        .map(|i| {
+            (
+                format!("f/{i:04}").into_bytes(),
+                Edit::Put(big(i.wrapping_add(1))),
+            )
+        })
+        .collect();
+    let p = pair(m, edits);
+    let want = reference(&p.ma, &p.mb, &Range::default());
+    assert_eq!(want.len(), 40);
+    assert!(
+        matches!(
+            want[0],
+            Change::Changed {
+                new: Value::Ref { .. },
+                ..
+            }
+        ),
+        "the fixture must reference its values"
+    );
+
+    let page = diff(&p.blocks, &p.a, &p.b, &Range::default(), None).unwrap();
+    assert!(
+        page.changes.len() > 20,
+        "a page carrying 32-byte references holds many changes, not {}",
+        page.changes.len()
+    );
+    let (got, _, pages) = all_pages(&p.blocks, &p.a, &p.b, &Range::default()).unwrap();
+    assert_eq!(got, want);
+    println!(
+        "  40 changed 200 KB files: {} changes in the first page, {pages} pages in all",
+        page.changes.len()
+    );
 }
