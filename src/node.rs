@@ -82,7 +82,31 @@ pub enum Value<'a> {
     },
 }
 
-impl Value<'_> {
+impl<'a> Value<'a> {
+    /// How the format requires `bytes` to be stored, and the block that has to
+    /// be kept if it does not fit in the leaf.
+    ///
+    /// The choice is part of the format, not a policy: a value at or below
+    /// [`MAX_INLINE`] MUST be inline and anything longer MUST be a reference,
+    /// or the same contents would hash two ways. This is the ONE place that
+    /// decides it — `apply` and [`TreeBuilder::push_bytes`](crate::build::TreeBuilder::push_bytes)
+    /// both call it, so a caller building the same tree by hand cannot drift
+    /// from the rule by restating it.
+    pub fn for_bytes(bytes: &'a [u8]) -> (Value<'a>, Option<(Cid, &'a [u8])>) {
+        if bytes.len() <= MAX_INLINE {
+            (Value::Inline(bytes), None)
+        } else {
+            let cid = crate::block_id(crate::kind::RAW, bytes);
+            (
+                Value::Ref {
+                    cid,
+                    len: bytes.len() as u32,
+                },
+                Some((cid, bytes)),
+            )
+        }
+    }
+
     fn logical_len(&self) -> u64 {
         match self {
             Value::Inline(b) => b.len() as u64,

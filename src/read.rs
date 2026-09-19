@@ -4,6 +4,11 @@ use crate::node::Value;
 use crate::store::{load, load_child, Blocks, ReadError};
 use crate::Cid;
 
+/// Levels in the tree at `root`; 1 is a single leaf.
+pub fn height(blocks: &impl Blocks, root: &Cid) -> Result<usize, ReadError> {
+    Ok(load(blocks, root)?.level() as usize + 1)
+}
+
 /// The value stored under `key` in the tree at `root`, if any.
 pub fn get<'a>(
     blocks: &'a impl Blocks,

@@ -150,6 +150,40 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
     }
 }
 
+impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
+    /// Add the next entry from raw bytes, letting the format choose how the
+    /// value is stored and handing any value block to the same sink as the
+    /// nodes.
+    ///
+    /// This is what a caller should reach for. [`TreeBuilder::push`] takes a
+    /// [`Value`] already decided, which means restating
+    /// [`Value::for_bytes`](crate::node::Value::for_bytes) — and a from-scratch
+    /// build that restates the rule is exactly how an oracle stops agreeing
+    /// with the thing it is checking.
+    pub fn push_bytes(&mut self, key: &[u8], bytes: &[u8]) -> Result<(), TreeError> {
+        let (value, block) = Value::for_bytes(bytes);
+        self.push(key, value)?;
+        if let Some((cid, b)) = block {
+            (self.sink)(cid, b);
+        }
+        Ok(())
+    }
+}
+
+/// The root of the empty tree: one empty leaf. Every tree starts here, and two
+/// empty trees have the same root.
+pub fn empty_root() -> Cid {
+    empty_leaf().cid
+}
+
+/// Put the empty tree into `blocks` and return its root — what a new store
+/// needs before it can take a write.
+pub fn init<B: crate::store::BlocksMut>(blocks: &mut B) -> Cid {
+    let leaf = empty_leaf();
+    blocks.insert_block(leaf.cid, &leaf.bytes);
+    leaf.cid
+}
+
 /// Build a tree from entries in key order; returns the root cid.
 pub fn build<'a>(
     entries: impl IntoIterator<Item = (&'a [u8], Value<'a>)>,
