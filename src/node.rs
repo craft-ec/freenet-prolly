@@ -14,8 +14,9 @@
 //! keys4  [u32; count]   first 4 bytes of each key SUFFIX, big-endian, zero-padded
 //! entries, contiguous, in key order — each holds only the key's suffix
 //!   leaf    klen:u16 ‖ vkind:u8 ‖ vlen:u32 ‖ suffix ‖ val
-//!             vkind 0 = inline bytes (vlen = their length)
-//!             vkind 1 = reference: val is cid(32); vlen = referenced length
+//!             vkind 0 = inline bytes (vlen = their length), vlen ≤ MAX_INLINE
+//!             vkind 1 = reference: val is cid(32); vlen = referenced length,
+//!                       vlen > MAX_INLINE — so a value has exactly one encoding
 //!   branch  klen:u16 ‖ child:cid(32) ‖ child_agg(16) ‖ suffix    key = child's min key
 //! parity [cid; pcount]
 //! ```
@@ -40,6 +41,10 @@ pub const MAX_NODE: usize = 16 * 1024;
 pub const HEADER: usize = 28;
 /// Longest key (prefix + suffix). Key *shapes* keep real keys far below this.
 pub const MAX_KEY: usize = 512;
+/// Longest value stored in the leaf. Anything longer MUST be a reference and
+/// anything this short MUST be inline: the choice is part of the format, or
+/// the same contents could hash two ways.
+pub const MAX_INLINE: usize = 1024;
 const LEAF_FIXED: usize = 2 + 1 + 4;
 const BRANCH_FIXED: usize = 2 + 32 + 16;
 const REF_LEN: usize = 32;
@@ -103,6 +108,8 @@ pub enum NodeError {
     KeyTooLong,
     /// The stored prefix is not exactly the longest common prefix of the keys.
     NonCanonicalPrefix,
+    /// An inline value longer than `MAX_INLINE`, or a reference to one that short.
+    NonCanonicalValue,
 }
 
 fn u16_at(b: &[u8], i: usize) -> usize {
@@ -218,8 +225,9 @@ impl<'a> Node<'a> {
                 let vkind = bytes[off + 2];
                 let vlen = u32_at(bytes, off + 3);
                 let stored = match vkind {
-                    0 => vlen as usize,
-                    1 => REF_LEN,
+                    0 if vlen as usize <= MAX_INLINE => vlen as usize,
+                    1 if vlen as usize > MAX_INLINE => REF_LEN,
+                    0 | 1 => return Err(NodeError::NonCanonicalValue),
                     _ => return Err(NodeError::BadEntry),
                 };
                 let key_at = off + LEAF_FIXED;
@@ -397,7 +405,10 @@ pub enum BuildError {
     /// Keys must be pushed in strictly increasing order.
     NotSorted,
     KeyTooLong,
+    /// An inline value longer than `MAX_INLINE`: store it by reference.
     ValueTooLong,
+    /// A reference to a value of at most `MAX_INLINE` bytes: store it inline.
+    ValueTooShort,
     TooManyEntries,
     NodeTooLarge,
     /// A value was pushed to a branch, or a child to a leaf, or parity to a leaf.
@@ -528,11 +539,11 @@ impl NodeBuilder {
             return Err(BuildError::WrongKind);
         }
         let (vkind, vlen, stored): (u8, u32, Vec<u8>) = match value {
-            Value::Inline(b) => (
-                0,
-                b.len().try_into().map_err(|_| BuildError::ValueTooLong)?,
-                b.to_vec(),
-            ),
+            Value::Inline(b) if b.len() > MAX_INLINE => return Err(BuildError::ValueTooLong),
+            Value::Inline(b) => (0, b.len() as u32, b.to_vec()),
+            Value::Ref { len, .. } if len as usize <= MAX_INLINE => {
+                return Err(BuildError::ValueTooShort)
+            }
             Value::Ref { cid, len } => (1, len, cid.to_vec()),
         };
         let entry_agg = Agg {

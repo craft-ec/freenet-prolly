@@ -2,6 +2,9 @@
 # Build the library for wasm32 and check it produces the same frozen roots as native.
 set -eu
 cd "$(dirname "$0")"
+command -v node >/dev/null || { echo "check-wasm: node is required" >&2; exit 1; }
+rustup target list --installed | grep -qx wasm32-unknown-unknown ||
+  { echo "check-wasm: rust target wasm32-unknown-unknown is required" >&2; exit 1; }
 cargo build --quiet --release --target wasm32-unknown-unknown --manifest-path wasm-check/Cargo.toml
 node - <<'JS'
 const fs = require('fs');

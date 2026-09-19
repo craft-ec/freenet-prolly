@@ -16,36 +16,36 @@
 //! Everything is integer arithmetic in `u128` (both sides stay below 2⁸⁹):
 //! boundaries decide hashes, and float rounding is not portable across targets.
 //!
-//! An entry that would push the open node past the level's hard limit closes the
+//! An entry that would push the open node past `MAX_LOGICAL` closes the
 //! node *before* it instead. That forced split is the only one not decided by
 //! content; the hazard makes it vanishingly rare.
 //!
 //! `LAMBDA`, the limits and the hash domain are format constants: changing any
 //! of them changes every root hash. They are pinned by `tests/vectors.txt`.
+//! "Frozen" means frozen for PT01 code and vectors. Node size stays a measured
+//! question until the phase-3 gate (put latency and the delegate's ops-per-round
+//! cap may favour larger nodes); no stored data exists before then, so reopening
+//! it costs only regenerated vectors.
 
-use crate::node::MAX_NODE;
+use crate::node::{HEADER, MAX_KEY, MAX_NODE};
 
 /// Scale of the split hazard. Mean `logical_len` ≈ 0.906·λ plus about half an entry.
 pub const LAMBDA: u64 = 4400;
 /// No content-defined split closes a node smaller than this.
 pub const MIN_SPLIT: usize = 1024;
-/// Hard limit on a leaf's `logical_len`.
-pub const MAX_LEAF: usize = MAX_NODE;
-/// Hard limit on a branch's `logical_len`. The remaining 4 KiB of the node is
-/// reserved for parity cids, which are not part of the boundary measure.
-pub const MAX_BRANCH: usize = 12 * 1024;
+/// Hard limit on any node's `logical_len`. The remaining 4 KiB of the 16 KiB
+/// node is reserved for parity cids, which are not part of the boundary measure
+/// (so how parity is grouped can change without moving a boundary).
+pub const MAX_LOGICAL: usize = 12 * 1024;
+
+// A content-defined split never closes a branch holding a single child: even the
+// largest child entry leaves the node below MIN_SPLIT. Only the last node of a
+// level can have one child. Raising MAX_KEY must not silently break this.
+const _: () = assert!(HEADER + 6 + 50 + MAX_KEY < MIN_SPLIT);
+const _: () = assert!(MAX_LOGICAL + 4096 <= MAX_NODE);
 
 const DOMAIN: &[u8] = b"PT01-split";
 const LAMBDA4: u128 = (LAMBDA as u128).pow(4);
-
-/// Hard limit on `logical_len` for a node at `level`.
-pub fn limit(level: u8) -> usize {
-    if level == 0 {
-        MAX_LEAF
-    } else {
-        MAX_BRANCH
-    }
-}
 
 /// The per-entry split hash.
 pub fn split_hash(level: u8, key: &[u8]) -> u32 {
@@ -61,7 +61,7 @@ pub fn split_hash(level: u8, key: &[u8]) -> u32 {
 /// Whether a node at `level` closes after the entry with `key`, which grew the
 /// node's `logical_len` from `s_before` to `s_after`.
 pub fn splits_after(level: u8, key: &[u8], s_before: usize, s_after: usize) -> bool {
-    debug_assert!(s_before < s_after && s_after <= MAX_NODE);
+    debug_assert!(s_before < s_after && s_after <= MAX_LOGICAL);
     if s_after < MIN_SPLIT {
         return false;
     }

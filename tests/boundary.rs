@@ -10,7 +10,7 @@ use common::{dataset, rng};
 
 use freenet_prolly::boundary::{self, splits_after, MIN_SPLIT};
 use freenet_prolly::build::{SplitRule, TreeBuilder};
-use freenet_prolly::node::{Agg, Node, Value, HEADER};
+use freenet_prolly::node::{Agg, Node, NodeBuilder, Value, HEADER, MAX_INLINE};
 use freenet_prolly::Cid;
 use std::collections::HashMap;
 
@@ -44,7 +44,13 @@ fn geometric(level: u8, key: &[u8], before: usize, after: usize) -> bool {
 
 /// Walk the tree; returns entries in order, height, and per-level node sizes (logical).
 fn walk(root: Cid, nodes: &Nodes) -> (Entries, usize) {
-    fn go(c: Cid, nodes: &Nodes, want: Option<u8>, out: &mut Entries) -> (u8, Agg, Vec<u8>) {
+    fn go(
+        c: Cid,
+        nodes: &Nodes,
+        want: Option<u8>,
+        last: bool,
+        out: &mut Entries,
+    ) -> (u8, Agg, Vec<u8>) {
         let n = Node::parse(&nodes[&c]).expect("every node parses");
         if let Some(l) = want {
             assert_eq!(n.level(), l, "child level is parent level - 1");
@@ -57,14 +63,15 @@ fn walk(root: Cid, nodes: &Nodes) -> (Entries, usize) {
                 }
             }
         } else {
-            // The last node of a level may hold a single child; the root never does.
+            // Only the last node of a level may hold a single child; the root never does.
             assert!(
-                n.len() >= 2 || want.is_some(),
-                "the root branch has ≥ 2 children"
+                n.len() >= 2 || (want.is_some() && last),
+                "single-child branch that is not the last of its level"
             );
             for i in 0..n.len() {
                 let (child, agg) = n.child(i);
-                let (_, got, min) = go(child, nodes, Some(n.level() - 1), out);
+                let last = last && i + 1 == n.len();
+                let (_, got, min) = go(child, nodes, Some(n.level() - 1), last, out);
                 assert_eq!(got, agg, "recorded child aggregate is the child's");
                 assert_eq!(min, n.key(i), "branch key is the child's min key");
             }
@@ -73,7 +80,7 @@ fn walk(root: Cid, nodes: &Nodes) -> (Entries, usize) {
         (n.level(), n.agg(), min)
     }
     let mut out = Vec::new();
-    let (level, agg, _) = go(root, nodes, None, &mut out);
+    let (level, agg, _) = go(root, nodes, None, true, &mut out);
     assert_eq!(agg.count as usize, out.len());
     (out, level as usize + 1)
 }
@@ -106,7 +113,7 @@ fn same_entries_same_root_different_entries_different_root() {
 }
 
 #[test]
-fn order_is_enforced_across_node_boundaries_and_oversized_entries_are_refused() {
+fn order_is_enforced_across_node_boundaries_and_oversized_values_are_refused() {
     use freenet_prolly::build::TreeError;
     use freenet_prolly::node::BuildError;
     // Fill until a node closes, then push a key smaller than the last one.
@@ -132,9 +139,11 @@ fn order_is_enforced_across_node_boundaries_and_oversized_entries_are_refused() 
 
     let mut t = TreeBuilder::new(|_, _: &[u8]| {});
     assert_eq!(
-        t.push(b"big", Value::Inline(&vec![0u8; 16 * 1024])),
-        Err(TreeError::EntryTooLarge)
+        t.push(b"big", Value::Inline(&vec![0u8; MAX_INLINE + 1])),
+        Err(TreeError::Node(BuildError::ValueTooLong))
     );
+    t.push(b"big", Value::Inline(&vec![0u8; MAX_INLINE]))
+        .unwrap();
 }
 
 fn leaf_sizes(nodes: &Nodes) -> Vec<usize> {
@@ -218,6 +227,11 @@ enum Edit {
 }
 
 fn locality(rule: SplitRule, edit: Edit, trials: usize) -> (f64, usize, usize, usize) {
+    // PROLLY_TRIALS=2000 for a p99 worth quoting; the default keeps CI quick.
+    let trials = std::env::var("PROLLY_TRIALS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(trials);
     let base = dataset(5, 20_000);
     let (root, old) = build_with(rule, &base);
     let (_, height) = walk(root, &old);
@@ -265,8 +279,8 @@ fn one_edit_rewrites_a_few_nodes_and_a_positional_rule_rewrites_the_rest() {
         println!("  {name:15} {mean:5.2}  {p99:4}  {max:4}   ({h})");
         assert!(mean < h as f64 + 1.5, "{name}: mean {mean}");
         // The tail is the re-sync walk: after a shifted boundary each following
-        // node re-joins the old chain with probability ≈ ½ (measured p99 ≤ h + 7).
-        assert!(p99 <= h + 9, "{name}: p99 {p99}");
+        // node re-joins the old chain with probability ≈ ½ (2000 trials: p99 ≤ h + 8; this run is 150, so the bound is loose).
+        assert!(p99 <= h + 11, "{name}: p99 {p99}");
         if let Edit::SameLen = edit {
             assert_eq!(max, h, "a same-length value edit rewrites the path only");
         }
@@ -276,6 +290,52 @@ fn one_edit_rewrites_a_few_nodes_and_a_positional_rule_rewrites_the_rest() {
     // A size threshold re-joins the old chain only when two running sums happen
     // to cross 4 KiB at the same entry, so an insert drags a run of leaves along.
     assert!(mean > 12.0, "control must cascade: {mean}");
+}
+
+/// A tree whose first leaf is closed by the hard limit, not by content: tiny
+/// entries with keys ground so the rule never fires, then one large entry that
+/// cannot fit. Pins MAX_LOGICAL, "close before the overflowing entry", and the
+/// restart of the rule at s_before = HEADER.
+fn forced_split_tree() -> Cid {
+    let mut e: Entries = Vec::new();
+    let mut s = HEADER;
+    let big = vec![7u8; 1000];
+    let mut i = 0;
+    while s + NodeBuilder::leaf_cost(b"99999", &Value::Inline(&big)) <= boundary::MAX_LOGICAL {
+        let key = (0..)
+            .map(|j| format!("{i:05}.{j}").into_bytes())
+            .find(|k| {
+                let c = NodeBuilder::leaf_cost(k, &Value::Inline(b""));
+                !splits_after(0, k, s, s + c)
+            })
+            .unwrap();
+        s += NodeBuilder::leaf_cost(&key, &Value::Inline(b""));
+        e.push((key, vec![]));
+        i += 1;
+    }
+    let filled = e.len();
+    e.push((b"99999".to_vec(), big));
+    e.extend(dataset(2, 40).into_iter().map(|(mut k, v)| {
+        k.insert(0, b'z');
+        (k, v)
+    }));
+    let (root, nodes) = build(&e);
+    let first = nodes
+        .values()
+        .map(|b| Node::parse(b).unwrap())
+        .find(|n| n.is_leaf() && n.key(0) == e[0].0)
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        filled,
+        "the limit, not content, closed the first leaf"
+    );
+    assert!(
+        s > boundary::MAX_LOGICAL - 1100,
+        "and it was nearly full: {s}"
+    );
+    assert_eq!(walk(root, &nodes).0, e);
+    root
 }
 
 fn hex(b: &[u8]) -> String {
@@ -305,7 +365,7 @@ fn frozen_vectors() {
         (b"d/post/2", 4000, 4300),
         (b"d/post/3", 2000, 2100),
         (b"d/post/4", 6000, 6400),
-        (b"d/post/5", 15000, 16384),
+        (b"d/post/5", 11000, 12288),
     ] {
         got += &format!(
             "split 0 {} {b} {a} {}\n",
@@ -313,6 +373,30 @@ fn frozen_vectors() {
             splits_after(0, key, b, a)
         );
     }
+    // MIN_SPLIT: a key whose hash is low enough to split at any size ≥ 1 KiB.
+    let low = (0..1_000_000)
+        .map(|i| format!("low-{i}"))
+        .find(|k| boundary::split_hash(0, k.as_bytes()) < 1 << 20)
+        .unwrap();
+    for a in [MIN_SPLIT - 1, MIN_SPLIT] {
+        let d = splits_after(0, low.as_bytes(), HEADER, a);
+        got += &format!("split 0 {} {HEADER} {a} {d}\n", hex(low.as_bytes()));
+    }
+    // The level is part of the decision: same key and sizes, opposite answers.
+    for want0 in [true, false] {
+        let k = (0..100_000)
+            .map(|i| format!("lvl-{i}"))
+            .find(|k| {
+                splits_after(0, k.as_bytes(), 4000, 4300) == want0
+                    && splits_after(1, k.as_bytes(), 4000, 4300) != want0
+            })
+            .expect("the level must change the decision for some key");
+        for level in [0, 1] {
+            let d = splits_after(level, k.as_bytes(), 4000, 4300);
+            got += &format!("split {level} {} 4000 4300 {d}\n", hex(k.as_bytes()));
+        }
+    }
+    got += &format!("forced {}\n", hex(&forced_split_tree()));
     // The smallest size at which a fresh node closes after a key, for keys with
     // a high split hash: this is where a one-unit change of LAMBDA shows.
     let mut edges = 0;
@@ -321,7 +405,7 @@ fn frozen_vectors() {
         if boundary::split_hash(0, key.as_bytes()) < 0xE000_0000 {
             continue;
         }
-        let at = (HEADER + 1..=16384)
+        let at = (HEADER + 1..=boundary::MAX_LOGICAL)
             .find(|&a| splits_after(0, key.as_bytes(), HEADER, a))
             .unwrap();
         got += &format!("edge 0 {} {HEADER} {at}\n", hex(key.as_bytes()));
@@ -334,8 +418,8 @@ fn frozen_vectors() {
         "const {} {} {} {}\n",
         boundary::LAMBDA,
         MIN_SPLIT,
-        boundary::MAX_LEAF,
-        boundary::MAX_BRANCH
+        boundary::MAX_LOGICAL,
+        MAX_INLINE
     );
     for n in [0usize, 1, 5000] {
         got += &format!("root {n} {}\n", hex(&build(&dataset(1, n)).0));

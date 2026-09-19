@@ -12,8 +12,6 @@ use crate::{cid, Cid};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeError {
     Node(BuildError),
-    /// One entry does not fit in an empty node; its value must be stored by reference.
-    EntryTooLarge,
     /// More levels than a `u8` can number.
     TooDeep,
 }
@@ -72,8 +70,9 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
             return Err(BuildError::NotSorted.into());
         }
         let cost = NodeBuilder::leaf_cost(key, &value);
+        self.add(0, key, cost, |b| b.push(key, value))?;
         self.last = Some(key.to_vec());
-        self.add(0, key, cost, |b| b.push(key, value))
+        Ok(())
     }
 
     fn level(&mut self, l: usize) -> Result<&mut Level, TreeError> {
@@ -95,10 +94,9 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         cost: usize,
         put: impl FnOnce(&mut NodeBuilder) -> Result<(), BuildError>,
     ) -> Result<(), TreeError> {
-        let limit = boundary::limit(l as u8);
-        if HEADER + cost > limit {
-            return Err(TreeError::EntryTooLarge);
-        }
+        let limit = boundary::MAX_LOGICAL;
+        // MAX_KEY and MAX_INLINE bound every entry far below the limit.
+        debug_assert!(HEADER + cost <= limit);
         if self.level(l)?.open.logical_len() + cost > limit {
             self.close(l)?;
         }
