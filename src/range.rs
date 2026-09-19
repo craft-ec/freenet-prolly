@@ -34,6 +34,7 @@ use crate::cursor::Cursor;
 use crate::node::{Agg, Node, Value};
 use crate::store::{load, Blocks, ReadError};
 use crate::Cid;
+use core::cmp::Ordering;
 use std::ops::Bound;
 
 /// Most blocks one page will name. The caller fetches a round at a time, so
@@ -413,7 +414,7 @@ fn rest_from_start(r: &Range) -> Range {
 /// the range aggregate of #7, which reuses this walk and needs to know whether a
 /// child's recorded aggregate is the exact answer or an upper bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Span {
+pub(crate) enum Span {
     /// Wholly inside the range: its aggregate counts exactly.
     Inside,
     /// Straddles an end of the range: its aggregate is an upper bound on what
@@ -459,7 +460,22 @@ fn frontier<B: Blocks>(
         cap_leaf_bytes: opts.cap_leaf_bytes,
     };
     let node = load(blocks, root)?;
-    walk(blocks, &node, None, rest, &mut f)?;
+    walk(blocks, &node, None, rest, &mut |c: &Child| {
+        if f.covered {
+            return Visit::Stop;
+        }
+        if !c.held {
+            f.name(c.id, c.agg, c.span, c.is_leaf);
+            return Visit::Next;
+        }
+        if c.is_leaf {
+            // Held: nothing to fetch, but what it holds counts against the
+            // caller's limit.
+            f.hold(c.agg);
+            return Visit::Next;
+        }
+        Visit::Descend
+    })?;
     Ok(f.out)
 }
 
@@ -535,17 +551,47 @@ impl Walk {
     }
 }
 
-/// Visit the children of `node` that intersect `r`, in scan order.
+/// One child of a branch, as the walk sees it — before anything is loaded.
+///
+/// Everything here is read from the PARENT, so it is known even for a child
+/// nobody holds. That is the point: a frontier names blocks it does not have.
+pub(crate) struct Child {
+    pub id: Cid,
+    pub agg: Agg,
+    pub span: Span,
+    /// A child of a level-1 branch is a leaf.
+    pub is_leaf: bool,
+    /// Is the block held? A missing one can only be named, never looked into.
+    pub held: bool,
+}
+
+/// What the visitor wants done with a child it has just been shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visit {
+    /// Look inside it. Only a held branch can be descended; anything else is
+    /// treated as `Next`.
+    Descend,
+    /// Nothing more here; carry on with the next child.
+    Next,
+    /// End the walk.
+    Stop,
+}
+
+/// Show `visit` every child of `node` that intersects `r`, in scan order.
+///
+/// A visitor rather than a procedure with a sink: the frontier below is one
+/// consumer, and the range aggregate (#7) is another that needs the same
+/// classification for a different purpose. Neither belongs inside the walk.
 ///
 /// `upper` is the smallest key of whatever follows this node — the bound its
 /// last child's coverage ends at, which the node itself cannot know. That is
-/// what makes `Inside` decidable for a last child.
-fn walk<B: Blocks>(
+/// what makes [`Span::Inside`] decidable for a last child.
+pub(crate) fn walk<B: Blocks>(
     blocks: &B,
     node: &Node<'_>,
     upper: Option<&[u8]>,
     r: &Range,
-    f: &mut Walk,
+    visit: &mut impl FnMut(&Child) -> Visit,
 ) -> Result<(), ReadError> {
     if node.is_leaf() {
         return Ok(());
@@ -556,27 +602,25 @@ fn walk<B: Blocks>(
     } else {
         (0..n).collect()
     };
+    let prefix = node.prefix();
     for i in order {
-        if f.covered {
-            return Ok(());
-        }
-        let min = node.key(i);
-        // This child covers [min, next), where `next` is the following child's
-        // key or, for the last child, whatever bounds this node.
-        let next: Option<Vec<u8>> = if i + 1 < n {
-            Some(node.key(i + 1))
-        } else {
-            upper.map(|u| u.to_vec())
-        };
+        // Keys are read as the node's shared prefix plus this entry's suffix and
+        // are NOT joined: a key is only built for a child the walk descends
+        // into, which is a handful per walk rather than one per child.
+        let min = Key(prefix, node.suffix(i));
+        let next = (i + 1 < n).then(|| Key(prefix, node.suffix(i + 1)));
+
         // Every key this child holds is ≥ `min` and < `next`. Both tests below
         // follow from that and nothing else, so neither reads the child.
         //
         // Wholly above the range: its smallest key is already past the top.
-        let above = !below_hi(&min, &r.hi);
+        let above = !min.below_hi(&r.hi);
         // Wholly below it: everything it holds is under `next`, so if `next` is
         // at or below the bottom bound, nothing in it can qualify.
         let below = match (&next, &r.lo) {
-            (Some(nx), Bound::Included(k) | Bound::Excluded(k)) => nx <= k,
+            (Some(nx), Bound::Included(k) | Bound::Excluded(k)) => {
+                nx.cmp_key(k) != Ordering::Greater
+            }
             _ => false,
         };
         if above || below {
@@ -584,37 +628,88 @@ fn walk<B: Blocks>(
         }
         // Wholly within: its smallest key clears the bottom, and everything
         // under `next` clears the top.
-        let inside = above_lo(&min, &r.lo)
+        let inside = min.above_lo(&r.lo)
             && match (&next, &r.hi) {
                 (_, Bound::Unbounded) => true,
-                (Some(nx), Bound::Included(k) | Bound::Excluded(k)) => nx <= k,
-                (None, _) => false,
+                (Some(nx), Bound::Included(k) | Bound::Excluded(k)) => {
+                    nx.cmp_key(k) != Ordering::Greater
+                }
+                (None, _) => match upper {
+                    // The node's own bound stands in for a missing next key.
+                    Some(u) => {
+                        below_hi(u, &r.hi)
+                            || matches!(&r.hi, Bound::Included(h) | Bound::Excluded(h) if u <= h.as_slice())
+                    }
+                    None => false,
+                },
             };
-        let span = if inside { Span::Inside } else { Span::Edge };
         let (id, agg) = node.child(i);
-        // A child of a level-1 branch is a leaf. Read from the PARENT, so it is
-        // known for a child that is missing too.
-        let child_is_leaf = node.level() == 1;
-        match blocks.get(&id) {
-            None => f.name(id, agg, span, child_is_leaf),
-            Some(_) => {
-                // Held: nothing to fetch here, but its children may be missing —
-                // and what it already holds counts against the caller's limit.
-                let child = load(blocks, &id)?;
-                // Aggregates are believed for budgeting; how deep to recurse is
-                // not something an unverified chain gets to decide.
-                if child.level() + 1 != node.level() {
-                    return Err(ReadError::Mismatch(id));
-                }
-                if child.is_leaf() {
-                    f.hold(agg);
-                } else {
-                    walk(blocks, &child, next.as_deref(), r, f)?;
-                }
-            }
+        let child = Child {
+            id,
+            agg,
+            span: if inside { Span::Inside } else { Span::Edge },
+            is_leaf: node.level() == 1,
+            held: blocks.get(&id).is_some(),
+        };
+        match visit(&child) {
+            Visit::Stop => return Ok(()),
+            Visit::Next => continue,
+            Visit::Descend => {}
         }
+        if !child.held || child.is_leaf {
+            continue;
+        }
+        let loaded = load(blocks, &id)?;
+        // Aggregates are believed for budgeting; how deep to recurse is not
+        // something an unverified chain gets to decide.
+        if loaded.level() + 1 != node.level() {
+            return Err(ReadError::Mismatch(id));
+        }
+        // Only here is a key actually built: the bound this child's own last
+        // child ends at.
+        let next_key = next.map(|k| k.to_vec());
+        walk(blocks, &loaded, next_key.as_deref(), r, visit)?;
     }
     Ok(())
+}
+
+/// A key held as the node keeps it: a shared prefix and one entry's suffix,
+/// compared without being joined.
+struct Key<'a>(&'a [u8], &'a [u8]);
+
+impl Key<'_> {
+    fn cmp_key(&self, other: &[u8]) -> Ordering {
+        let Key(prefix, suffix) = self;
+        let n = prefix.len().min(other.len());
+        match prefix[..n].cmp(&other[..n]) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        if other.len() < prefix.len() {
+            return Ordering::Greater;
+        }
+        (*suffix).cmp(&other[prefix.len()..])
+    }
+
+    fn above_lo(&self, lo: &Bound<Vec<u8>>) -> bool {
+        match lo {
+            Bound::Unbounded => true,
+            Bound::Included(k) => self.cmp_key(k) != Ordering::Less,
+            Bound::Excluded(k) => self.cmp_key(k) == Ordering::Greater,
+        }
+    }
+
+    fn below_hi(&self, hi: &Bound<Vec<u8>>) -> bool {
+        match hi {
+            Bound::Unbounded => true,
+            Bound::Included(k) => self.cmp_key(k) != Ordering::Greater,
+            Bound::Excluded(k) => self.cmp_key(k) == Ordering::Less,
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u8> {
+        [self.0, self.1].concat()
+    }
 }
 
 /// The bytes of a value that lives in its own block.
