@@ -1,9 +1,14 @@
 //! Prolly tree: a sorted `key -> value` map whose shape and root hash are a pure
 //! function of its contents. See ARCHITECTURE.md §5. Built in phase 1.
 
+pub mod apply;
 pub mod boundary;
 pub mod build;
+pub mod chunk;
+pub mod cursor;
 pub mod node;
+pub mod read;
+pub mod store;
 
 /// Id of a block. It is the Block contract's key material, so a child pointer
 /// read from a parent is exactly what fetches the child from the network.
