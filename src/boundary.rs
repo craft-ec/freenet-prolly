@@ -27,7 +27,7 @@
 //! cap may favour larger nodes); no stored data exists before then, so reopening
 //! it costs only regenerated vectors.
 
-use crate::node::{HEADER, MAX_KEY, MAX_NODE};
+use crate::node::{Node, NodeBuilder, HEADER, MAX_KEY, MAX_NODE};
 
 /// Scale of the split hazard. Mean `logical_len` ≈ 0.906·λ plus about half an entry.
 pub const LAMBDA: u64 = 4400;
@@ -69,4 +69,40 @@ pub fn splits_after(level: u8, key: &[u8], s_before: usize, s_after: usize) -> b
     let lhs = split_hash(level, key) as u128 * LAMBDA4;
     let rhs = (p4(s_after) - p4(s_before)) << 32;
     lhs < rhs
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryError {
+    /// The node should have ended after entry `.0`, and goes on.
+    InteriorSplit(usize),
+    /// The entries measure more than `MAX_LOGICAL`.
+    TooLarge,
+}
+
+/// The part of the split rule that one node can be held to: no entry but the
+/// last satisfies the rule at its position, and the node is within the hard
+/// limit. Whether the LAST entry should have closed the node cannot be told from
+/// the node alone (the last node of a level, and a node closed by the hard
+/// limit, end without it), so that is not checked.
+///
+/// For hosts: a parsed node that fails this was not produced by the format's
+/// chunker, and keeping it would poison dedup and diff for its readers.
+pub fn check_node(node: &Node<'_>) -> Result<(), BoundaryError> {
+    let mut s = HEADER;
+    for i in 0..node.len() {
+        let key = node.key(i);
+        let after = s + if node.is_leaf() {
+            NodeBuilder::leaf_cost(&key, &node.value(i))
+        } else {
+            NodeBuilder::child_cost(&key)
+        };
+        if after > MAX_LOGICAL {
+            return Err(BoundaryError::TooLarge);
+        }
+        if i + 1 < node.len() && splits_after(node.level(), &key, s, after) {
+            return Err(BoundaryError::InteriorSplit(i));
+        }
+        s = after;
+    }
+    Ok(())
 }

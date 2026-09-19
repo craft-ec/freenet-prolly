@@ -337,6 +337,10 @@ fn one_edit_rewrites_a_few_nodes_and_a_positional_rule_rewrites_the_rest() {
 /// cannot fit. Pins MAX_LOGICAL, "close before the overflowing entry", and the
 /// restart of the rule at s_before = HEADER.
 fn forced_split_tree() -> Cid {
+    forced_split_tree_into(&mut Nodes::new())
+}
+
+fn forced_split_tree_into(keep: &mut Nodes) -> Cid {
     let mut e: Entries = Vec::new();
     let mut s = HEADER;
     let big = vec![7u8; 1000];
@@ -375,6 +379,7 @@ fn forced_split_tree() -> Cid {
         "and it was nearly full: {s}"
     );
     assert_eq!(walk(root, &nodes).0, e);
+    keep.extend(nodes);
     root
 }
 
@@ -471,4 +476,102 @@ fn frozen_vectors() {
     }
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
+}
+
+/// What a host can hold a single node to.
+#[test]
+fn every_built_node_passes_the_per_node_split_check_and_a_miscut_node_does_not() {
+    use freenet_prolly::boundary::{check_node, BoundaryError, MAX_LOGICAL};
+    let e = dataset(3, 60_000);
+    let (_, nodes) = build(&e);
+    let mut checked = 0;
+    for bytes in nodes.values() {
+        assert_eq!(check_node(&Node::parse(bytes).unwrap()), Ok(()));
+        checked += 1;
+    }
+    assert!(checked > 3000);
+    let (_, forced) = {
+        let mut nodes = Nodes::new();
+        let root = forced_split_tree_into(&mut nodes);
+        (root, nodes)
+    };
+    for bytes in forced.values() {
+        assert_eq!(check_node(&Node::parse(bytes).unwrap()), Ok(()));
+    }
+
+    // Control: the same entries cut by a positional rule parse fine, and are refused.
+    let (_, miscut) = build_with(by_size, &e);
+    let refused = miscut
+        .values()
+        .filter(|b| {
+            matches!(
+                check_node(&Node::parse(b).unwrap()),
+                Err(BoundaryError::InteriorSplit(_))
+            )
+        })
+        .count();
+    println!("positional cut: {refused}/{} nodes refused", miscut.len());
+    // A Weibull node would have ended before 4 KiB with probability
+    // 1 − exp(−(4096/4400)⁴) ≈ 0.53, so about half the positional nodes hold an
+    // entry that should have closed them.
+    assert!(
+        refused * 10 > miscut.len() * 4,
+        "{refused}/{}",
+        miscut.len()
+    );
+
+    // A node over the limit (the raw builder allows up to MAX_NODE).
+    let mut b = NodeBuilder::leaf();
+    let mut i = 0u32;
+    while b.logical_len() <= MAX_LOGICAL {
+        let key = (0..)
+            .map(|j| format!("{i:05}.{j}").into_bytes())
+            .find(|k| {
+                let c = NodeBuilder::leaf_cost(k, &Value::Inline(b""));
+                b.logical_len() + c > MAX_LOGICAL
+                    || !splits_after(0, k, b.logical_len(), b.logical_len() + c)
+            })
+            .unwrap();
+        b.push(&key, Value::Inline(b"")).unwrap();
+        i += 1;
+    }
+    let bytes = b.finish().unwrap();
+    assert_eq!(
+        check_node(&Node::parse(&bytes).unwrap()),
+        Err(BoundaryError::TooLarge)
+    );
+
+    // Cost on the worst case a host can be handed: ~12 KiB of minimum-size entries.
+    let mut b = NodeBuilder::leaf();
+    let mut i = 0u32;
+    loop {
+        let base = b.logical_len();
+        if base + 13 + 6 > MAX_LOGICAL {
+            break;
+        }
+        let Some(key) = (0..200u32)
+            .map(|j| format!("{i:04}{j:02}").into_bytes())
+            .find(|k| !splits_after(0, k, base, base + 13 + k.len()))
+        else {
+            break;
+        };
+        if base + 13 + key.len() > MAX_LOGICAL {
+            break;
+        }
+        b.push(&key, Value::Inline(b"")).unwrap();
+        i += 1;
+    }
+    let entries = b.len();
+    let bytes = b.finish().unwrap();
+    let t = std::time::Instant::now();
+    for _ in 0..200 {
+        let n = Node::parse(&bytes).unwrap();
+        check_node(&n).unwrap();
+    }
+    println!(
+        "worst-case node: {entries} entries, {} B; parse + check_node = {:?} each (native, opt-level 2)",
+        bytes.len(),
+        t.elapsed() / 200
+    );
+    assert!(entries > 500);
 }
