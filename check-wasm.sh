@@ -52,7 +52,15 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
       bad++; console.error(`rproof ${n}: does not verify on wasm32`);
     }
   }
-  console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs and ${rproofs.length} range proofs match native and verify (${bad} bad)`);
+  // The empty final page of a listing, at the WIRE door — the page a light
+  // client sees when it finishes reading a feed.
+  for (const n of [1000, 5000]) {
+    if (instance.exports.empty_final_page_ok(n) !== 1) {
+      bad++;
+      console.error(`empty final page (${n} entries): not verified on wasm32`);
+    }
+  }
+  console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs, ${rproofs.length} range proofs and the empty final page match native and verify (${bad} bad)`);
   process.exit(bad ? 1 : 0);
 });
 JS

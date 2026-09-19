@@ -916,8 +916,31 @@ pub enum ProvenOwned {
 /// [`verify_range`] from the wire form, refusing before copying.
 pub fn verify_range_bytes(root: &Cid, r: &Range, bytes: &[u8]) -> Result<ProvenPage, ProofError> {
     let per_page = bounded(r)?;
+    // BEFORE the shape gate, because that gate reads the root's level out of a
+    // first block and an empty proof has none. This is the WIRE door — what a
+    // light client and a browser call — so an empty final page refused here is
+    // refused where it matters, whatever `verify_range` does with an
+    // already-decoded proof. Fixing one entry point and not the other left the
+    // bug exactly where the users are.
+    if bounds_are_empty(r) {
+        // Compared as BYTES against the one canonical encoding: nothing is
+        // decoded, nothing is hashed, and anything else is Extra.
+        if bytes != empty_proof_bytes() {
+            return Err(ProofError::Extra);
+        }
+        return Ok(ProvenPage {
+            entries: Vec::new(),
+            next: None,
+        });
+    }
     shape_of_bytes(bytes, root, 2, per_page)?;
     verify_range(root, r, &Proof::decode(bytes)?)
+}
+
+/// The one encoding of the empty proof — the canonical answer to a question
+/// whose bounds cannot hold a key.
+fn empty_proof_bytes() -> Vec<u8> {
+    Proof::default().encode()
 }
 
 #[cfg(test)]
@@ -1019,6 +1042,68 @@ mod range_tests {
             "listing proof: honest {honest_work} blocks; 20,000 pad nodes ({} B) cost 0 hashed, 0 copied",
             wire.len()
         );
+    }
+
+    /// An empty-bounds question is answered, or refused, without decoding or
+    /// hashing anything — including at the wire door, which is the one a light
+    /// client calls.
+    #[test]
+    fn an_empty_question_costs_nothing_at_either_door() {
+        let (blocks, root, keys) = tree();
+        // Reverse, resumed exactly at its lower bound: the bounds are empty.
+        let q = Range {
+            lo: std::ops::Bound::Included(keys[100].clone()),
+            hi: std::ops::Bound::Included(keys[300].clone()),
+            reverse: true,
+            after: Some(keys[100].clone()),
+            max_entries: 20,
+            ..Range::default()
+        };
+        let honest = prove_range(&blocks, &root, &q).unwrap();
+        assert!(honest.nodes.is_empty());
+        let wire = honest.encode();
+
+        HASHED.store(0, Ordering::Relaxed);
+        COPIED.store(0, Ordering::Relaxed);
+        assert!(verify_range_bytes(&root, &q, &wire)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(HASHED.load(Ordering::Relaxed), 0);
+        assert_eq!(COPIED.load(Ordering::Relaxed), 0);
+
+        // A padded proof aimed at an empty question: refused without decoding.
+        let padded = {
+            let real = prove_range(
+                &blocks,
+                &root,
+                &Range {
+                    after: None,
+                    ..q.clone()
+                },
+            )
+            .unwrap();
+            padded_proof(&real, 5_000).encode()
+        };
+        assert!(padded.len() > 500_000);
+        HASHED.store(0, Ordering::Relaxed);
+        COPIED.store(0, Ordering::Relaxed);
+        assert_eq!(
+            verify_range_bytes(&root, &q, &padded),
+            Err(ProofError::Extra)
+        );
+        assert_eq!(HASHED.load(Ordering::Relaxed), 0, "padding was hashed");
+        assert_eq!(
+            COPIED.load(Ordering::Relaxed),
+            0,
+            "{} B was copied to refuse an empty question",
+            padded.len()
+        );
+        println!("empty question: answered and refused at 0 hashed, 0 copied");
+    }
+
+    fn padded_proof(honest: &Proof, n: usize) -> Proof {
+        padded(honest, n)
     }
 
     /// A prover cannot pass off a page it could not complete itself.

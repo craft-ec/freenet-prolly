@@ -1310,6 +1310,16 @@ fn the_final_page_of_a_listing_verifies_in_both_directions() {
                             p.nodes.len()
                         )
                     });
+                    // BOTH doors. The wire one is what a light client calls,
+                    // and it had the same bug after the other was fixed.
+                    let wire = verify_range_bytes(&root, &req, &p.encode()).unwrap_or_else(|e| {
+                        panic!(
+                            "an HONEST proof was refused at the WIRE door as {e:?}: \
+                                 reverse={reverse} limit={limit} nodes={}",
+                            p.nodes.len()
+                        )
+                    });
+                    assert_eq!(wire, page, "the two doors disagreed");
                     pages += 1;
                     if page.entries.is_empty() {
                         empties += 1;
@@ -1382,6 +1392,28 @@ fn an_empty_bounds_question_takes_the_empty_proof_and_nothing_else() {
         Err(ProofError::Extra),
         "blocks attached to an empty-bounds question must be refused"
     );
+
+    // The wire door, for every case above.
+    assert!(verify_range_bytes(&root, &empty_q, &p.encode())
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(verify_range_bytes(&root, &fwd, &pf.encode())
+        .unwrap()
+        .entries
+        .is_empty());
+    assert_eq!(
+        verify_range_bytes(&root, &empty_q, &real.encode()),
+        Err(ProofError::Extra),
+        "the wire door accepted blocks on an empty-bounds question"
+    );
+    // Anything that is not the canonical empty encoding, without decoding it.
+    for junk in [&b""[..], b"PP01", &[0xff; 64]] {
+        assert_eq!(
+            verify_range_bytes(&root, &empty_q, junk),
+            Err(ProofError::Extra)
+        );
+    }
 
     // And a NON-empty question still refuses a zero-node proof.
     let nonempty = Range {

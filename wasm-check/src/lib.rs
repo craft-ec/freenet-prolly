@@ -135,3 +135,68 @@ pub extern "C" fn range_proof_verify(n: u32) -> i32 {
         _ => 0,
     }
 }
+
+/// 1 if the EMPTY final page of a reverse listing verifies here, at the wire
+/// door, and if blocks attached to that question are refused.
+///
+/// The page a light client sees when it finishes reading a feed. It was
+/// refused on this path while passing on the other one, so it is checked on
+/// the target and through the bytes.
+#[no_mangle]
+pub extern "C" fn empty_final_page_ok(n: u32) -> i32 {
+    use freenet_prolly::proof::{prove_range, verify_range_bytes, Proof};
+    use freenet_prolly::range::Range;
+    use freenet_prolly::store::MemBlocks;
+    let e = common::dataset(1, n as usize);
+    let mut store = MemBlocks::default();
+    let root = build(
+        e.iter().map(|(k, v)| (k.as_slice(), Value::Inline(v))),
+        |c, b| store.insert(c, b),
+    )
+    .unwrap();
+    let mut keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    // Reverse, resumed at the lower bound: the bounds cannot hold a key.
+    let q = Range {
+        lo: core::ops::Bound::Included(keys[10].clone()),
+        hi: core::ops::Bound::Included(keys[50].clone()),
+        reverse: true,
+        after: Some(keys[10].clone()),
+        max_entries: 8,
+        ..Range::default()
+    };
+    let Ok(p) = prove_range(&store, &root, &q) else {
+        return 0;
+    };
+    if !p.nodes.is_empty() {
+        return 0;
+    }
+    match verify_range_bytes(&root, &q, &p.encode()) {
+        Ok(page) if page.entries.is_empty() && page.next.is_none() => {}
+        _ => return 0,
+    }
+    // And a non-empty proof for that question is refused.
+    let Ok(real) = prove_range(
+        &store,
+        &root,
+        &Range {
+            after: None,
+            ..q.clone()
+        },
+    ) else {
+        return 0;
+    };
+    if verify_range_bytes(&root, &q, &real.encode()).is_ok() {
+        return 0;
+    }
+    // A zero-node proof still cannot answer a question with entries in it.
+    let nonempty = Range {
+        after: None,
+        ..q.clone()
+    };
+    if verify_range_bytes(&root, &nonempty, &Proof::default().encode()).is_ok() {
+        return 0;
+    }
+    1
+}
