@@ -9,9 +9,11 @@ pub mod chunk;
 pub mod cursor;
 pub mod diff;
 pub mod node;
+pub mod parity;
 pub mod proof;
 pub mod range;
 pub mod read;
+pub mod rs;
 pub mod store;
 
 /// Id of a block. It is the Block contract's key material, so a child pointer
