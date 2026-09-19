@@ -8,7 +8,28 @@
 //! Resuming by key, never by a position in a node, is what makes a page survive
 //! the tree changing underneath it: the caller may hand the next page a newer
 //! root and get that tree's entries from the same key on.
+//!
+//! Aggregates are believed for BUDGETING and never for CONTENT: what a page
+//! serves comes from leaves the reader has loaded and checked against their
+//! parents, while what it NAMES is decided from numbers a branch records about
+//! children nobody has seen yet. Naming a block one does not hold is a decision
+//! made on hearsay, and the bounds here are what keep a lie about it cheap.
+//!
+//! # For the range aggregate (#7), which reuses [`walk`]
+//!
+//! Two things want changing first, neither of which matters while the walk only
+//! builds a frontier:
+//!
+//! - it builds `node.key(i)` for every child — the same per-entry allocation
+//!   #18 took out of `check_node`. Prefer `node.search` on the two bounds and
+//!   treat everything strictly between them as [`Span::Inside`], which needs no
+//!   key at all;
+//! - it is a procedure with a sink rather than a visitor. #7 wants
+//!   `(child, agg, Span)` yielded, and it will need `Edge` children DESCENDED
+//!   rather than merely classified, since an edge's exact contribution is only
+//!   known further down.
 
+use crate::boundary::MAX_LOGICAL;
 use crate::cursor::Cursor;
 use crate::node::{Agg, Node, Value};
 use crate::store::{load, Blocks, ReadError};
@@ -40,11 +61,18 @@ pub struct Options {
     /// Stop naming blocks once the named aggregates cover the caller's limit.
     /// With this off, a page for twenty entries names blocks for sixty-four.
     pub agg_bound: bool,
+    /// Budget a leaf's bytes by what a PAGE can take from it, not by the
+    /// logical bytes its aggregate records. With this off, one leaf of large
+    /// referenced values "covers" a 256 KiB budget by itself.
+    pub cap_leaf_bytes: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { agg_bound: true }
+        Options {
+            agg_bound: true,
+            cap_leaf_bytes: true,
+        }
     }
 }
 
@@ -110,9 +138,12 @@ fn successor(p: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug)]
 pub struct Page<'a> {
     pub entries: Vec<(Vec<u8>, Value<'a>)>,
-    /// Resume after this key. It does NOT promise more entries exist: when the
-    /// limit lands exactly on the range's last entry, the scan does not read on
-    /// to find out, and one extra empty page is the honest cost.
+    /// Resume by passing the ORIGINAL `lo`/`hi` again with `after = next`; the
+    /// bounds are the range, this is only the cursor into it.
+    ///
+    /// It does NOT promise more entries exist: when the limit lands exactly on
+    /// the range's last entry, the scan does not read on to find out, and one
+    /// extra empty page is the honest cost.
     pub next: Option<Vec<u8>>,
     /// Blocks to fetch, in scan order: the leaf the scan stopped at, plus
     /// further blocks of the range that the held branches can name.
@@ -178,32 +209,49 @@ fn entry_bytes(key: &[u8], v: &Value<'_>) -> usize {
 }
 
 /// Place a cursor at the first entry of the scan.
-fn open<'a, B: Blocks>(blocks: &'a B, root: &Cid, r: &Range) -> Result<Cursor<'a, B>, ReadError> {
+/// Place a cursor at the first entry of the scan. `None` means the scan is over
+/// before it starts — which is not the same as an empty tree: it is reached when
+/// the only step left would cross into a leaf that lies wholly outside the
+/// range, and that step is exactly what must not be paid for.
+fn open<'a, B: Blocks>(
+    blocks: &'a B,
+    root: &Cid,
+    r: &Range,
+) -> Result<Option<Cursor<'a, B>>, ReadError> {
     let start = start_bound(r);
     if r.reverse {
-        return match &start {
-            Bound::Unbounded => Cursor::seek_last(blocks, root),
-            Bound::Excluded(k) => Cursor::seek_before(blocks, root, k),
-            Bound::Included(k) => {
-                let mut c = Cursor::seek(blocks, root, k)?;
-                // `seek` lands on the first key ≥ k; for a reverse scan that key
-                // is only in range when it equals k.
-                if c.peek().map(|(got, _)| got == *k) != Some(true) {
-                    c.prev()?;
-                }
-                Ok(c)
-            }
+        // Both bounded cases go through `seek`, so the step backwards is one the
+        // range can be consulted about first. `seek_before` would take it inside
+        // the cursor, where the range is not known.
+        let (key, step_on_equal) = match &start {
+            Bound::Unbounded => return Cursor::seek_last(blocks, root).map(Some),
+            Bound::Included(k) => (k, false),
+            Bound::Excluded(k) => (k, true),
         };
+        let mut c = Cursor::seek(blocks, root, key)?;
+        // `seek` lands on the first key ≥ k. A reverse scan wants the last key
+        // at or below it, so step back unless we landed exactly where we want.
+        let landed_on_key = c.peek().map(|(got, _)| got == *key) == Some(true);
+        if step_on_equal || !landed_on_key {
+            if at_edge_of_range(&c, r) {
+                return Ok(None);
+            }
+            c.prev()?;
+        }
+        return Ok(Some(c));
     }
     match &start {
-        Bound::Unbounded => Cursor::seek(blocks, root, &[]),
-        Bound::Included(k) => Cursor::seek(blocks, root, k),
+        Bound::Unbounded => Cursor::seek(blocks, root, &[]).map(Some),
+        Bound::Included(k) => Cursor::seek(blocks, root, k).map(Some),
         Bound::Excluded(k) => {
             let mut c = Cursor::seek(blocks, root, k)?;
             if c.peek().map(|(got, _)| got == *k) == Some(true) {
+                if at_edge_of_range(&c, r) {
+                    return Ok(None);
+                }
                 c.next()?;
             }
-            Ok(c)
+            Ok(Some(c))
         }
     }
 }
@@ -239,14 +287,17 @@ pub fn range_with<'a, B: Blocks>(
     }
 
     let mut cur = match open(blocks, root, r) {
-        Ok(c) => c,
-        Err(ReadError::Need(ids)) => {
+        // The only step left would have left the range: nothing to serve and
+        // nothing to fetch.
+        Ok(None) => return Ok(page),
+        Ok(Some(c)) => c,
+        Err(ReadError::Need(_)) => {
             // Nothing served, so name what the held branches can see of the
-            // range — not only the one block the descent stopped on.
+            // range — not only the block the descent happened to stop on, which
+            // may lie outside it. An empty frontier means nothing in range is
+            // missing, so the page is finished; naming the descent's block
+            // anyway would send the caller after one it cannot use.
             page.need = frontier(opts, blocks, root, &rest_from_start(r))?;
-            if page.need.is_empty() {
-                page.need = ids;
-            }
             return Ok(page);
         }
         Err(e) => return Err(e.into()),
@@ -370,6 +421,16 @@ enum Span {
     Edge,
 }
 
+/// The blocks a scan of `rest` needs, in scan order, named from the held
+/// branches alone.
+///
+/// Public because the per-device overlay k-way merges several [`Cursor`]s and
+/// has to name the frontier of a tree that is blocked while the others keep
+/// serving — it needs this without going through [`range`].
+pub fn frontier_of<B: Blocks>(blocks: &B, root: &Cid, rest: &Range) -> Result<Vec<Cid>, ReadError> {
+    frontier(Options::default(), blocks, root, rest)
+}
+
 /// The blocks a scan needs to continue past `from`, in scan order.
 ///
 /// Walks the branches that are HELD, names the blocks that are not, and stops
@@ -395,6 +456,7 @@ fn frontier<B: Blocks>(
         want_bytes: rest.max_bytes as u64,
         covered: false,
         agg_bound: opts.agg_bound,
+        cap_leaf_bytes: opts.cap_leaf_bytes,
     };
     let node = load(blocks, root)?;
     walk(blocks, &node, None, rest, &mut f)?;
@@ -409,6 +471,7 @@ struct Walk {
     want_bytes: u64,
     covered: bool,
     agg_bound: bool,
+    cap_leaf_bytes: bool,
 }
 
 impl Walk {
@@ -421,14 +484,14 @@ impl Walk {
     /// frontier early, costing one more round, never a wrong answer. (The span
     /// is still yielded: the range aggregate of #7 needs the exact/bound
     /// distinction, and this walk is the one it will reuse.)
-    fn name(&mut self, id: Cid, agg: Agg, _span: Span) {
+    fn name(&mut self, id: Cid, agg: Agg, _span: Span, leaf: bool) {
         if self.out.contains(&id) {
             return;
         }
         self.out.push(id);
         // The recount comes after the push, so the block that stopped the scan
         // is always named however tight the limit is.
-        self.add(agg);
+        self.add(agg, leaf);
     }
 
     /// A leaf that is already HELD needs no fetch, but it still fills the
@@ -440,12 +503,26 @@ impl Walk {
         if self.out.is_empty() {
             return;
         }
-        self.add(agg);
+        self.add(agg, true);
     }
 
-    fn add(&mut self, agg: Agg) {
+    fn add(&mut self, agg: Agg, leaf: bool) {
+        // `agg.bytes` is LOGICAL bytes: a referenced value counts its full
+        // length, while a page charges it 32 bytes for the reference. So a
+        // leaf's aggregate can claim to cover a whole byte budget on its own,
+        // and the frontier would stop after naming it. What a page can actually
+        // take from a leaf is at most the leaf's own measure — still an upper
+        // bound, and one that does not depend on where the values live.
+        //
+        // A missing BRANCH keeps its recorded bytes: it is named and not
+        // descended, so how its subtree is shaped is unknowable here.
+        let bytes = if leaf && self.cap_leaf_bytes {
+            agg.bytes.min(MAX_LOGICAL as u64)
+        } else {
+            agg.bytes
+        };
         self.entries = self.entries.saturating_add(agg.count);
-        self.bytes = self.bytes.saturating_add(agg.bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
         // EITHER limit ends a page, so either one being covered means what has
         // been named can already fill it. Requiring both would name a byte
         // budget's worth of leaves to serve twenty entries — the exact waste
@@ -515,12 +592,20 @@ fn walk<B: Blocks>(
             };
         let span = if inside { Span::Inside } else { Span::Edge };
         let (id, agg) = node.child(i);
+        // A child of a level-1 branch is a leaf. Read from the PARENT, so it is
+        // known for a child that is missing too.
+        let child_is_leaf = node.level() == 1;
         match blocks.get(&id) {
-            None => f.name(id, agg, span),
+            None => f.name(id, agg, span, child_is_leaf),
             Some(_) => {
                 // Held: nothing to fetch here, but its children may be missing —
                 // and what it already holds counts against the caller's limit.
                 let child = load(blocks, &id)?;
+                // Aggregates are believed for budgeting; how deep to recurse is
+                // not something an unverified chain gets to decide.
+                if child.level() + 1 != node.level() {
+                    return Err(ReadError::Mismatch(id));
+                }
                 if child.is_leaf() {
                     f.hold(agg);
                 } else {

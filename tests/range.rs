@@ -782,7 +782,10 @@ fn a_small_limit_names_few_blocks_and_the_control_names_many() {
     };
 
     let bounded = named(Options::default());
-    let unbounded = named(Options { agg_bound: false });
+    let unbounded = named(Options {
+        agg_bound: false,
+        ..Options::default()
+    });
     println!("latest-20 frontier: {bounded} blocks named, control names {unbounded}");
     assert!(
         bounded <= 4,
@@ -1144,4 +1147,145 @@ fn value_bytes_checks_what_it_returns() {
         !store.0.contains_key(&as_value),
         "nothing in the store answers to the RAW id of a node"
     );
+}
+
+/// The final page of every "page size N" list. When the entry limit lands on the
+/// range's last entry AND that entry is the last of its leaf, the follow-up page
+/// has to step off the leaf to discover there is nothing more — and the block it
+/// would step into lies outside the range. Naming it costs the caller a network
+/// round for a block it can never use, and the entries still come out right, so
+/// nothing else in this suite would notice.
+#[test]
+fn the_page_after_the_last_one_names_nothing_outside_the_range() {
+    let m: Map = dataset(5, 3000).into_iter().collect();
+    let (root, full) = scratch(&m);
+    let lv = leaves(&full);
+    assert!(lv.len() > 6);
+    let mid = lv.len() / 2;
+    let (lo, hi) = (lv[mid].0.clone(), lv[mid].1.clone());
+    let in_leaf = m.range(lo.clone()..=hi.clone()).count();
+    assert!(in_leaf > 1);
+
+    for reverse in [false, true] {
+        // Hold every branch and exactly the one leaf the range lives in.
+        let mut held = MemBlocks::default();
+        for (id, bytes) in full.0.iter() {
+            let n = Node::parse(bytes).unwrap();
+            if !n.is_leaf() || (n.key(0) == lo && n.key(n.len() - 1) == hi) {
+                held.insert(*id, bytes);
+            }
+        }
+        let req = Range {
+            lo: Bound::Included(lo.clone()),
+            hi: Bound::Included(hi.clone()),
+            reverse,
+            // Exactly the entries in range: the limit lands on the last one.
+            max_entries: in_leaf,
+            max_bytes: usize::MAX,
+            ..Range::default()
+        };
+        let p = range(&held, &root, &req).unwrap();
+        assert_eq!(p.entries.len(), in_leaf, "page 1 serves the whole leaf");
+        let next = p.next.clone();
+        assert!(p.need.is_empty(), "page 1 needs nothing");
+        assert!(next.is_some(), "page 1 does not know it is the last");
+        drop(p);
+
+        let p2 = range(
+            &held,
+            &root,
+            &Range {
+                after: next,
+                ..req.clone()
+            },
+        )
+        .unwrap();
+        assert!(p2.entries.is_empty(), "there is nothing left in range");
+        assert!(
+            p2.need.is_empty(),
+            "the follow-up page named {} block(s) outside the range (reverse {reverse})",
+            p2.need.len()
+        );
+        assert!(p2.finished(), "and it must be the end of the scan");
+    }
+}
+
+/// The frontier's byte budget must be in the bytes a PAGE costs, not the logical
+/// bytes an aggregate records. A referenced value counts its full length in the
+/// aggregate and 32 bytes in a page, so one leaf of large references can claim
+/// to fill a 256 KiB budget by itself — and the frontier then names one block
+/// per round for exactly the scans that are all references, like file listings.
+#[test]
+fn a_leaf_of_referenced_values_does_not_swallow_the_byte_budget() {
+    use freenet_prolly::boundary::MAX_LOGICAL;
+    // Every value is a 100 KiB reference.
+    let mut m: Map = Map::new();
+    for i in 0..3000u32 {
+        m.insert(
+            format!("f/{i:08}").into_bytes(),
+            vec![(i % 251) as u8; 100 * 1024],
+        );
+    }
+    let (root, full) = scratch(&m);
+    assert!(m.values().all(|v| v.len() > MAX_INLINE));
+
+    // Only the BYTE budget may bind here, or the entry limit would be what
+    // stops the frontier and this would be measuring the wrong rule.
+    let bytes_only = Range {
+        max_entries: usize::MAX,
+        max_bytes: 256 * 1024,
+        ..Range::default()
+    };
+    let named = |opts: Options, req: &Range| -> usize {
+        // Branches held, no leaves: the frontier has everything it needs to name
+        // a round's worth and nothing it can serve.
+        let mut held = MemBlocks::default();
+        for (id, bytes) in full.0.iter() {
+            if Node::parse(bytes).is_ok_and(|n| !n.is_leaf()) {
+                held.insert(*id, bytes);
+            }
+        }
+        let p = range_with(opts, &held, &root, req).unwrap();
+        assert!(p.entries.is_empty());
+        p.need.len()
+    };
+
+    let capped = named(Options::default(), &bytes_only);
+    let logical = named(
+        Options {
+            cap_leaf_bytes: false,
+            ..Options::default()
+        },
+        &bytes_only,
+    );
+    println!("ref-heavy frontier: {capped} blocks named, logical-bytes rule names {logical}");
+    // A page's 256 KiB can take at least this many leaves' worth of entries.
+    let floor = bytes_only.max_bytes / MAX_LOGICAL;
+    assert!(
+        capped >= floor,
+        "{capped} blocks named, a page can take {floor} leaves' worth"
+    );
+    assert_eq!(logical, 1, "the control must name one block");
+
+    // With the default limits it is the ENTRY budget that binds, which is the
+    // right answer for a different reason — recorded so the number above is not
+    // read as the only one.
+    let default_named = named(Options::default(), &Range::default());
+    println!("ref-heavy frontier, default limits: {default_named} blocks named");
+    assert!(default_named > 1);
+
+    // Inline values are unaffected: the aggregate is already the page cost.
+    let inline: Map = (0..3000u32)
+        .map(|i| (format!("f/{i:08}").into_bytes(), vec![7u8; 200]))
+        .collect();
+    let (root2, full2) = scratch(&inline);
+    let mut held = MemBlocks::default();
+    for (id, bytes) in full2.0.iter() {
+        if Node::parse(bytes).is_ok_and(|n| !n.is_leaf()) {
+            held.insert(*id, bytes);
+        }
+    }
+    let p = range(&held, &root2, &Range::default()).unwrap();
+    println!("inline frontier: {} blocks named", p.need.len());
+    assert!(p.need.len() > 1, "inline values still fill a round");
 }
