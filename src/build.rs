@@ -6,7 +6,7 @@
 //! empty leaf.
 
 use crate::boundary;
-use crate::node::{Agg, BuildError, NodeBuilder, Value, HEADER};
+use crate::node::{Agg, BuildError, NodeBuilder, Value};
 use crate::{cid, Cid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +14,9 @@ pub enum TreeError {
     Node(BuildError),
     /// More levels than a `u8` can number.
     TooDeep,
+    /// An earlier call failed after nodes had been closed; the builder's output
+    /// can no longer be the canonical tree, so it refuses to go on.
+    Poisoned,
 }
 
 impl From<BuildError> for TreeError {
@@ -44,6 +47,7 @@ pub struct TreeBuilder<F: FnMut(Cid, &[u8])> {
     levels: Vec<Level>,
     /// Last key pushed: order must hold across node boundaries too.
     last: Option<Vec<u8>>,
+    poisoned: bool,
     rule: SplitRule,
     sink: F,
 }
@@ -59,18 +63,31 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         TreeBuilder {
             levels: Vec::new(),
             last: None,
+            poisoned: false,
             rule,
             sink,
         }
     }
 
     /// Add the next entry. Keys must be strictly increasing.
+    ///
+    /// A refused entry (bad order, key too long, wrong value encoding) leaves the
+    /// builder exactly as it was — everything that can refuse an entry is checked
+    /// before anything changes, so what a caller tried first never shows in the
+    /// root. A failure past that point poisons the builder.
     pub fn push(&mut self, key: &[u8], value: Value<'_>) -> Result<(), TreeError> {
+        if self.poisoned {
+            return Err(TreeError::Poisoned);
+        }
         if self.last.as_deref().is_some_and(|p| p >= key) {
             return Err(BuildError::NotSorted.into());
         }
+        NodeBuilder::check_leaf(key, &value)?;
         let cost = NodeBuilder::leaf_cost(key, &value);
-        self.add(0, key, cost, |b| b.push(key, value))?;
+        if let Err(e) = self.add(0, key, cost, |b| b.push(key, value)) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.last = Some(key.to_vec());
         Ok(())
     }
@@ -95,8 +112,6 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         put: impl FnOnce(&mut NodeBuilder) -> Result<(), BuildError>,
     ) -> Result<(), TreeError> {
         let limit = boundary::MAX_LOGICAL;
-        // MAX_KEY and MAX_INLINE bound every entry far below the limit.
-        debug_assert!(HEADER + cost <= limit);
         if self.level(l)?.open.logical_len() + cost > limit {
             self.close(l)?;
         }
@@ -145,6 +160,9 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
 
     /// Close every level and return the root's cid.
     pub fn finish(mut self) -> Result<Cid, TreeError> {
+        if self.poisoned {
+            return Err(TreeError::Poisoned);
+        }
         if self.levels.is_empty() {
             self.level(0)?;
         }
@@ -182,3 +200,10 @@ pub fn build<'a>(
     }
     t.finish()
 }
+
+// Every entry fits an empty node with room to spare, so the forced close in
+// `add` always makes progress.
+const _: () = assert!(
+    crate::node::HEADER + 6 + 7 + crate::node::MAX_KEY + crate::node::MAX_INLINE
+        <= boundary::MAX_LOGICAL
+);

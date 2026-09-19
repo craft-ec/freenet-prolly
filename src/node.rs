@@ -488,6 +488,20 @@ impl NodeBuilder {
         self.entries.first().map(|(k, _)| k.as_slice())
     }
 
+    /// Whether `key` and `value` can ever be a leaf entry: key length and the
+    /// one-encoding rule. Independent of the builder's state, so a caller can
+    /// check before doing anything that has side effects.
+    pub fn check_leaf(key: &[u8], value: &Value<'_>) -> Result<(), BuildError> {
+        if key.len() > MAX_KEY {
+            return Err(BuildError::KeyTooLong);
+        }
+        match value {
+            Value::Inline(b) if b.len() > MAX_INLINE => Err(BuildError::ValueTooLong),
+            Value::Ref { len, .. } if *len as usize <= MAX_INLINE => Err(BuildError::ValueTooShort),
+            _ => Ok(()),
+        }
+    }
+
     /// What one entry adds to [`Self::logical_len`].
     pub fn leaf_cost(key: &[u8], value: &Value<'_>) -> usize {
         let stored = match value {
@@ -538,12 +552,9 @@ impl NodeBuilder {
         if self.level != 0 {
             return Err(BuildError::WrongKind);
         }
+        Self::check_leaf(key, &value)?;
         let (vkind, vlen, stored): (u8, u32, Vec<u8>) = match value {
-            Value::Inline(b) if b.len() > MAX_INLINE => return Err(BuildError::ValueTooLong),
             Value::Inline(b) => (0, b.len() as u32, b.to_vec()),
-            Value::Ref { len, .. } if len as usize <= MAX_INLINE => {
-                return Err(BuildError::ValueTooShort)
-            }
             Value::Ref { cid, len } => (1, len, cid.to_vec()),
         };
         let entry_agg = Agg {

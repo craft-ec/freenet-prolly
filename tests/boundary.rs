@@ -146,6 +146,46 @@ fn order_is_enforced_across_node_boundaries_and_oversized_values_are_refused() {
         .unwrap();
 }
 
+/// A push that fails must leave the builder exactly as it was: otherwise the
+/// same contents hash two ways depending on what the caller tried first.
+#[test]
+fn a_rejected_push_does_not_change_the_root() {
+    let e = dataset(1, 400);
+    let cid = [5u8; 32];
+    let long_key = vec![b'k'; 600];
+    let run = |noise: bool| {
+        let mut t = TreeBuilder::new(|_, _: &[u8]| {});
+        let mut rejected = 0;
+        for (i, (k, v)) in e.iter().enumerate() {
+            if i % 7 != 0 {
+                t.push(k, Value::Inline(v)).unwrap();
+                continue;
+            }
+            if noise {
+                // (an empty key is only out of order once something was pushed)
+                let unsorted: &[u8] = if i == 0 { &long_key } else { b"" };
+                let bad = [
+                    t.push(k, Value::Inline(&[0u8; 9000])),
+                    t.push(k, Value::Ref { cid, len: 10 }),
+                    t.push(&long_key, Value::Inline(b"")),
+                    t.push(unsorted, Value::Inline(b"")),
+                ];
+                rejected += bad.iter().filter(|r| r.is_err()).count();
+            }
+            t.push(k, Value::Ref { cid, len: 9000 }).unwrap();
+        }
+        (t.finish().unwrap(), rejected)
+    };
+    let (clean, _) = run(false);
+    let (noisy, rejected) = run(true);
+    assert_eq!(
+        rejected,
+        4 * e.len().div_ceil(7),
+        "every bad push was refused"
+    );
+    assert_eq!(clean, noisy, "same contents, different root");
+}
+
 fn leaf_sizes(nodes: &Nodes) -> Vec<usize> {
     let mut v: Vec<(Vec<u8>, usize)> = nodes
         .values()
