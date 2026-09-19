@@ -457,19 +457,31 @@ fn proofs(name: &str, b: &Built) {
     // A listing is the expensive one: the leaves of the page plus two edge
     // paths, so it scales with the page and not with the tree.
     for entries in [20usize, 100, 1000] {
-        let r = Range {
-            lo: std::ops::Bound::Included(keys[keys.len() / 3].clone()),
-            max_entries: entries,
-            ..Range::default()
-        };
-        let p = freenet_prolly::proof::prove_range(&b.blocks, &b.root, &r).unwrap();
-        let page = freenet_prolly::proof::verify_range(&b.root, &r, &p).unwrap();
-        assert_eq!(page.entries.len(), entries);
-        println!(
-            "| a complete listing of {entries} entries | {} | {} |",
-            p.nodes.len(),
-            p.bytes()
-        );
+        for reverse in [false, true] {
+            // The same entries in both directions: newest-first is the listing
+            // a feed shows, and it must not cost more to prove.
+            let at = keys.len() / 3;
+            let r = Range {
+                lo: std::ops::Bound::Included(keys[at].clone()),
+                hi: std::ops::Bound::Included(keys[at + entries - 1].clone()),
+                reverse,
+                max_entries: entries,
+                ..Range::default()
+            };
+            let p = freenet_prolly::proof::prove_range(&b.blocks, &b.root, &r).unwrap();
+            let page = freenet_prolly::proof::verify_range(&b.root, &r, &p).unwrap();
+            assert_eq!(page.entries.len(), entries);
+            println!(
+                "| a complete listing of {entries} entries, {} | {} | {} |",
+                if reverse {
+                    "newest first"
+                } else {
+                    "oldest first"
+                },
+                p.nodes.len(),
+                p.bytes()
+            );
+        }
     }
     println!();
 }

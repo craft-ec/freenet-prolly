@@ -19,7 +19,7 @@ use freenet_prolly::proof::{
 use freenet_prolly::range::Range;
 use freenet_prolly::store::{Blocks, MemBlocks, ReadError};
 use freenet_prolly::{block_id, kind, Cid};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -1064,4 +1064,200 @@ fn a_hostile_range_proof_is_refused_cheaply() {
         wire.len(),
         big.len()
     );
+}
+
+/// The architect's omission probe, permanent, in BOTH directions.
+///
+/// For every page of every range, withhold each block of the proof in turn.
+/// A forged proof must be REFUSED or verify to a byte-identical page — there
+/// is no third outcome, and "accepted with a different page" is the lie #37
+/// made possible: a reverse continuation that verified as an empty listing
+/// while entries remained.
+#[test]
+fn no_one_block_omission_is_ever_accepted_with_a_different_page() {
+    let m: Map = dataset(21, 8_000).into_iter().collect();
+    let (blocks, root) = build(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut r = rng(31);
+    let (mut pages, mut forged, mut accepted_same) = (0usize, 0usize, 0usize);
+
+    for _ in 0..40 {
+        let (a, b) = (r() as usize % keys.len(), r() as usize % keys.len());
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        for reverse in [false, true] {
+            let base = Range {
+                lo: std::ops::Bound::Included(keys[lo].clone()),
+                hi: std::ops::Bound::Included(keys[hi].clone()),
+                reverse,
+                max_entries: 1 + (r() as usize % 40),
+                ..Range::default()
+            };
+            let mut after: Option<Vec<u8>> = None;
+            for _ in 0..4 {
+                let req = Range {
+                    after: after.clone(),
+                    ..base.clone()
+                };
+                let Ok(honest) = prove_range(&blocks, &root, &req) else {
+                    break;
+                };
+                let want = verify_range(&root, &req, &honest).unwrap();
+                pages += 1;
+
+                for drop in 0..honest.nodes.len() {
+                    let mut nodes = honest.nodes.clone();
+                    nodes.remove(drop);
+                    let p = Proof { nodes, value: None };
+                    match verify_range(&root, &req, &p) {
+                        Err(_) => forged += 1,
+                        Ok(got) => {
+                            assert_eq!(
+                                (got.entries.len(), &got.next),
+                                (want.entries.len(), &want.next),
+                                "reverse {reverse}: a proof missing block {drop} was \
+                                 ACCEPTED with a different page"
+                            );
+                            accepted_same += 1;
+                        }
+                    }
+                }
+                match want.next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+        }
+    }
+    assert!(pages > 100, "only {pages} pages");
+    assert!(forged > 500, "only {forged} forgeries refused");
+    println!(
+        "{pages} pages both directions: {forged} one-block omissions refused, \
+         {accepted_same} verified to the identical page, 0 accepted differently"
+    );
+}
+
+/// What #37 actually bought a reverse listing: its proof carries no leaf that
+/// lies wholly above its bound.
+///
+/// NOT "a reverse proof is smaller than a forward one" — I measured that and it
+/// is false, because a forward scan from a bound and a reverse scan to the same
+/// bound cover DIFFERENT entries, so their leaf counts have no reason to agree.
+/// The property is structural and per-scan: before #37 a reverse scan opened by
+/// seeking forward, so the leaf above the bound was loaded and ended up in the
+/// proof; now the mirrored descent never touches it.
+#[test]
+fn a_reverse_listing_proof_carries_no_leaf_above_its_bound() {
+    let m: Map = dataset(27, 20_000).into_iter().collect();
+    let (blocks, root) = build(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut checked = 0;
+    for at in [100usize, 5_000, 10_000, 19_000] {
+        // A bound in the gap just above a real key — the shape where a forward
+        // seek steps into the next leaf.
+        let mut edge = keys[at].clone();
+        edge.push(0x00);
+        for entries in [20usize, 100] {
+            let rev = Range {
+                hi: std::ops::Bound::Included(edge.clone()),
+                reverse: true,
+                max_entries: entries,
+                ..Range::default()
+            };
+            let p = prove_range(&blocks, &root, &rev).unwrap();
+            let page = verify_range(&root, &rev, &p).unwrap();
+            assert_eq!(page.entries.len(), entries);
+            for b in &p.nodes {
+                let n = Node::parse(b).unwrap();
+                if !n.is_leaf() {
+                    continue;
+                }
+                assert!(
+                    n.key(0) <= edge,
+                    "the proof carries a leaf that starts above the bound"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 8);
+
+    // Like for like, for the record: the SAME entries proved in both
+    // directions. Any difference is the edge, not the body.
+    for entries in [20usize, 100] {
+        let (lo, hi) = (keys[7_000].clone(), keys[7_000 + entries - 1].clone());
+        let base = Range {
+            lo: std::ops::Bound::Included(lo),
+            hi: std::ops::Bound::Included(hi),
+            max_entries: entries,
+            ..Range::default()
+        };
+        let f = prove_range(&blocks, &root, &base).unwrap();
+        let r = prove_range(
+            &blocks,
+            &root,
+            &Range {
+                reverse: true,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        println!(
+            "  the same {entries} entries: forward {} nodes / {} B, reverse {} nodes / {} B",
+            f.nodes.len(),
+            f.bytes(),
+            r.nodes.len(),
+            r.bytes()
+        );
+    }
+}
+
+/// A page that could not be completed is not a complete listing, whatever its
+/// `need` looks like — the #37 lie, at the proof layer.
+#[test]
+fn a_blocked_page_can_never_be_proved_complete() {
+    use freenet_prolly::range::{range, PageEnd};
+    fn nodes(store: &MemBlocks, root: Cid, out: &mut HashSet<Cid>) {
+        if !out.insert(root) {
+            return;
+        }
+        let n = Node::parse(&store.0[&root]).unwrap();
+        if !n.is_leaf() {
+            for i in 0..n.len() {
+                nodes(store, n.child(i).0, out);
+            }
+        }
+    }
+    let m: Map = dataset(28, 8_000).into_iter().collect();
+    let (blocks, root) = build(&m);
+    let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+    let mut all = HashSet::new();
+    nodes(&blocks, root, &mut all);
+
+    let mut blocked = 0;
+    for missing in all.iter().filter(|c| **c != root) {
+        let mut partial = MemBlocks::default();
+        for id in all.iter().filter(|id| *id != missing) {
+            partial.insert(*id, blocks.get(id).unwrap());
+        }
+        for reverse in [false, true] {
+            let r = Range {
+                lo: std::ops::Bound::Included(keys[1_000].clone()),
+                reverse,
+                max_entries: 60,
+                ..Range::default()
+            };
+            // A prover missing a block must refuse rather than ship a short page.
+            let page = range(&partial, &root, &r).unwrap();
+            if page.end == PageEnd::Blocked {
+                blocked += 1;
+                assert_eq!(
+                    prove_range(&partial, &root, &r),
+                    Err(ProofError::Incomplete),
+                    "a blocked prover shipped a page"
+                );
+            }
+        }
+    }
+    assert!(blocked > 0, "nothing was blocked; the test proves nothing");
+    println!("{blocked} blocked pages, none of them provable");
 }

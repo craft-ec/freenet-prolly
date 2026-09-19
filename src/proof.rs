@@ -82,6 +82,32 @@
 //! ciphertext there, so a reader who cannot decrypt them cannot check a path,
 //! and no proof in this module changes that.
 //!
+//! # What a proof does NOT tell you
+//!
+//! A proof answers one question against one root. Everything below is outside
+//! it, and a reader that forgets so is trusting something it has not checked:
+//!
+//! - **Whether the root is current.** A proof is exactly as fresh as the head
+//!   it is checked against; nothing here says that head is the latest one.
+//!   Where the root came from — device head Register ← identity entry ←
+//!   directory ← signed global head — is somebody else's problem and a real
+//!   one.
+//! - **What a person's other devices hold.** One root is one tree. An identity
+//!   with several device heads has several, and a proof about one says nothing
+//!   about the rest.
+//! - **The bytes behind a referenced value**, unless the proof carries them. A
+//!   proof of `Value::Ref` authenticates an id and a length; the bytes are a
+//!   separate fetch, and the returned type says which you were given.
+//! - **Any COUNT.** [`verify_aggregate`] returns
+//!   [`Claimed`](crate::aggregate::Claimed): the writer's number,
+//!   authenticated as the writer's. A proof cannot make a count true.
+//! - **Anything in a Bag.** A bag asserts only that names met a price; its
+//!   `count` and `full` are claims a stranger can buy, and no proof changes
+//!   that.
+//! - **A sealed domain, at all.** Node bodies are ciphertext there, so a reader
+//!   who cannot decrypt them cannot check a path. There is no proof to offer an
+//!   outsider.
+//!
 //! # What a proof cannot do
 //!
 //! It authenticates what the writer COMMITTED TO. It cannot upgrade that into
@@ -92,7 +118,7 @@
 
 use crate::aggregate::{aggregate, AggError, Claimed};
 use crate::node::{Node, Value, MAX_NODE, MAX_VALUE};
-use crate::range::{range, Range};
+use crate::range::{range, PageEnd, Range};
 use crate::read::get;
 use crate::store::{Blocks, ReadError};
 use crate::{block_id, kind, Cid};
@@ -673,7 +699,7 @@ pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof
         crate::range::RangeError::Read(e) => read_err(e),
         _ => ProofError::Unsupported("this range"),
     })?;
-    if !page.need.is_empty() {
+    if page.end == PageEnd::Blocked {
         // The prover itself could not complete the page.
         return Err(ProofError::Incomplete);
     }
@@ -683,6 +709,12 @@ pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof
 }
 
 /// Check a page against a root, from the proof alone.
+///
+/// Completeness rests on HOW the page ended — `Limit`, `EndOfRange` or
+/// `EndOfTree`, never `Blocked` — and not on `need` being empty. See #37: a
+/// scan that could not fetch a block could report an empty `need` and no
+/// entries, and a verifier reading that as "complete" would accept a forged
+/// reverse continuation as an empty listing.
 ///
 /// Returns the page the proof establishes. **The claim is exactly: under this
 /// root, the entries of `r` from its start up to `page.next` are these and no
@@ -712,12 +744,19 @@ pub fn verify_range(root: &Cid, r: &Range, proof: &Proof) -> Result<ProvenPage, 
         crate::range::RangeError::Read(e) => read_err(e),
         _ => ProofError::Unsupported("this range"),
     })?;
-    // The one check that makes this a COMPLETENESS proof: a page that is short
-    // because a block was missing is not a complete listing, and this is where
-    // every omission lands.
-    if !page.need.is_empty() {
+    // The one check that makes this a COMPLETENESS proof, and it asks the SCAN
+    // rather than inspecting `need`: a page is complete only if it ended by
+    // running out of range, out of tree, or at its limit. `Blocked` means a
+    // block was missing — whatever `need` looks like. #37 was exactly this: a
+    // scan that could not fetch a block could end with `need` empty and no
+    // entries, and an empty `need` read as "complete".
+    if page.end == PageEnd::Blocked {
         return Err(ProofError::NotComplete);
     }
+    debug_assert!(
+        page.need.is_empty(),
+        "a page that scanned to its end needs nothing"
+    );
     store.check_canonical()?;
     Ok(ProvenPage {
         entries: page
