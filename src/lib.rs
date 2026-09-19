@@ -3,6 +3,7 @@
 
 pub mod boundary;
 pub mod build;
+pub mod chunk;
 pub mod node;
 pub mod read;
 pub mod store;
