@@ -9,5 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 freenet-prolly = { path = ".." }
+blake3 = { version = "1", default-features = false }
 
 [workspace]

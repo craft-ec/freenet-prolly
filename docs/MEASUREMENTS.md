@@ -5,7 +5,7 @@ Produced by `cargo run --release --example measure > docs/MEASUREMENTS.md`.
 | | |
 |---|---|
 | machine | Apple M4 Max |
-| commit | `cf292b2` |
+| commit | `f7838fa` |
 | store | in-memory (`MemBlocks`); no disk or network in any figure |
 | datasets | **realistic**: records, edges and index terms, keys out of order · **append-only**: every key above the last |
 | runs | block and byte counts are deterministic for a commit and dataset (checked: two runs differ only in timings); times are a single run on an otherwise idle machine |
@@ -18,7 +18,7 @@ Encoded block size in bytes. `cv` is the standard deviation over the mean; `max-
 
 ### realistic, 20000 entries
 
-Built in 11.626208ms. Height 4, 1143 nodes.
+Built in 11.937875ms. Height 4, 1143 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -34,7 +34,7 @@ Built in 11.626208ms. Height 4, 1143 nodes.
 
 ### append-only, 20000 entries
 
-Built in 8.285083ms. Height 3, 933 nodes.
+Built in 8.282708ms. Height 3, 933 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -49,7 +49,7 @@ Built in 8.285083ms. Height 3, 933 nodes.
 
 ### realistic, 200000 entries
 
-Built in 130.864ms. Height 4, 11383 nodes.
+Built in 122.6555ms. Height 4, 11383 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -65,7 +65,7 @@ Built in 130.864ms. Height 4, 11383 nodes.
 
 ### append-only, 200000 entries
 
-Built in 95.662958ms. Height 4, 9261 nodes.
+Built in 90.36675ms. Height 4, 9261 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -81,7 +81,7 @@ Built in 95.662958ms. Height 4, 9261 nodes.
 
 ### realistic, 1000000 entries
 
-Built in 654.996666ms. Height 5, 57185 nodes.
+Built in 685.650375ms. Height 5, 57185 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -98,7 +98,7 @@ Built in 654.996666ms. Height 5, 57185 nodes.
 
 ### append-only, 1000000 entries
 
-Built in 481.797083ms. Height 4, 46196 nodes.
+Built in 500.902833ms. Height 4, 46196 nodes.
 
 | level | nodes | kind |
 |---|---|---|
@@ -304,19 +304,89 @@ Both roots held, nothing else; `b` is the tree after the edits in the first colu
 | 10 | 21 | 60 | 10 |
 | 1000 | 821 | 3665 | 1000 |
 
+## Proof size
+
+A proof is the node bodies on the path, so it is the height times a node — and absence below the tree's minimum is ONE node, because the root's own first key settles it. Every proof here was verified before its size was reported.
+
+### realistic, 20000 entries (height 4)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 4 | 13572 |
+| absence, below the minimum | 1 | 356 |
+| absence, above the maximum | 4 | 6901 |
+| absence, between two keys | 4 | 13572 |
+| count of the whole tree | 1 | 356 |
+| count of a prefix | 6 | 15122 |
+
+### append-only, 20000 entries (height 3)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 3 | 10497 |
+| absence, below the minimum | 1 | 1016 |
+| absence, above the maximum | 3 | 3564 |
+| absence, between two keys | 3 | 10497 |
+| count of the whole tree | 1 | 1016 |
+| count of a prefix | 5 | 18532 |
+
+### realistic, 200000 entries (height 4)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 4 | 14261 |
+| absence, below the minimum | 1 | 1894 |
+| absence, above the maximum | 4 | 5776 |
+| absence, between two keys | 4 | 14261 |
+| count of the whole tree | 1 | 1894 |
+| count of a prefix | 7 | 29722 |
+
+### append-only, 200000 entries (height 4)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 4 | 12299 |
+| absence, below the minimum | 1 | 299 |
+| absence, above the maximum | 4 | 3126 |
+| absence, between two keys | 4 | 12299 |
+| count of the whole tree | 1 | 299 |
+| count of a prefix | 6 | 21773 |
+
+### realistic, 1000000 entries (height 5)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 5 | 17702 |
+| absence, below the minimum | 1 | 512 |
+| absence, above the maximum | 5 | 6373 |
+| absence, between two keys | 5 | 17702 |
+| count of the whole tree | 1 | 512 |
+| count of a prefix | 8 | 34238 |
+
+### append-only, 1000000 entries (height 4)
+
+| proof of | nodes | bytes |
+|---|---|---|
+| a present key | 4 | 10941 |
+| absence, below the minimum | 1 | 1031 |
+| absence, above the maximum | 4 | 7370 |
+| absence, between two keys | 4 | 10941 |
+| count of the whole tree | 1 | 1031 |
+| count of a prefix | 7 | 25228 |
+
 ## Block amplification
 
 Appending one entry at a time. **Store blocks** is everything the store ends up holding, **live nodes** is what the final tree actually reaches, and **if replaced dropped** is what would remain if every node `apply` reported as replaced were removed — a floor, since `replaced` is a hint and another tree may still use those blocks.
 
 | entries | appends | blocks written | bytes written | live nodes | live bytes | store blocks | store bytes | store / live | if replaced dropped | then / live | time |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 20000 | 100 | 300 | 512800 | 938 | 3414573 | 1234 | 3910387 | 1.3x | 939 | 1.0x | 1.923375ms |
-| 20000 | 1000 | 3000 | 5639083 | 978 | 3567362 | 3934 | 9036670 | 4.0x | 979 | 1.0x | 20.786625ms |
-| 20000 | 10000 | 30000 | 54844118 | 1383 | 5094749 | 30934 | 58241705 | 22.4x | 1384 | 1.0x | 202.031125ms |
-| 200000 | 100 | 400 | 314036 | 9266 | 33987178 | 9662 | 34284216 | 1.0x | 9267 | 1.0x | 1.357917ms |
-| 200000 | 1000 | 4000 | 3879605 | 9307 | 34140007 | 13262 | 37849785 | 1.4x | 9308 | 1.0x | 15.467834ms |
-| 200000 | 10000 | 40000 | 46656087 | 9722 | 35668552 | 49262 | 80626267 | 5.1x | 9723 | 1.0x | 182.99125ms |
-| 1000000 | 100 | 400 | 816012 | 46201 | 169860159 | 46597 | 170659179 | 1.0x | 46202 | 1.0x | 3.032166ms |
-| 1000000 | 1000 | 4000 | 9596053 | 46245 | 170013246 | 50197 | 179439220 | 1.1x | 46246 | 1.0x | 34.83575ms |
-| 1000000 | 10000 | 40000 | 78022002 | 46667 | 171542481 | 86197 | 247865169 | 1.8x | 46668 | 1.0x | 308.497208ms |
+| 20000 | 100 | 300 | 512800 | 938 | 3414573 | 1234 | 3910387 | 1.3x | 939 | 1.0x | 1.969333ms |
+| 20000 | 1000 | 3000 | 5639083 | 978 | 3567362 | 3934 | 9036670 | 4.0x | 979 | 1.0x | 20.083417ms |
+| 20000 | 10000 | 30000 | 54844118 | 1383 | 5094749 | 30934 | 58241705 | 22.4x | 1384 | 1.0x | 201.007459ms |
+| 200000 | 100 | 400 | 314036 | 9266 | 33987178 | 9662 | 34284216 | 1.0x | 9267 | 1.0x | 1.374791ms |
+| 200000 | 1000 | 4000 | 3879605 | 9307 | 34140007 | 13262 | 37849785 | 1.4x | 9308 | 1.0x | 15.665834ms |
+| 200000 | 10000 | 40000 | 46656087 | 9722 | 35668552 | 49262 | 80626267 | 5.1x | 9723 | 1.0x | 185.251666ms |
+| 1000000 | 100 | 400 | 816012 | 46201 | 169860159 | 46597 | 170659179 | 1.0x | 46202 | 1.0x | 3.073542ms |
+| 1000000 | 1000 | 4000 | 9596053 | 46245 | 170013246 | 50197 | 179439220 | 1.1x | 46246 | 1.0x | 35.523583ms |
+| 1000000 | 10000 | 40000 | 78022002 | 46667 | 171542481 | 86197 | 247865169 | 1.8x | 46668 | 1.0x | 310.966583ms |
 

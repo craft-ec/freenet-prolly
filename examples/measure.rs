@@ -420,6 +420,43 @@ fn cold_diffs(name: &str, b: &Built) {
     println!();
 }
 
+/// What a proof costs to send, and what it proves.
+fn proofs(name: &str, b: &Built) {
+    use freenet_prolly::proof::{prove, prove_aggregate, verify, verify_aggregate, Proven};
+    let keys: Vec<Vec<u8>> = b.map.keys().cloned().collect();
+    let height = Node::parse(&b.blocks.0[&b.root]).unwrap().level() as usize + 1;
+    println!("### {name}, {} entries (height {height})\n", b.map.len());
+    println!("| proof of | nodes | bytes |");
+    println!("|---|---|---|");
+
+    let mut below = keys[0].clone();
+    below.insert(0, 0x00);
+    let mut above = keys[keys.len() - 1].clone();
+    above.push(0xff);
+    let mut between = keys[keys.len() / 2].clone();
+    between.push(0x01);
+    for (what, key, present) in [
+        ("a present key", keys[keys.len() / 2].clone(), true),
+        ("absence, below the minimum", below, false),
+        ("absence, above the maximum", above, false),
+        ("absence, between two keys", between, false),
+    ] {
+        let p = prove(&b.blocks, &b.root, &key).unwrap();
+        let ok = verify(&b.root, &key, &p).unwrap();
+        assert_eq!(matches!(ok, Proven::Present(_)), present, "{what}");
+        println!("| {what} | {} | {} |", p.nodes.len(), p.bytes());
+    }
+    for (what, r) in [
+        ("count of the whole tree", Range::default()),
+        ("count of a prefix", Range::prefix(&b.prefix)),
+    ] {
+        let p = prove_aggregate(&b.blocks, &b.root, &r).unwrap();
+        verify_aggregate(&b.root, &r, &p).unwrap();
+        println!("| {what} | {} | {} |", p.nodes.len(), p.bytes());
+    }
+    println!();
+}
+
 /// What N one-at-a-time appends cost, against what the tree ends up needing.
 fn amplification(n: usize, appends: usize) {
     let map = append_only(n);
@@ -542,6 +579,12 @@ fn main() {
     );
     for (label, b) in &built {
         cold_diffs(label, b);
+    }
+
+    println!("## Proof size\n");
+    println!("A proof is the node bodies on the path, so it is the height times a node — and absence below the tree's minimum is ONE node, because the root's own first key settles it. Every proof here was verified before its size was reported.\n");
+    for (label, b) in &built {
+        proofs(label, b);
     }
 
     println!("## Block amplification\n");
