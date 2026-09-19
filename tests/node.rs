@@ -152,12 +152,18 @@ fn builder_refuses_disorder_and_wrong_kinds() {
 #[test]
 fn builder_refuses_to_exceed_the_node_cap() {
     let mut b = NodeBuilder::leaf();
-    let big = vec![0u8; MAX_NODE];
-    assert_eq!(
-        b.push(b"k", Value::Inline(&big)),
-        Err(BuildError::NodeTooLarge)
-    );
+    let v = vec![0u8; MAX_INLINE];
+    let mut i = 0u32;
+    let err = loop {
+        match b.push(&i.to_be_bytes(), Value::Inline(&v)) {
+            Ok(()) => i += 1,
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, BuildError::NodeTooLarge);
+    assert!(i >= 15 && b.logical_len() <= MAX_NODE);
     // and whatever it does accept always parses
+    let mut b = NodeBuilder::leaf();
     let mut i = 0u32;
     while b.push(&i.to_be_bytes(), Value::Inline(&[0u8; 100])).is_ok() {
         i += 1;
@@ -464,4 +470,43 @@ fn parse_never_panics_and_accepts_only_canonical_bytes() {
     // harmless ones (e.g. a flipped byte inside a value) must still be accepted.
     assert!(rejected > 100_000, "only {rejected} rejected");
     assert!(accepted > 1_000, "only {accepted} accepted");
+}
+
+#[test]
+fn a_value_has_exactly_one_encoding() {
+    // Builder: inline up to MAX_INLINE, by reference above it, never the other way.
+    let at = vec![1u8; MAX_INLINE];
+    let over = vec![1u8; MAX_INLINE + 1];
+    let r = |len| Value::Ref { cid: [9; 32], len };
+    let mut b = NodeBuilder::leaf();
+    b.push(b"a", Value::Inline(&at)).unwrap();
+    assert_eq!(
+        b.push(b"b", Value::Inline(&over)),
+        Err(BuildError::ValueTooLong)
+    );
+    assert_eq!(
+        b.push(b"b", r(MAX_INLINE as u32)),
+        Err(BuildError::ValueTooShort)
+    );
+    b.push(b"b", r(MAX_INLINE as u32 + 1)).unwrap();
+    let good = b.finish().unwrap();
+    Node::parse(&good).unwrap();
+
+    // Parser: the same two rules, so a host refuses what the builder would not make.
+    let too_long: &[u8] = &over;
+    assert_eq!(
+        Node::parse(&raw_leaf(b"k", &[(b"", too_long)])).err(),
+        Some(NodeError::NonCanonicalValue)
+    );
+    // Shrink the reference's vlen in place. Entry "b" is last and its key is
+    // wholly in the shared prefix... it is not: keys "a","b" share nothing, so
+    // the entry ends with suffix(1) + cid(32) and vlen sits 4 + 1 + 32 from the end.
+    let mut bad = good.clone();
+    let vlen_at = bad.len() - 32 - 1 - 4;
+    assert_eq!(
+        u32::from_le_bytes(bad[vlen_at..vlen_at + 4].try_into().unwrap()),
+        MAX_INLINE as u32 + 1
+    );
+    bad[vlen_at..vlen_at + 4].copy_from_slice(&(MAX_INLINE as u32).to_le_bytes());
+    assert_eq!(Node::parse(&bad).err(), Some(NodeError::NonCanonicalValue));
 }
