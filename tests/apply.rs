@@ -444,6 +444,12 @@ fn run(rule: SplitRule, seed: u64, start: usize, batches: usize) -> Result<Stats
 
 /// Control: a rule that depends on how many entries were pushed before — on the
 /// history of the process, not on the contents.
+///
+/// The `static` here is deliberate and stays. Everywhere else a process-global
+/// counter behind a test assertion is a defect (#43), because it reports other
+/// threads' work; this one is not a counter a test asserts on — it IS the
+/// history the rule depends on, and being global is the property under test.
+/// One caller, one thread.
 fn history_dependent(_: u8, _: &[u8], _: usize, after: usize) -> bool {
     static PUSHED: AtomicUsize = AtomicUsize::new(0);
     after >= 1024 && PUSHED.fetch_add(1, Ordering::Relaxed).is_multiple_of(29)
