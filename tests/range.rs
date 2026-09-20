@@ -24,24 +24,17 @@ use std::ops::Bound;
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
-fn value_of(v: &[u8]) -> Value<'_> {
-    if v.len() <= MAX_INLINE {
-        Value::Inline(v)
-    } else {
-        Value::Ref {
-            cid: block_id(kind::RAW, v),
-            len: v.len() as u32,
-        }
-    }
-}
-
 /// Build `m` into a tree, keeping the nodes AND the blocks of values too large
 /// to inline — a scan must be able to materialise either kind.
 fn scratch(m: &Map) -> (Cid, MemBlocks) {
     let mut store = MemBlocks::default();
     let mut t = TreeBuilder::new(|c, b: &[u8]| store.insert(c, b));
     for (k, v) in m {
-        t.push(k, value_of(v)).unwrap();
+        // `push_bytes` hands the builder the value AND registers it, so a
+        // referenced value can be coded into its leaf's parity. Building the
+        // `Ref` by hand and pushing it would be refused, which is the rule
+        // doing its job.
+        t.push_bytes(k, v).unwrap();
     }
     let root = t.finish().unwrap();
     for v in m.values() {

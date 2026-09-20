@@ -200,3 +200,157 @@ pub extern "C" fn empty_final_page_ok(n: u32) -> i32 {
     }
     1
 }
+
+// ------------------------------------------------------------- parity ------
+//
+// The parity code, recomputed HERE rather than shared with the native test:
+// the two meet only in `tests/vectors.txt`, which is what makes the file a
+// check of the target and not of a helper both sides call.
+
+/// Members of unequal length, each a plausible block state (`kind ‖ body`).
+/// Deliberately the same construction as the native side — a different one
+/// would prove nothing about the target.
+fn parity_members(k: usize) -> Vec<Vec<u8>> {
+    (0..k)
+        .map(|i| {
+            let len = 1 + i * i * 8 + i * 8;
+            let mut s = Vec::with_capacity(1 + len);
+            s.push(if i % 2 == 0 {
+                freenet_prolly::kind::RAW
+            } else {
+                freenet_prolly::kind::TREE_NODE
+            });
+            s.extend((0..len).map(|b| (b as u8).wrapping_mul(i as u8 + 3)));
+            s
+        })
+        .collect()
+}
+
+/// The three parity ids of the frozen group, concatenated: 96 bytes.
+#[no_mangle]
+pub extern "C" fn parity_ids(k: u32) -> *const u8 {
+    use freenet_prolly::parity::encode_group;
+    let states = parity_members(k as usize);
+    let parity = encode_group(&states).expect("a codeable group");
+    static mut OUT: [u8; 96] = [0; 96];
+    unsafe {
+        for (i, p) in parity.iter().enumerate() {
+            let id = freenet_prolly::block_id(freenet_prolly::kind::PARITY, p);
+            OUT[i * 32..(i + 1) * 32].copy_from_slice(&id);
+        }
+        &raw const OUT as *const u8
+    }
+}
+
+/// The STORED length of the group's first parity block — a function of its own
+/// bytes, since parity is trimmed. Never the group's width.
+#[no_mangle]
+pub extern "C" fn parity_len(k: u32) -> u32 {
+    use freenet_prolly::parity::encode_group;
+    encode_group(&parity_members(k as usize)).expect("codeable")[0].len() as u32
+}
+
+/// Every way to lose three of the `k + 3`, rebuilt, digested — the claim
+/// "anyone can repair without a key" has to hold on THIS target too, not only
+/// on the one the vectors were generated on.
+#[no_mangle]
+pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
+    use freenet_prolly::rs::PARITY;
+    let k = k as usize;
+    let states = parity_members(k);
+    let parity = encode_group(&states).expect("a codeable group");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s))
+        .chain(parity.iter().cloned())
+        .collect();
+    let n = k + PARITY;
+    let mut h = blake3::Hasher::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            for c in b + 1..n {
+                let have: Vec<Option<Vec<u8>>> = (0..n)
+                    .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
+                    .collect();
+                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+                // If a rebuild differs here, the digest differs and the driver
+                // says so — but assert too, so the failure names the case.
+                assert!(got == states, "repair differs on wasm32");
+                for s in &got {
+                    h.update(s);
+                }
+            }
+        }
+    }
+    static mut OUT: [u8; 32] = [0; 32];
+    unsafe {
+        OUT = *h.finalize().as_bytes();
+        &raw const OUT as *const u8
+    }
+}
+
+/// `check_node` including the grouping, on a node filled to the hard limit —
+/// what every hosting node pays per tree-node block, now that `pcount` is
+/// verified exactly.
+#[no_mangle]
+pub extern "C" fn check_with_grouping_n(leaf: u32, runs: u32) -> u32 {
+    use freenet_prolly::boundary::check_node;
+    let body = if leaf == 1 {
+        worst_case_leaf()
+    } else {
+        worst_case_branch()
+    };
+    let node = freenet_prolly::node::Node::parse(&body).expect("a node");
+    let mut ok = 0;
+    for _ in 0..runs {
+        if check_node(&node).is_ok() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// Members of the node the timing above runs on, so the number has a size.
+#[no_mangle]
+pub extern "C" fn check_with_grouping_members(leaf: u32) -> u32 {
+    let body = if leaf == 1 {
+        worst_case_leaf()
+    } else {
+        worst_case_branch()
+    };
+    freenet_prolly::node::Node::parse(&body).expect("a node").len() as u32
+}
+
+/// The biggest node of its kind in a real tree — chunker-produced, because a
+/// hand-filled node is mis-cut and `check_node` rightly refuses it, which
+/// would make the timing a measurement of a refusal.
+fn worst_case(leaf: bool) -> Vec<u8> {
+    use freenet_prolly::store::MemBlocks;
+    let e = common::dataset(1, 20_000);
+    let mut store = MemBlocks::default();
+    build(
+        e.iter().map(|(k, v)| (k.as_slice(), Value::Inline(v))),
+        |c, b| store.insert(c, b),
+    )
+    .unwrap();
+    store
+        .0
+        .values()
+        .filter(|b| {
+            freenet_prolly::node::Node::parse(b)
+                .map(|n| n.is_leaf() == leaf)
+                .unwrap_or(false)
+        })
+        .max_by_key(|b| freenet_prolly::node::Node::parse(b).unwrap().len())
+        .cloned()
+        .expect("a node of this kind exists")
+}
+
+fn worst_case_branch() -> Vec<u8> {
+    worst_case(false)
+}
+
+fn worst_case_leaf() -> Vec<u8> {
+    worst_case(true)
+}

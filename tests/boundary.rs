@@ -172,6 +172,10 @@ fn a_rejected_push_does_not_change_the_root() {
                 ];
                 rejected += bad.iter().filter(|r| r.is_err()).count();
             }
+            // The builder codes a referenced value into its leaf's parity, so
+            // it must have been handed the bytes. A `Ref` it never saw is
+            // refused — which is the point, not an obstacle.
+            t.see(cid, &vec![0xab; 9000]);
             t.push(k, Value::Ref { cid, len: 9000 }).unwrap();
         }
         (t.finish().unwrap(), rejected)
@@ -467,6 +471,21 @@ fn frozen_vectors() {
         MAX_INLINE,
         freenet_prolly::node::MAX_VALUE
     );
+    // The parity rule's constants, on the wire line rather than only in the
+    // source: a change to any of them moves a frozen vector, which is what a
+    // reviewer sees. `0x11D` is the field polynomial, then the group bounds,
+    // the close threshold, and the size classes.
+    {
+        use freenet_prolly::parity::{CLASSES, CLOSE_THRESHOLD_FOR_VECTORS, MAX_GROUP, MIN_GROUP};
+        got += &format!(
+            "pconst 11d {MIN_GROUP} {MAX_GROUP} {CLOSE_THRESHOLD_FOR_VECTORS} {}\n",
+            CLASSES
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     for (k, body) in [(0u8, &b""[..]), (0, b"value"), (1, b"value")] {
         let id = freenet_prolly::block_id(k, body);
         got += &format!("id {k} {} {}\n", hex(body), hex(&id));
@@ -484,6 +503,19 @@ fn frozen_vectors() {
         let (nodes, bytes, hash) = range_proof_vector(n);
         got += &format!("rproof {n} {nodes} {bytes} {}\n", hex(&hash));
     }
+    // Parity: the code frozen to the byte, its canonical trimmed form, and
+    // repair frozen with it.
+    for k in [1usize, 7, 12] {
+        let (plen, ids) = parity_vector(k);
+        got += &format!(
+            "parity {k} {plen} {} {} {}\n",
+            hex(&ids[0]),
+            hex(&ids[1]),
+            hex(&ids[2])
+        );
+        got += &format!("prepair {k} {}\n", hex(&parity_repair_digest(k)));
+    }
+    got += &format!("puneven {}\n", hex(&parity_uneven_digest()));
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -620,11 +652,12 @@ fn the_two_slice_split_hash_is_the_same_hash() {
     assert!(checked > 20_000);
 }
 
-/// A node carrying parity is refused until #19 defines the rule for it: it is
-/// the one region of an otherwise valid node that nothing constrains.
+/// `pcount` is now a pure function of the entries, so a node carrying the wrong
+/// amount of parity is refused and one carrying the right amount is not. That
+/// closes the one region of an otherwise valid node nothing used to constrain.
 #[test]
-fn a_node_with_parity_is_refused_and_the_same_node_without_it_is_not() {
-    use freenet_prolly::boundary::{check_node, BoundaryError};
+fn a_node_with_the_wrong_parity_count_is_refused_and_the_right_one_is_not() {
+    use freenet_prolly::boundary::{check_node, check_parity, BoundaryError};
     use freenet_prolly::node::Agg;
     let build = |parity: usize| {
         let mut b = NodeBuilder::branch(1);
@@ -644,19 +677,32 @@ fn a_node_with_parity_is_refused_and_the_same_node_without_it_is_not() {
         }
         b.finish().unwrap()
     };
-    // The control: the same node with no parity is accepted, so the refusal is
-    // about the parity and not about the node.
-    let clean = build(0);
-    let n = Node::parse(&clean).unwrap();
-    assert_eq!(n.parity_count(), 0);
+    // Four children is one group, so the node requires exactly 3 parity ids.
+    let probe = build(3);
+    let want = freenet_prolly::parity::pcount_of(&Node::parse(&probe).expect("parses"));
+    assert_eq!(want, 3, "four children are one group");
+
+    // The control: the right count is accepted, so the refusals below are about
+    // the COUNT and not about parity being rejected wholesale.
+    let right = build(want);
+    let n = Node::parse(&right).expect("a node with parity is well-formed");
+    assert_eq!(n.parity_count(), want);
+    assert_eq!(check_parity(&n), Ok(()));
+    // `check_node` does not call it yet — see the note there — so the node
+    // passes the entry checks whatever its parity says.
     assert_eq!(check_node(&n), Ok(()));
 
-    for parity in [1usize, 3] {
+    for parity in [0usize, 1, 2, 4, 6] {
         let bytes = build(parity);
-        // It PARSES — parity is a legal part of the format — and is refused here.
+        // It PARSES — the region's size is all `parse` decides — and the count
+        // is settled here, where the entries are known.
         let n = Node::parse(&bytes).expect("a node with parity is well-formed");
         assert_eq!(n.parity_count(), parity);
-        assert_eq!(check_node(&n), Err(BoundaryError::UnexpectedParity));
+        assert_eq!(
+            check_parity(&n),
+            Err(BoundaryError::WrongParityCount(want, parity)),
+            "{parity} ids where {want} are required"
+        );
     }
 }
 
@@ -860,4 +906,252 @@ fn range_proof_vector(n: usize) -> (usize, usize, [u8; 32]) {
     assert_eq!(page.entries.len(), 32);
     let bytes = p.encode();
     (p.nodes.len(), bytes.len(), *blake3::hash(&bytes).as_bytes())
+}
+
+/// The parity code, frozen to the byte.
+///
+/// "Parity is a pure function of the children" is what makes it deduplicate,
+/// verifiable by plain hash, and repairable by anyone without a key — and it is
+/// only true if two implementations produce identical bytes. These vectors are
+/// the evidence: computed here and again in `wasm-check`, meeting only in
+/// `tests/vectors.txt`, so they check the TARGET rather than a shared helper.
+///
+/// `k = 1` is the degenerate group (three different scalar multiples of one
+/// symbol), `k = 12` the largest the grouping rule can make, and the lengths
+/// are deliberately unequal so the padding and the length prefix are exercised
+/// rather than skipped.
+pub fn parity_vector(k: usize) -> (usize, [Cid; 3]) {
+    use freenet_prolly::parity::encode_group;
+    let states = parity_members(k);
+    let parity = encode_group(&states).expect("a codeable group");
+    let ids = [
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[0]),
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[1]),
+        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[2]),
+    ];
+    // The STORED length of the first parity block, which is a function of its
+    // own bytes and not of the group's longest member. Frozen so that a change
+    // to trimming shows up here rather than only in the ids.
+    (parity[0].len(), ids)
+}
+
+/// Deterministic members of unequal length, each a plausible block state
+/// (`kind ‖ body`).
+pub fn parity_members(k: usize) -> Vec<Vec<u8>> {
+    (0..k)
+        .map(|i| {
+            // Lengths 1, 17, 49, 97, … — no two alike, and none a multiple of
+            // the others, so a padding bug cannot cancel out.
+            let len = 1 + i * i * 8 + i * 8;
+            let mut s = Vec::with_capacity(1 + len);
+            s.push(if i % 2 == 0 {
+                freenet_prolly::kind::RAW
+            } else {
+                freenet_prolly::kind::TREE_NODE
+            });
+            s.extend((0..len).map(|b| (b as u8).wrapping_mul(i as u8 + 3)));
+            s
+        })
+        .collect()
+}
+
+/// Every way to lose three of the `k + 3`, rebuilt, digested. This is what
+/// says a repairer on another target gets the same bytes back — the claim
+/// "anyone can repair without a key" rests on it.
+/// A repair sweep over a group of UNEQUAL lengths, with the cases that make
+/// trimming hard forced rather than hoped for: the longest member dropped, and
+/// a parity block among the lost. The k = 1/7/12 vectors use one shape of
+/// member each; this is the shape where the width is not recoverable from
+/// what survives.
+pub fn parity_uneven_digest() -> [u8; 32] {
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
+    use freenet_prolly::rs::PARITY;
+    // Strictly increasing, so the LAST member is the one that sets the width.
+    let states: Vec<Vec<u8>> = (0..6).map(|i| vec![(i as u8) + 1; 1 + i * 37]).collect();
+    let k = states.len();
+    let parity = encode_group(&states).expect("codeable");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s))
+        .chain(parity.iter().cloned())
+        .collect();
+    let mut h = blake3::Hasher::new();
+    // Every loss that includes the longest member, and every one that includes
+    // a parity block — the two cases the equal-length vectors cannot reach.
+    let mut cases = 0usize;
+    let mut parity_lost = 0usize;
+    for a in 0..k + PARITY {
+        for b in a + 1..k + PARITY {
+            let gone = [k - 1, a, b];
+            if a == k - 1 || b == k - 1 {
+                continue;
+            }
+            let have: Vec<Option<Vec<u8>>> = (0..k + PARITY)
+                .map(|j| (!gone.contains(&j)).then(|| all[j].clone()))
+                .collect();
+            let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+            assert_eq!(got, states, "uneven: lost {gone:?}");
+            for s in &got {
+                h.update(s);
+            }
+            cases += 1;
+            if a >= k || b >= k {
+                parity_lost += 1;
+            }
+        }
+    }
+    assert!(cases > 20, "only {cases} uneven cases");
+    assert!(
+        parity_lost > 0,
+        "no case dropped a parity block: that half of the sweep is untested"
+    );
+    *h.finalize().as_bytes()
+}
+
+pub fn parity_repair_digest(k: usize) -> [u8; 32] {
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
+    use freenet_prolly::rs::PARITY;
+    let states = parity_members(k);
+    let parity = encode_group(&states).expect("a codeable group");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s))
+        .chain(parity.iter().cloned())
+        .collect();
+    let n = k + PARITY;
+    let mut h = blake3::Hasher::new();
+    let mut cases = 0usize;
+    for a in 0..n {
+        for b in a + 1..n {
+            for c in b + 1..n {
+                let have: Vec<Option<Vec<u8>>> = (0..n)
+                    .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
+                    .collect();
+                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+                assert_eq!(got, states, "k = {k}: lost {a},{b},{c}");
+                for s in &got {
+                    h.update(s);
+                }
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cases,
+        n * (n - 1) * (n - 2) / 6,
+        "k = {k}: combinations missed"
+    );
+    *h.finalize().as_bytes()
+}
+
+/// The parity code end to end, without freezing its bytes yet.
+///
+/// The vectors wait on the canonical form of a parity block, but nothing about
+/// determinism or repair does — and a test that only runs when the bytes are
+/// frozen would leave the code unexercised in the meantime.
+#[test]
+fn the_parity_code_is_deterministic_and_repairs() {
+    for k in [1usize, 7, 12] {
+        let (width, ids) = parity_vector(k);
+        assert_eq!(parity_vector(k), (width, ids), "k = {k}: not deterministic");
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2],
+            "k = {k}: parity ids repeat"
+        );
+        let states = parity_members(k);
+        // The stored parity length is its own, and never the group's width.
+        assert!(
+            width <= 4 + states.iter().map(|s| s.len()).max().unwrap(),
+            "a parity block longer than the untrimmed width"
+        );
+        // Every way to lose three, rebuilt and compared — the assertion lives
+        // inside the digest helper, which also counts the combinations.
+        let _ = parity_repair_digest(k);
+    }
+    // The members really are of unequal length, or padding is never exercised.
+    let states = parity_members(12);
+    let mut lens: Vec<usize> = states.iter().map(|s| s.len()).collect();
+    let before = lens.len();
+    lens.sort_unstable();
+    lens.dedup();
+    assert_eq!(lens.len(), before, "the members must differ in length");
+}
+
+/// What a host can be made to do by a node it is going to refuse.
+///
+/// `check_node` now pays a grouping hash per member, which is the most
+/// expensive thing in it — so a node that fails a cheaper check must be refused
+/// before buying any. Counted, because the verdict is "refused" either way and
+/// no assertion about it can see the difference.
+#[test]
+fn a_node_refused_for_anything_cheaper_costs_no_grouping() {
+    use freenet_prolly::boundary::{check_node, BoundaryError};
+    use freenet_prolly::parity::work;
+
+    // A well-formed branch, for the control: it pays one hash per child.
+    let good = {
+        let mut b = NodeBuilder::branch(1);
+        for i in 0..8u8 {
+            b.push_child(
+                &[b'k', i],
+                [i; 32],
+                freenet_prolly::node::Agg {
+                    count: 1,
+                    bytes: 10,
+                },
+            )
+            .unwrap();
+        }
+        // Eight children are one group, so three ids.
+        for p in 0..3u8 {
+            b.push_parity([0x70 + p; 32]).unwrap();
+        }
+        b.finish().unwrap()
+    };
+    let n = Node::parse(&good).expect("parses");
+    work::reset();
+    assert_eq!(check_node(&n), Ok(()));
+    assert_eq!(
+        work::hashes(),
+        8,
+        "the control must pay one hash per member"
+    );
+
+    // The cheapest refusals of all: a node whose parity count is wrong is
+    // refused only AFTER the entry walk, but one that is over the hard limit
+    // never reaches the grouping at all.
+    let oversized = {
+        let mut b = NodeBuilder::branch(1);
+        let mut i = 0u32;
+        while b.logical_len() < freenet_prolly::boundary::MAX_LOGICAL - 200 {
+            b.push_child(
+                &[b'k', (i >> 8) as u8, i as u8],
+                [i as u8; 32],
+                freenet_prolly::node::Agg {
+                    count: 1,
+                    bytes: 10,
+                },
+            )
+            .unwrap();
+            i += 1;
+        }
+        b.finish().unwrap()
+    };
+    let n = Node::parse(&oversized).expect("parses");
+    work::reset();
+    let verdict = check_node(&n);
+    if verdict == Ok(()) {
+        // It fitted; then it must have paid for every member, which is the
+        // honest control for the counter rather than a silent skip.
+        assert_eq!(work::hashes(), n.len());
+    } else {
+        assert!(
+            matches!(
+                verdict,
+                Err(BoundaryError::TooLarge) | Err(BoundaryError::InteriorSplit(_))
+            ),
+            "unexpected refusal {verdict:?}"
+        );
+        assert_eq!(work::hashes(), 0, "an entry-level refusal bought grouping");
+    }
 }

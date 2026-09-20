@@ -9,9 +9,11 @@ pub mod chunk;
 pub mod cursor;
 pub mod diff;
 pub mod node;
+pub mod parity;
 pub mod proof;
 pub mod range;
 pub mod read;
+pub mod rs;
 pub mod store;
 
 /// Id of a block. It is the Block contract's key material, so a child pointer
@@ -25,6 +27,10 @@ pub mod kind {
     pub const RAW: u8 = 0;
     /// A tree node (`PT01`).
     pub const TREE_NODE: u8 = 1;
+    /// One coded symbol of a sibling group ([`crate::parity`]). Defined here
+    /// because a parity block's id is `block_id(PARITY, symbol)` and the tree
+    /// is what computes it; the Block contract holds the same byte.
+    pub const PARITY: u8 = 4;
 }
 
 /// The id of a block of `kind` holding `body`: `BLAKE3(kind ‖ body)`, which is

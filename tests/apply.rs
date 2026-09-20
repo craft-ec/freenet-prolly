@@ -13,6 +13,13 @@ use freenet_prolly::apply::{apply_with, Edit, Options};
 use freenet_prolly::boundary::splits_after;
 use freenet_prolly::build::{SplitRule, TreeBuilder};
 use freenet_prolly::node::{Node, Value, MAX_INLINE};
+use freenet_prolly::parity::MAX_GROUP;
+
+/// Members a single edit can drag in: one group per level of the path, each up
+/// to `MAX_GROUP`. Named rather than inlined so the number has a reason.
+fn parity_budget() -> usize {
+    5 * MAX_GROUP
+}
 use freenet_prolly::read::get;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::{block_id, kind, Cid};
@@ -234,9 +241,28 @@ fn step(
             landed.insert(nodes[i].1);
         }
     }
+    // PARITY MEMBERS. Every group a rebuild touches is recoded from its
+    // members, so the members of every node the rebuild emitted are legitimate
+    // reads — and ONLY those. Stated exactly rather than as "parity reads
+    // something": an accidental whole-node read still shows as stray, because a
+    // node that is not a member of anything the rebuild emitted is not in here.
+    let mut members: HashSet<Cid> = HashSet::new();
+    for bytes in new_nodes.0.values() {
+        let n = Node::parse(bytes).unwrap();
+        for i in 0..n.len() {
+            if n.is_leaf() {
+                if let freenet_prolly::node::Value::Ref { cid, .. } = n.value(i) {
+                    members.insert(cid);
+                }
+            } else {
+                members.insert(n.child(i).0);
+            }
+        }
+    }
     let stray = reads
         .difference(&replaced)
         .filter(|c| !landed.contains(*c))
+        .filter(|c| !members.contains(*c))
         .count();
     // Above the leaves the neighbour is always re-read when a branch's first
     // child is replaced (no aggregate bound exists there; upper levels are warm).
@@ -250,6 +276,7 @@ fn step(
         let what: Vec<String> = reads
             .difference(&replaced)
             .filter(|c| !landed.contains(*c))
+            .filter(|c| !members.contains(*c))
             .map(|c| {
                 let n = Node::parse(&old_nodes.0[c]).unwrap();
                 let touched = batch
@@ -690,8 +717,17 @@ fn a_cold_edit_resumes_round_by_round_and_emits_only_at_the_end() {
         println!(
             "  batch {size:2}: {rounds} rounds, {fetched} blocks fetched, widest round {widest}"
         );
+        // A cold edit now also fetches the MEMBERS of every group it touches,
+        // because this version recodes each touched group from its members
+        // rather than updating the old parity. That is the honest cost of the
+        // simple writer: up to MAX_GROUP members per touched group, on each
+        // level of the path. The optimisation — delta from the three old
+        // parity blocks, which needs none of those reads — is a separate
+        // change behind a byte-equality oracle (freenet-prolly#19, PR B), and
+        // this bound comes back down with it.
+        let per_edit = 12 + parity_budget();
         assert!(
-            fetched < 12 * size + 8,
+            fetched < per_edit * size + 8 + 4 * MAX_GROUP,
             "fetched {fetched} for {size} edits"
         );
         m = dataset(12, 20_000).into_iter().collect();

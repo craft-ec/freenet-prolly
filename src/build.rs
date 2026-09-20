@@ -38,6 +38,10 @@ struct Level {
 
 /// Streaming tree builder. Closed nodes are handed to `sink` as `(cid, bytes)`.
 pub struct TreeBuilder<F: FnMut(Cid, &[u8])> {
+    /// Every block this build has produced or been handed, so a parity member
+    /// can be read back the moment its parent needs it. A `Ref` whose bytes the
+    /// builder never saw is a miss, and a miss is refused.
+    seen: crate::store::Overlay<'static, crate::store::MemBlocks>,
     levels: Vec<Level>,
     /// Last key pushed: order must hold across node boundaries too.
     last: Option<Vec<u8>>,
@@ -51,10 +55,19 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         Self::with_rule(boundary::splits_after, sink)
     }
 
+    /// Hand the builder a value block it did not write, so a `Ref` naming it
+    /// can be coded. Without this a caller that stored its own values would be
+    /// refused — correctly, since parity over a member whose bytes nobody has
+    /// is parity over nothing.
+    pub fn see(&mut self, cid: Cid, bytes: &[u8]) {
+        self.seen.put(cid, bytes);
+    }
+
     /// A builder with a different split rule. The format uses
     /// [`boundary::splits_after`]; anything else exists for comparison in tests.
     pub fn with_rule(rule: SplitRule, sink: F) -> Self {
         TreeBuilder {
+            seen: crate::store::Overlay::new(None),
             levels: Vec::new(),
             last: None,
             poisoned: false,
@@ -102,13 +115,17 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
             });
         }
         let mut done = Vec::new();
-        self.levels[l].chunker.push(key, body, &mut done)?;
+        self.levels[l]
+            .chunker
+            .push(key, body, &self.seen, &mut done)?;
         self.closed(l, done)
     }
 
     /// Pass the nodes level `l` just closed to the sink and to the level above.
     fn closed(&mut self, l: usize, done: Vec<Closed>) -> Result<(), TreeError> {
         for node in done {
+            // Readable before the level above asks for it as a member.
+            self.seen.put(node.cid, &node.bytes);
             (self.sink)(node.cid, &node.bytes);
             let lv = &mut self.levels[l];
             lv.closed += 1;
@@ -162,6 +179,12 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
     /// with the thing it is checking.
     pub fn push_bytes(&mut self, key: &[u8], bytes: &[u8]) -> Result<(), TreeError> {
         let (value, block) = Value::for_bytes(bytes);
+        // Registered BEFORE the push: the leaf's parity reads the member back
+        // the moment the entry goes in, so emitting the block afterwards would
+        // be a miss.
+        if let Some((cid, b)) = block {
+            self.seen.put(cid, b);
+        }
         self.push(key, value)?;
         if let Some((cid, b)) = block {
             (self.sink)(cid, b);

@@ -31,6 +31,49 @@ pub trait BlocksMut: Blocks {
     fn insert_block(&mut self, cid: Cid, bytes: &[u8]);
 }
 
+/// Fresh blocks first, a base store second.
+///
+/// A rebuild needs its own output back: a branch's parity members are its
+/// CHILDREN, and when a branch closes those children were created moments ago
+/// and are not in the caller's store yet — `apply` emits them to a sink and the
+/// caller inserts them afterwards. Reading only the store would miss exactly
+/// the members the rebuild just made.
+///
+/// So writes look here first and fall through. `build` with no base store uses
+/// an overlay over nothing, where a `Ref` whose bytes were never handed over is
+/// a miss — and a miss is refused, never quietly coded as absent.
+pub struct Overlay<'a, B: Blocks> {
+    fresh: std::collections::BTreeMap<Cid, Vec<u8>>,
+    base: Option<&'a B>,
+}
+
+impl<'a, B: Blocks> Overlay<'a, B> {
+    pub fn new(base: Option<&'a B>) -> Self {
+        Overlay {
+            fresh: std::collections::BTreeMap::new(),
+            base,
+        }
+    }
+
+    /// Remember a block this call produced or was handed.
+    pub fn put(&mut self, cid: Cid, bytes: &[u8]) {
+        self.fresh.insert(cid, bytes.to_vec());
+    }
+
+    pub fn holds(&self, cid: &Cid) -> bool {
+        self.fresh.contains_key(cid)
+    }
+}
+
+impl<B: Blocks> Blocks for Overlay<'_, B> {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.fresh
+            .get(cid)
+            .map(|v| v.as_slice())
+            .or_else(|| self.base.and_then(|b| b.get(cid)))
+    }
+}
+
 /// Blocks held in memory.
 #[derive(Default, Clone)]
 pub struct MemBlocks(pub HashMap<Cid, Vec<u8>>);

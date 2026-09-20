@@ -141,7 +141,9 @@ fn builder_refuses_disorder_and_wrong_kinds() {
         b.push_child(b"c", [0; 32], Agg::default()),
         Err(BuildError::WrongKind)
     );
-    assert_eq!(b.push_parity([0; 32]), Err(BuildError::WrongKind));
+    // A LEAF may carry parity now — it protects the values it stores by
+    // reference — so the level no longer decides whether an id may be added.
+    assert_eq!(b.push_parity([0; 32]), Ok(()));
     let mut br = NodeBuilder::branch(1);
     assert_eq!(
         br.push(b"a", Value::Inline(b"")),
@@ -194,7 +196,17 @@ fn each_malformation_is_named() {
     };
     assert_eq!(with(&|v| v[0] = b'X'), NodeError::BadMagic);
     assert_eq!(with(&|v| v[5] = 1), NodeError::BadFlags);
-    assert_eq!(with(&|v| v[24] = 1), NodeError::BadShape); // parity on a leaf
+    // A LEAF may carry parity now — it protects the values stored by reference
+    // — so `pcount = 1` is refused only because these bytes have no room for a
+    // 32-byte id, not because a leaf may not have one.
+    assert_eq!(with(&|v| v[24] = 1), NodeError::TooShort);
+    // What `parse` does decide about the region is its size: a count past what
+    // the 4 KiB reserve could ever hold is refused before the entries are read.
+    assert_eq!(
+        with(&|v| v[24..26]
+            .copy_from_slice(&((freenet_prolly::node::MAX_PCOUNT + 1) as u16).to_le_bytes())),
+        NodeError::BadShape
+    );
     assert_eq!(with(&|v| v[8] = 9), NodeError::AggMismatch);
     assert_eq!(with(&|v| v[16] ^= 1), NodeError::AggMismatch);
     assert_eq!(
