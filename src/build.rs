@@ -156,7 +156,7 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
         let mut l = 0;
         loop {
             let mut done = Vec::new();
-            self.levels[l].chunker.finish(&mut done)?;
+            self.levels[l].chunker.finish(&self.seen, &mut done)?;
             self.closed(l, done)?;
             let lv = &mut self.levels[l];
             if lv.closed == 1 {

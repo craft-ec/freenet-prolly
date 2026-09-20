@@ -137,26 +137,13 @@ pub fn group_sizes(hashes: &[u32]) -> Vec<usize> {
 /// values by class ascending, then by key within the class. A leaf with no
 /// referenced values has no groups, and so no parity.
 pub fn group_sizes_of(node: &Node<'_>) -> Vec<usize> {
-    let level = node.level();
-    let prefix = node.prefix();
-    if level > 0 {
-        let hashes: Vec<u32> = (0..node.len())
-            .map(|i| group_hash_parts(level, prefix, node.suffix(i)))
-            .collect();
-        return group_sizes(&hashes);
-    }
-    let mut out = Vec::new();
-    for class in 0..CLASSES.len() {
-        let hashes: Vec<u32> = (0..node.len())
-            .filter(|&i| match node.value(i) {
-                Value::Ref { len, .. } => class_of(len as usize) == class,
-                _ => false,
-            })
-            .map(|i| group_hash_parts(level, prefix, node.suffix(i)))
-            .collect();
-        out.extend(group_sizes(&hashes));
-    }
-    out
+    // Derived from `group_members`, not computed a second way. Two enumerations
+    // of the same grouping is the one way a writer and a checker can come to
+    // disagree about whether a node is valid.
+    group_members(node)
+        .into_iter()
+        .map(|(_, m)| m.len())
+        .collect()
 }
 
 /// How many parity ids a node must carry: three per group, and a pure function
@@ -619,4 +606,177 @@ mod frozen_constants {
         assert_eq!(class_of(4097), 1);
         assert_eq!(class_of(MAX_VALUE), CLASSES.len() - 1);
     }
+}
+
+/// The parity a node already has, indexed by the members it covers.
+///
+/// A rewrite replaces a node, but most of its groups are untouched: the same
+/// members, in the same order, in the same class. Their parity is a pure
+/// function of those members, so it is already correct and already stored —
+/// recomputing it costs reads of every member for a result that cannot differ.
+///
+/// This is what lets a writer say "I have seen this exact group before" and
+/// copy the three ids instead. It is built from a node the rebuild is
+/// REPLACING, so nothing here is a claim: the ids came out of a node that was
+/// validated when it was stored.
+#[derive(Default)]
+pub struct GroupIndex {
+    /// `(class, member cids) → the group's three parity ids`, in the order the
+    /// node listed them.
+    groups: Vec<(usize, Vec<crate::Cid>, [crate::Cid; rs::PARITY])>,
+}
+
+impl GroupIndex {
+    /// Read a node's groups. A node whose parity count disagrees with its
+    /// entries contributes nothing — it should never have been stored, and a
+    /// writer must not build on it.
+    pub fn of(node: &Node<'_>) -> GroupIndex {
+        let mut out = GroupIndex::default();
+        out.add(node);
+        out
+    }
+
+    /// Add another node's groups.
+    ///
+    /// A rewrite usually spans several old nodes and produces several new ones,
+    /// with the boundaries moving between them — so a group that survives may
+    /// well end up in a different node than it started in. Parity is a pure
+    /// function of the members and the class, and position is not part of it,
+    /// so a group found in ANY node this rewrite is replacing is the same group.
+    pub fn add(&mut self, node: &Node<'_>) {
+        let out = self;
+        let ids: Vec<crate::Cid> = node.parity().collect();
+        if ids.len() != pcount_of(node) {
+            return;
+        }
+        let mut at = 0usize;
+        for (class, members) in group_members(node) {
+            let trio = [ids[at], ids[at + 1], ids[at + 2]];
+            at += rs::PARITY;
+            out.groups.push((class, members, trio));
+        }
+    }
+
+    /// The three ids for exactly this group, if the node already had it.
+    pub fn exact(&self, class: usize, members: &[crate::Cid]) -> Option<[crate::Cid; rs::PARITY]> {
+        self.groups
+            .iter()
+            .find(|(c, m, _)| *c == class && m == members)
+            .map(|(_, _, ids)| *ids)
+    }
+
+    /// A group of the same class and the same length differing in exactly ONE
+    /// position: the position, the cid that used to be there, and the old
+    /// parity ids.
+    ///
+    /// This is the shape [`update_group`] can correct, and the reason it is
+    /// worth finding: the correction reads two member blocks, where a recode
+    /// reads all of them. A group differing in two positions is not reported —
+    /// the saving is gone by then, and the caller would have to hold two old
+    /// states to use it.
+    ///
+    /// The first match wins. Any group answering the description gives the same
+    /// answer, because the ids are a function of the members.
+    pub fn one_off(
+        &self,
+        class: usize,
+        members: &[crate::Cid],
+    ) -> Option<(usize, crate::Cid, [crate::Cid; rs::PARITY])> {
+        self.groups.iter().find_map(|(c, m, ids)| {
+            if *c != class || m.len() != members.len() {
+                return None;
+            }
+            let mut differ = m
+                .iter()
+                .zip(members)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b);
+            let (pos, (was, _)) = differ.next()?;
+            // Exactly one: a second difference and this is not a delta.
+            if differ.next().is_some() {
+                return None;
+            }
+            Some((pos, *was, *ids))
+        })
+    }
+}
+
+/// A node's groups as `(class, member cids)`, in the order their parity ids
+/// appear. The member cids are what the group is OVER: children for a branch,
+/// referenced values for a leaf.
+pub fn group_members(node: &Node<'_>) -> Vec<(usize, Vec<crate::Cid>)> {
+    let level = node.level();
+    let prefix = node.prefix();
+    let mut runs: Vec<(usize, Vec<u32>, Vec<crate::Cid>)> = Vec::new();
+    if level > 0 {
+        let mut h = Vec::with_capacity(node.len());
+        let mut c = Vec::with_capacity(node.len());
+        for i in 0..node.len() {
+            h.push(group_hash_parts(level, prefix, node.suffix(i)));
+            c.push(node.child(i).0);
+        }
+        runs.push((0, h, c));
+    } else {
+        for class in 0..CLASSES.len() {
+            let mut h = Vec::new();
+            let mut c = Vec::new();
+            for i in 0..node.len() {
+                if let Value::Ref { cid, len } = node.value(i) {
+                    if class_of(len as usize) == class {
+                        h.push(group_hash_parts(level, prefix, node.suffix(i)));
+                        c.push(cid);
+                    }
+                }
+            }
+            if !h.is_empty() {
+                runs.push((class, h, c));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (class, hashes, cids) in runs {
+        let mut at = 0usize;
+        for size in group_sizes(&hashes) {
+            out.push((class, cids[at..at + size].to_vec()));
+            at += size;
+        }
+    }
+    out
+}
+
+/// A node's parity BLOCKS, computed from its members.
+///
+/// The node lists ids; this is what produces the bytes behind them. A writer
+/// puts these after the commit (§9: parity ids may be listed before the parity
+/// blocks exist), a keeper computes them to repair, and a delta update needs
+/// the old ones — so it is the same function for all three rather than three
+/// spellings of it.
+///
+/// Returns `None` if any member is not readable: parity over a member whose
+/// bytes nobody has is parity over nothing.
+pub fn blocks_of(
+    node: &Node<'_>,
+    blocks: &dyn crate::store::Blocks,
+) -> Option<Vec<(crate::Cid, Vec<u8>)>> {
+    let leaf = node.level() == 0;
+    let kind = if leaf {
+        crate::kind::RAW
+    } else {
+        crate::kind::TREE_NODE
+    };
+    let mut out = Vec::new();
+    for (_, members) in group_members(node) {
+        let mut states = Vec::with_capacity(members.len());
+        for c in &members {
+            let b = blocks.get(c)?;
+            let mut st = Vec::with_capacity(1 + b.len());
+            st.push(kind);
+            st.extend_from_slice(b);
+            states.push(st);
+        }
+        for p in encode_group(&states).ok()? {
+            out.push((crate::block_id(crate::kind::PARITY, &p), p));
+        }
+    }
+    Some(out)
 }

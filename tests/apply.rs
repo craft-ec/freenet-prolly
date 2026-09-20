@@ -246,19 +246,41 @@ fn step(
     // reads — and ONLY those. Stated exactly rather than as "parity reads
     // something": an accidental whole-node read still shows as stray, because a
     // node that is not a member of anything the rebuild emitted is not in here.
-    let mut members: HashSet<Cid> = HashSet::new();
-    for bytes in new_nodes.0.values() {
-        let n = Node::parse(bytes).unwrap();
+    // What a rewrite may read besides nodes: the blocks the nodes NAME.
+    //
+    // A group's parity is a pure function of its members, so a rewrite gets its
+    // ids from one of three places — copied from an old node that already had
+    // the group, corrected from that node's three parity blocks and the one
+    // member that changed, or coded from the members. The second and third read
+    // blocks the old node names; the third reads blocks the new node names.
+    //
+    // It is stated as "named by a node this rewrite touched" and not as "parity
+    // reads something": a node that is a member of nothing involved is still
+    // stray, which is the walk-the-whole-tree failure this guards against.
+    let mut named: HashSet<Cid> = HashSet::new();
+    let mut note = |n: &Node<'_>| {
         for i in 0..n.len() {
             if n.is_leaf() {
                 if let freenet_prolly::node::Value::Ref { cid, .. } = n.value(i) {
-                    members.insert(cid);
+                    named.insert(cid);
                 }
             } else {
-                members.insert(n.child(i).0);
+                named.insert(n.child(i).0);
             }
         }
+        for p in n.parity() {
+            named.insert(p);
+        }
+    };
+    for bytes in new_nodes.0.values() {
+        note(&Node::parse(bytes).unwrap());
     }
+    for c in &replaced {
+        if let Some(bytes) = old_nodes.0.get(c) {
+            note(&Node::parse(bytes).unwrap());
+        }
+    }
+    let members = named;
     let stray = reads
         .difference(&replaced)
         .filter(|c| !landed.contains(*c))
@@ -1001,5 +1023,177 @@ fn twenty_thousand_appends_one_at_a_time() {
     // And the whole tree still reads back.
     for (k, v) in m.iter().step_by(97) {
         assert_eq!(get(&store, &root, k).unwrap(), Some(value_of(v)));
+    }
+}
+
+/// **Reuse changes what is READ, never what is WRITTEN.**
+///
+/// Parity is a pure function of a group's members, so copying an untouched
+/// group's ids from the node being replaced and coding that group from its
+/// members must give the same three ids. This is the oracle for that: every
+/// case below is applied incrementally AND built from scratch, and the two
+/// trees are required to be identical block for block — not merely to have the
+/// same root, which a shared bug in both paths could satisfy.
+///
+/// The cases are the ones where the grouping is most likely to move: an update
+/// with no membership change, an insert that shifts a group boundary and one
+/// that does not, a delete, a value crossing a size class, and a short tail
+/// folding and unfolding.
+#[test]
+fn reuse_gives_the_same_bytes_as_coding_every_group() {
+    use freenet_prolly::chunk::source;
+
+    // Values large enough to be stored by REFERENCE, so the leaves carry parity
+    // and the leaf grouping (by size class) is exercised, not only the branches.
+    let big = |n: usize, b: u8| vec![b; n];
+    let mut base: Map = dataset(11, 900).into_iter().collect();
+    for (i, (_, v)) in base.iter_mut().enumerate() {
+        // A spread across the first two size classes.
+        *v = big(if i % 3 == 0 { 1100 } else { 5000 }, i as u8);
+    }
+    let keys: Vec<Vec<u8>> = base.keys().cloned().collect();
+    let mid = keys[keys.len() / 2].clone();
+    let mut before_mid = keys[keys.len() / 2 - 1].clone();
+    before_mid.push(0);
+    let mut fresh = keys[3].clone();
+    fresh.push(7);
+
+    // Named so the list reads as what it is: each case is a label and the
+    // batch that case applies.
+    type Case = (&'static str, Vec<(Vec<u8>, Edit)>);
+    let cases: Vec<Case> = vec![
+        (
+            "an update beneath a child, no membership change",
+            vec![put(&mid, &big(5000, 0xaa))],
+        ),
+        (
+            "an insert between two existing keys",
+            vec![put(&before_mid, &big(5000, 0xbb))],
+        ),
+        (
+            "another insert, elsewhere",
+            vec![put(&fresh, &big(5000, 0xcc))],
+        ),
+        ("a delete", vec![del(&mid)]),
+        (
+            "a value crossing a size class",
+            vec![put(&keys[1], &big(20_000, 0xdd))],
+        ),
+        (
+            "several edits at once, which moves boundaries",
+            keys.iter()
+                .step_by(97)
+                .map(|k| put(k, &big(1100, 0xee)))
+                .collect(),
+        ),
+    ];
+
+    // Every case runs twice. With the writer's parity blocks in the store a
+    // one-member change can be CORRECTED; without them the same change must
+    // fall back to a recode. Both passes assert the same bytes, so the fallback
+    // is a negative control that actually executes rather than a comment about
+    // one.
+    for (what, batch) in &cases {
+        let mut counts = Vec::new();
+        for with_parity in [true, false] {
+            let mut m = base.clone();
+            let (mut root, mut store) = scratch(splits_after, &m);
+            // Values live in the store too: a leaf's parity is over them.
+            for (k, v) in &m {
+                let _ = k;
+                let (val, block) = freenet_prolly::node::Value::for_bytes(v);
+                let _ = val;
+                if let Some((c, b)) = block {
+                    store.insert(c, b);
+                }
+            }
+
+            // The parity BLOCKS a writer would have put after its own commit. The
+            // library lists parity ids and does not emit the bytes, so a writer
+            // that did not keep them has nothing to correct — which is the second
+            // pass.
+            if with_parity {
+                let mut parity_blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
+                for bytes in store.0.values() {
+                    if let Ok(n) = Node::parse(bytes) {
+                        if let Some(ps) = freenet_prolly::parity::blocks_of(&n, &store) {
+                            parity_blocks.extend(ps);
+                        }
+                    }
+                }
+                for (c, b) in parity_blocks {
+                    store.insert(c, &b);
+                }
+            }
+
+            source::reset();
+            let applied = freenet_prolly::apply::apply_into(&mut store, &root, batch)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            root = applied.root;
+            let (reused, delta, recoded) = (source::reused(), source::delta(), source::recoded());
+
+            for (k, e) in batch {
+                match e {
+                    Edit::Put(v) => {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    Edit::Delete => {
+                        m.remove(k);
+                    }
+                }
+            }
+            let (want_root, want_nodes) = scratch(splits_after, &m);
+            assert_eq!(root, want_root, "{what}: the root differs from a rebuild");
+
+            // Block for block, not just the root: identical roots with different
+            // parity ids is impossible, but identical roots are also what a bug
+            // shared by both paths would produce, so the nodes are compared too.
+            for (cid, bytes) in &want_nodes.0 {
+                let got = store
+                    .0
+                    .get(cid)
+                    .unwrap_or_else(|| panic!("{what}: the rebuild's node {cid:?} is missing"));
+                assert_eq!(got, bytes, "{what}: node bytes differ");
+            }
+
+            // And reuse must actually have happened, or the equality above is the
+            // equality of two recodes and this test is about nothing.
+            assert!(
+                reused > 0,
+                "{what}: no group was reused ({reused} reused, {recoded} recoded)"
+            );
+            // And the delta path is the point of the first pass; without this the
+            // two passes could be the same run twice.
+            if with_parity {
+                assert!(
+                delta > 0,
+                "{what}: the old parity was there and no group was corrected ({reused} reused, {delta} delta, {recoded} recoded)"
+            );
+            } else {
+                assert_eq!(
+                    delta, 0,
+                    "{what}: no old parity block exists, yet a group claimed to correct one"
+                );
+            }
+            let held = if with_parity {
+                "parity held"
+            } else {
+                "no parity  "
+            };
+            println!("  {held}  {reused:3} reused, {delta:3} delta, {recoded:3} recoded  {what}");
+            counts.push((reused, delta, recoded));
+        }
+
+        // The two passes must differ in exactly one way: the groups the first
+        // CORRECTED are the groups the second RE-CODED. Equal reuse, and equal
+        // work overall, is what says the fallback caught precisely the delta
+        // path's groups and did not quietly widen or narrow.
+        let ((r0, d0, c0), (r1, d1, c1)) = (counts[0], counts[1]);
+        assert_eq!(r0, r1, "{what}: reuse should not depend on holding parity");
+        assert_eq!(
+            d0 + c0,
+            d1 + c1,
+            "{what}: {d0} corrected + {c0} recoded, but without parity {d1} + {c1}"
+        );
     }
 }

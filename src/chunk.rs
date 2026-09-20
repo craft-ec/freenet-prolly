@@ -44,63 +44,194 @@ impl Entry {
 
 /// The parity a node owes, accumulated as its members arrive.
 ///
-/// **Bounded by design.** A group can still gain members while it is the last
-/// one in its run — that is the fold rule — so the states of at most the last
-/// closed group and the open one are held, per class. Everything earlier is
-/// encoded and dropped as soon as a later group closes and proves it final:
-/// `4 classes × 2 groups × 12 members × 256 KiB ≈ 24 MB` worst case, and a few
-/// hundred kilobytes in any real tree. Buffering whole leaves would be ≈ 70 MB.
+/// **Members are recorded, not read.** A group's three ids can come from three
+/// places, and only the last needs the members' bytes at all:
 ///
-/// The grouping itself is [`crate::parity::group_sizes`] — the SAME function
-/// `check_parity` uses. A writer with its own copy of the rule is the one way
-/// this could drift into producing nodes the format refuses.
+/// - the node being replaced already had this exact group — same members, same
+///   order, same class — so its ids are already right and are copied;
+/// - it had a group differing in ONE position, so the new parity is the old
+///   parity plus a correction that needs only the two versions of that one
+///   member (`parity::update_group`);
+/// - neither, so the group is coded from its members.
+///
+/// Parity is a pure function of the members, so all three give the same bytes.
+/// What differs is what has to be READ — and on an ordinary edit most groups
+/// of a rewritten node are untouched, so most of them read nothing.
+///
+/// What is held is bounded the same way as before: a group can still gain
+/// members while it is the last of its run, so the CIDS of at most the last
+/// closed group and the open one matter, and bytes are fetched per group at
+/// the moment it is coded and dropped immediately after.
 #[derive(Default)]
 struct Run {
-    /// One per member, in key order. Four bytes each, so keeping all of them
-    /// costs nothing and removes any need to re-derive the grouping.
+    class: usize,
+    /// Four bytes each, so keeping all of them costs nothing and removes any
+    /// need to re-derive the grouping.
     hashes: Vec<u32>,
-    /// States for the members not yet encoded: the tail of `hashes`.
-    held: Vec<Vec<u8>>,
+    /// One per member, in key order. Cheap: the bytes are not here.
+    cids: Vec<Cid>,
+    /// The member states the caller supplied for entries it is writing, keyed
+    /// by cid — a value being written is not in the store yet.
     encoded: usize,
     ids: Vec<Cid>,
 }
 
+/// Where a group's parity came from. Counted so a test can assert that an
+/// ordinary edit REUSES rather than recodes — the saving is invisible to any
+/// assertion about the bytes, which are identical either way.
+#[cfg(any(test, feature = "testing"))]
+pub mod source {
+    use core::cell::Cell;
+    thread_local! {
+        static REUSED: Cell<usize> = const { Cell::new(0) };
+        static DELTA: Cell<usize> = const { Cell::new(0) };
+        static RECODED: Cell<usize> = const { Cell::new(0) };
+    }
+    pub fn reused() -> usize {
+        REUSED.with(|n| n.get())
+    }
+    pub fn delta() -> usize {
+        DELTA.with(|n| n.get())
+    }
+    pub fn recoded() -> usize {
+        RECODED.with(|n| n.get())
+    }
+    pub fn reset() {
+        REUSED.with(|n| n.set(0));
+        DELTA.with(|n| n.set(0));
+        RECODED.with(|n| n.set(0));
+    }
+    pub(super) fn tick_reused() {
+        REUSED.with(|n| n.set(n.get() + 1));
+    }
+    pub(super) fn tick_delta() {
+        DELTA.with(|n| n.set(n.get() + 1));
+    }
+    pub(super) fn tick_recoded() {
+        RECODED.with(|n| n.set(n.get() + 1));
+    }
+}
+
 impl Run {
-    fn push(&mut self, h: u32, state: Vec<u8>) -> Result<(), BuildError> {
+    fn push(&mut self, h: u32, cid: Cid) {
         self.hashes.push(h);
-        self.held.push(state);
-        // Every group but the last is final: only the last can still fold.
-        let sizes = crate::parity::group_sizes(&self.hashes);
-        let settled: usize = sizes[..sizes.len().saturating_sub(1)].iter().sum();
-        self.encode_to(settled, &sizes)
+        self.cids.push(cid);
     }
 
-    fn finish(&mut self) -> Result<Vec<Cid>, BuildError> {
+    /// The state of one member: `kind ‖ body`, from the store.
+    fn state(
+        blocks: &dyn crate::store::Blocks,
+        class_is_leaf: bool,
+        cid: &Cid,
+    ) -> Result<Vec<u8>, BuildError> {
+        let bytes = blocks.get(cid).ok_or(BuildError::MissingMember(*cid))?;
+        let k = if class_is_leaf {
+            kind::RAW
+        } else {
+            kind::TREE_NODE
+        };
+        let mut st = Vec::with_capacity(1 + bytes.len());
+        st.push(k);
+        st.extend_from_slice(bytes);
+        Ok(st)
+    }
+
+    fn finish(
+        &mut self,
+        leaf: bool,
+        blocks: &dyn crate::store::Blocks,
+        old: Option<&crate::parity::GroupIndex>,
+    ) -> Result<Vec<Cid>, BuildError> {
         let sizes = crate::parity::group_sizes(&self.hashes);
-        self.encode_to(self.hashes.len(), &sizes)?;
+        let mut at = 0usize;
+        for size in sizes {
+            let members = &self.cids[at..at + size];
+            at += size;
+            let ids = self.group_ids(leaf, blocks, old, members)?;
+            self.ids.extend_from_slice(&ids);
+        }
+        self.encoded = at;
         Ok(std::mem::take(&mut self.ids))
     }
 
-    /// Encode whole groups until `members` of the run have been coded.
-    fn encode_to(&mut self, members: usize, sizes: &[usize]) -> Result<(), BuildError> {
-        let mut at = 0usize;
-        for &size in sizes {
-            if at + size > members {
-                break;
+    fn group_ids(
+        &self,
+        leaf: bool,
+        blocks: &dyn crate::store::Blocks,
+        old: Option<&crate::parity::GroupIndex>,
+        members: &[Cid],
+    ) -> Result<[Cid; crate::rs::PARITY], BuildError> {
+        if let Some(idx) = old {
+            // Already had this exact group: its parity is a pure function of
+            // these members, so it is already right.
+            if let Some(ids) = idx.exact(self.class, members) {
+                #[cfg(any(test, feature = "testing"))]
+                source::tick_reused();
+                return Ok(ids);
             }
-            at += size;
-            if at <= self.encoded {
-                continue;
+            // One member changed in place: the correction needs only that
+            // member's two versions and the three old parity BLOCKS. If any of
+            // them is not to hand, fall through and recode — never produce
+            // parity that does not cover what it claims.
+            if let Some((pos, was, old_ids)) = idx.one_off(self.class, members) {
+                if let Some(ids) = self.delta(leaf, blocks, members, pos, was, old_ids)? {
+                    #[cfg(any(test, feature = "testing"))]
+                    source::tick_delta();
+                    return Ok(ids);
+                }
             }
-            let parity = crate::parity::encode_group(&self.held[..size])
-                .map_err(|_| BuildError::NodeTooLarge)?;
-            for p in &parity {
-                self.ids.push(block_id(kind::PARITY, p));
-            }
-            self.held.drain(..size);
-            self.encoded = at;
         }
-        Ok(())
+        #[cfg(any(test, feature = "testing"))]
+        source::tick_recoded();
+        let mut states = Vec::with_capacity(members.len());
+        for c in members {
+            states.push(Run::state(blocks, leaf, c)?);
+        }
+        let parity = crate::parity::encode_group(&states).map_err(|_| BuildError::NodeTooLarge)?;
+        Ok([
+            block_id(kind::PARITY, &parity[0]),
+            block_id(kind::PARITY, &parity[1]),
+            block_id(kind::PARITY, &parity[2]),
+        ])
+    }
+
+    /// Correct a group's parity for a single member changing in place.
+    ///
+    /// `None` when the old parity blocks are not available: the caller recodes.
+    fn delta(
+        &self,
+        leaf: bool,
+        blocks: &dyn crate::store::Blocks,
+        members: &[Cid],
+        pos: usize,
+        was: Cid,
+        old_ids: [Cid; crate::rs::PARITY],
+    ) -> Result<Option<[Cid; crate::rs::PARITY]>, BuildError> {
+        let mut old_parity = Vec::with_capacity(crate::rs::PARITY);
+        for id in &old_ids {
+            match blocks.get(id) {
+                Some(b) => old_parity.push(b.to_vec()),
+                // A parity block that was never put, or has been dropped. The
+                // fallback is a recode, never "no parity".
+                None => return Ok(None),
+            }
+        }
+        let Some(old_state) = blocks.get(&was).map(|b| {
+            let mut st = Vec::with_capacity(1 + b.len());
+            st.push(if leaf { kind::RAW } else { kind::TREE_NODE });
+            st.extend_from_slice(b);
+            st
+        }) else {
+            return Ok(None);
+        };
+        let new_state = Run::state(blocks, leaf, &members[pos])?;
+        let parity = crate::parity::update_group(&old_parity, pos, &old_state, &new_state)
+            .map_err(|_| BuildError::NodeTooLarge)?;
+        Ok(Some([
+            block_id(kind::PARITY, &parity[0]),
+            block_id(kind::PARITY, &parity[1]),
+            block_id(kind::PARITY, &parity[2]),
+        ]))
     }
 }
 
@@ -133,6 +264,9 @@ pub struct LevelChunker {
     /// The open node's parity. A branch has one run over its children; a leaf
     /// one per size class, since its members are grouped by class first.
     runs: Vec<Run>,
+    /// The groups of every node this rewrite is REPLACING. Empty for a build
+    /// from scratch, where there is nothing to reuse.
+    old: crate::parity::GroupIndex,
 }
 
 fn new_node(level: u8) -> NodeBuilder {
@@ -150,6 +284,7 @@ impl LevelChunker {
             rule,
             open: new_node(level),
             runs: Vec::new(),
+            old: crate::parity::GroupIndex::default(),
         }
     }
 
@@ -188,27 +323,15 @@ impl LevelChunker {
         };
         // The hard limit closes the node BEFORE the entry that would overflow it.
         if self.open.logical_len() + cost > boundary::MAX_LOGICAL {
-            self.close(out)?;
+            self.close(blocks, out)?;
         }
-        // The member's bytes are fetched BEFORE anything is mutated: a refused
-        // entry must leave the chunker exactly as it was, and a miss here is a
-        // refusal (or, for a caller with a store to fetch from, a Need).
+        // The member is RECORDED here, not read. Which of its bytes are needed
+        // depends on whether its group turns out to be reusable, and that is
+        // not known until the group closes.
         let member = match body {
             Body::Inline(_) => None,
-            Body::Ref { cid, len } => {
-                Some((crate::parity::class_of(*len as usize), kind::RAW, *cid))
-            }
-            Body::Child { cid, .. } => Some((0, kind::TREE_NODE, *cid)),
-        };
-        let state = match member {
-            None => None,
-            Some((class, k, cid)) => {
-                let bytes = blocks.get(&cid).ok_or(BuildError::MissingMember(cid))?;
-                let mut st = Vec::with_capacity(1 + bytes.len());
-                st.push(k);
-                st.extend_from_slice(bytes);
-                Some((class, st))
-            }
+            Body::Ref { cid, len } => Some((crate::parity::class_of(*len as usize), *cid)),
+            Body::Child { cid, .. } => Some((0, *cid)),
         };
         let before = self.open.logical_len();
         match body {
@@ -222,40 +345,80 @@ impl LevelChunker {
             )?,
             Body::Child { cid, agg } => self.open.push_child(key, *cid, *agg)?,
         }
-        if let Some((class, st)) = state {
+        if let Some((class, cid)) = member {
             let h = crate::parity::group_hash_parts(self.level, key, &[]);
-            self.run(class).push(h, st)?;
+            self.run(class).push(h, cid);
         }
         if (self.rule)(self.level, key, before, self.open.logical_len()) {
-            self.close(out)?;
+            self.close(blocks, out)?;
         }
         Ok(())
     }
 
     /// Close the open node, if it holds anything (end of the level).
-    pub fn finish(&mut self, out: &mut Vec<Closed>) -> Result<(), BuildError> {
+    pub fn finish(
+        &mut self,
+        blocks: &dyn crate::store::Blocks,
+        out: &mut Vec<Closed>,
+    ) -> Result<(), BuildError> {
         if !self.open.is_empty() {
-            self.close(out)?;
+            self.close(blocks, out)?;
         }
         Ok(())
     }
 
     fn run(&mut self, class: usize) -> &mut Run {
         while self.runs.len() <= class {
-            self.runs.push(Run::default());
+            let c = self.runs.len();
+            self.runs.push(Run {
+                class: c,
+                ..Run::default()
+            });
         }
         &mut self.runs[class]
     }
 
-    fn close(&mut self, out: &mut Vec<Closed>) -> Result<(), BuildError> {
+    /// An old node this rewrite is replacing. Its groups are where untouched
+    /// parity is copied from — and it is NOT cleared when a node closes,
+    /// because boundaries move: a group that survives can land in a different
+    /// node than it started in.
+    pub fn replacing(&mut self, node: &Node<'_>) {
+        self.old.add(node);
+    }
+
+    fn close(
+        &mut self,
+        blocks: &dyn crate::store::Blocks,
+        out: &mut Vec<Closed>,
+    ) -> Result<(), BuildError> {
         let mut done = std::mem::replace(&mut self.open, new_node(self.level));
         // Ids in the order the format requires: class ascending, group order
         // within a class.
-        for run in std::mem::take(&mut self.runs).iter_mut() {
-            for id in run.finish()? {
-                done.push_parity(id)?;
+        let leaf = self.level == 0;
+        // Taken out so the runs can borrow it while `self` is borrowed
+        // mutably; put back before returning, since later nodes of this same
+        // rewrite reuse from it too.
+        let old = std::mem::take(&mut self.old);
+        let mut runs = std::mem::take(&mut self.runs);
+        let mut result = Ok(());
+        for run in runs.iter_mut() {
+            match run.finish(leaf, blocks, Some(&old)) {
+                Ok(ids) => {
+                    for id in ids {
+                        if let Err(e) = done.push_parity(id) {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => result = Err(e),
+            }
+            if result.is_err() {
+                break;
             }
         }
+        self.old = old;
+        result?;
         let min_key = done.min_key().unwrap_or_default().to_vec();
         let agg = done.agg();
         let bytes = done.finish()?;
