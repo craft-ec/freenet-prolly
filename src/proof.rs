@@ -260,7 +260,7 @@ impl Proof {
                 return Err(ProofError::TooLarge("a node"));
             }
             #[cfg(test)]
-            COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            work::tick_copied();
             nodes.push(r.take(len as usize)?.to_vec());
         }
         let vlen = u32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes"));
@@ -408,15 +408,63 @@ fn shape<'a>(proof: &'a Proof, root: &Cid, per_level: usize) -> Result<Node<'a>,
     Ok(node)
 }
 
-/// Blocks parsed and hashed by [`ProofStore::new`]. The cost a hostile proof
-/// can impose, counted so a test can assert on it rather than on a clock.
+/// What verifying a proof COST, counted so a test can assert on work rather
+/// than on a clock.
+///
+/// Per-thread, and that is the whole point. The harness runs a binary's tests
+/// on many threads, so a process-global counter reports every thread's work to
+/// every reader: `assert_eq!(hashed(), 0)` after a refused proof then passes
+/// when the other tests happen to be elsewhere and fails when they are not,
+/// and nothing in a green run says which it was. These counters lied exactly
+/// that way once — a mutant in `apply.rs` was recorded KILLED by a cost test
+/// here that has nothing to do with it, and because cargo stops at the first
+/// failing test binary, the suite that should have judged the mutant never ran.
+/// A false kill is worse than a survivor: it ends the investigation.
 #[cfg(test)]
-pub(crate) static HASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) mod work {
+    use core::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
 
-/// Node bodies COPIED out of the wire form by [`Proof::decode`] — the other
-/// half of the cost, and the one a shape check on the bytes avoids.
-#[cfg(test)]
-pub(crate) static COPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static HASHED: Cell<usize> = const { Cell::new(0) };
+        static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Blocks parsed and hashed by `ProofStore::new` — the cost a hostile
+    /// proof can impose.
+    pub(crate) fn hashed() -> usize {
+        HASHED.with(|n| n.get())
+    }
+
+    /// Node bodies COPIED out of the wire form by `Proof::decode` — the other
+    /// half of the cost, and the one a shape check on the bytes avoids.
+    pub(crate) fn copied() -> usize {
+        COPIED.with(|n| n.get())
+    }
+
+    /// Both, because a test that measures one and forgets the other reads a
+    /// number left over from whatever it did before.
+    pub(crate) fn reset() {
+        HASHED.with(|n| n.set(0));
+        COPIED.with(|n| n.set(0));
+        SHARED_HASHED.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn tick_hashed() {
+        HASHED.with(|n| n.set(n.get() + 1));
+        SHARED_HASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn tick_copied() {
+        COPIED.with(|n| n.set(n.get() + 1));
+    }
+
+    /// The same count kept the OLD way, ticked beside the per-thread one and
+    /// read by nothing but the control test. It exists so the control can show
+    /// what the process-global form reports under the same load, rather than
+    /// describing it.
+    pub(crate) static SHARED_HASHED: AtomicUsize = AtomicUsize::new(0);
+}
 
 /// A store holding exactly the proof's blocks, keyed the way every block is
 /// keyed, recording which ones were asked for.
@@ -430,7 +478,7 @@ impl<'a> ProofStore<'a> {
         let mut blocks = Vec::with_capacity(p.nodes.len());
         for n in &p.nodes {
             #[cfg(test)]
-            HASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            work::tick_hashed();
             // Parsed here so a block that is not a node is refused as such,
             // rather than reaching the reader as a missing block.
             Node::parse(n).map_err(|_| ProofError::NotANode)?;
@@ -582,7 +630,6 @@ mod tests {
     use crate::build::init;
     use crate::node::NodeBuilder;
     use crate::store::MemBlocks;
-    use std::sync::atomic::Ordering;
 
     /// Refusing a hostile proof must cost about what an honest one costs.
     ///
@@ -610,9 +657,9 @@ mod tests {
             Proven::Present(_)
         ));
 
-        HASHED.store(0, Ordering::Relaxed);
+        work::reset();
         let _ = verify(&root, &key, &honest);
-        let honest_work = HASHED.load(Ordering::Relaxed);
+        let honest_work = work::hashed();
         assert_eq!(honest_work, honest.nodes.len());
 
         // The honest path, then thousands of distinct, individually VALID
@@ -627,9 +674,9 @@ mod tests {
                 nodes.push(b.finish().unwrap());
             }
             let hostile = Proof { nodes, value: None };
-            HASHED.store(0, Ordering::Relaxed);
+            work::reset();
             let got = verify(&root, &key, &hostile);
-            let work = HASHED.load(Ordering::Relaxed);
+            let work = work::hashed();
             assert!(got.is_err(), "{n} pad nodes must be refused");
             assert_eq!(
                 work, 0,
@@ -950,7 +997,6 @@ mod range_tests {
     use crate::build::init;
     use crate::node::NodeBuilder;
     use crate::store::MemBlocks;
-    use std::sync::atomic::Ordering;
 
     fn tree() -> (MemBlocks, Cid, Vec<Vec<u8>>) {
         let mut blocks = MemBlocks::default();
@@ -991,22 +1037,18 @@ mod range_tests {
             ..Range::default()
         };
         let honest = prove_range(&blocks, &root, &r).unwrap();
-        HASHED.store(0, Ordering::Relaxed);
+        work::reset();
         verify_range(&root, &r, &honest).unwrap();
-        let honest_work = HASHED.load(Ordering::Relaxed);
+        let honest_work = work::hashed();
         assert_eq!(honest_work, honest.nodes.len());
 
         let big = padded(&honest, 20_000);
-        HASHED.store(0, Ordering::Relaxed);
+        work::reset();
         assert!(matches!(
             verify_range(&root, &r, &big),
             Err(ProofError::TooLarge(_))
         ));
-        assert_eq!(
-            HASHED.load(Ordering::Relaxed),
-            0,
-            "padding must not be hashed"
-        );
+        assert_eq!(work::hashed(), 0, "padding must not be hashed");
 
         // With NO entry limit there is no bound to derive, so it must be
         // refused before the proof is touched — not after `range` declines.
@@ -1014,26 +1056,26 @@ mod range_tests {
             max_entries: 0,
             ..r.clone()
         };
-        HASHED.store(0, Ordering::Relaxed);
+        work::reset();
         assert!(matches!(
             verify_range(&root, &unlimited, &big),
             Err(ProofError::Unsupported(_))
         ));
         assert_eq!(
-            HASHED.load(Ordering::Relaxed),
+            work::hashed(),
             0,
             "an unlimited range must be refused before the proof is parsed"
         );
 
         // And from the wire: refused before the bytes are copied.
         let wire = big.encode();
-        COPIED.store(0, Ordering::Relaxed);
+        work::reset();
         assert!(matches!(
             verify_range_bytes(&root, &r, &wire),
             Err(ProofError::TooLarge(_))
         ));
         assert_eq!(
-            COPIED.load(Ordering::Relaxed),
+            work::copied(),
             0,
             "{} B of padding was copied before being refused",
             wire.len()
@@ -1063,14 +1105,13 @@ mod range_tests {
         assert!(honest.nodes.is_empty());
         let wire = honest.encode();
 
-        HASHED.store(0, Ordering::Relaxed);
-        COPIED.store(0, Ordering::Relaxed);
+        work::reset();
         assert!(verify_range_bytes(&root, &q, &wire)
             .unwrap()
             .entries
             .is_empty());
-        assert_eq!(HASHED.load(Ordering::Relaxed), 0);
-        assert_eq!(COPIED.load(Ordering::Relaxed), 0);
+        assert_eq!(work::hashed(), 0);
+        assert_eq!(work::copied(), 0);
 
         // A padded proof aimed at an empty question: refused without decoding.
         let padded = {
@@ -1086,15 +1127,14 @@ mod range_tests {
             padded_proof(&real, 5_000).encode()
         };
         assert!(padded.len() > 500_000);
-        HASHED.store(0, Ordering::Relaxed);
-        COPIED.store(0, Ordering::Relaxed);
+        work::reset();
         assert_eq!(
             verify_range_bytes(&root, &q, &padded),
             Err(ProofError::Extra)
         );
-        assert_eq!(HASHED.load(Ordering::Relaxed), 0, "padding was hashed");
+        assert_eq!(work::hashed(), 0, "padding was hashed");
         assert_eq!(
-            COPIED.load(Ordering::Relaxed),
+            work::copied(),
             0,
             "{} B was copied to refuse an empty question",
             padded.len()
@@ -1125,5 +1165,89 @@ mod range_tests {
             Err(ProofError::Incomplete),
             "a prover missing blocks must refuse, not ship a short page"
         );
+    }
+}
+
+/// The cost counters are per-thread, and this is what that buys.
+///
+/// A process-global counter reports the work of every thread to every reader,
+/// so a cost assertion over it passes when the other tests happen to be
+/// elsewhere and fails when they are not — and a green run never says which.
+/// Here that is not left to luck: two barriers make the failure DETERMINISTIC.
+/// Every thread waits until all of them are ready, does its own fixed amount of
+/// counted work, and waits again until all of them have finished. Only then
+/// does it read. A per-thread counter reads exactly its own `PER_THREAD`; a
+/// shared one reads `THREADS * PER_THREAD`, every time, because all the work is
+/// provably done before any read happens.
+///
+/// The shared reading is not described, it is TAKEN: `work::SHARED_HASHED` is
+/// ticked beside the per-thread counter and read only here. So this test states
+/// what the old form would have reported under the same load, rather than
+/// asking the reader to believe it.
+#[cfg(test)]
+mod counter_scope {
+    use super::*;
+    use crate::apply::{apply_into, Edit};
+    use crate::build::init;
+    use crate::store::MemBlocks;
+    use std::sync::atomic::Ordering;
+    use std::sync::Barrier;
+
+    const THREADS: usize = 4;
+    /// Entries per thread's fixture. Big enough that the tree has a branch
+    /// level, so the proof is more than one node and `mine == n` is a real
+    /// equality rather than 1 == 1.
+    const ENTRIES: usize = 2_000;
+
+    #[test]
+    fn a_cost_counter_reports_this_threads_work_and_no_other_threads() {
+        let ready = Barrier::new(THREADS);
+        let measured = Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    // A proof whose verification hashes a known number of
+                    // blocks. Built before the barrier, so the counted region
+                    // holds nothing but the work being counted.
+                    let mut blocks = MemBlocks::default();
+                    let root = init(&mut blocks);
+                    let edits: Vec<(Vec<u8>, Edit)> = (0..ENTRIES as u32)
+                        .map(|i| {
+                            (
+                                format!("k/{i:08}").into_bytes(),
+                                Edit::Put(vec![(i % 251) as u8; 120]),
+                            )
+                        })
+                        .collect();
+                    let root = apply_into(&mut blocks, &root, &edits).unwrap().root;
+                    let key = b"k/00001000".to_vec();
+                    let honest = prove(&blocks, &root, &key).unwrap();
+                    let n = honest.nodes.len();
+                    assert!(n > 0, "the fixture must do real work");
+
+                    work::reset();
+                    ready.wait();
+                    verify(&root, &key, &honest).expect("an honest proof verifies");
+                    let mine = work::hashed();
+                    // Every thread's work is finished before any thread reads.
+                    measured.wait();
+                    let shared = work::SHARED_HASHED.load(Ordering::Relaxed);
+
+                    assert_eq!(
+                        mine, n,
+                        "the counter reported other threads' work: it is not per-thread"
+                    );
+                    // The control: the same count kept the old way is N times
+                    // as large, which is exactly the number the cost tests used
+                    // to assert on.
+                    assert!(
+                        shared >= mine * THREADS,
+                        "the shared counter read {shared}, not {} — the control \
+                         is not loaded and proves nothing",
+                        mine * THREADS
+                    );
+                });
+            }
+        });
     }
 }
