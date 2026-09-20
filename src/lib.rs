@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod cursor;
 pub mod diff;
 pub mod node;
+pub mod pack;
 pub mod parity;
 pub mod proof;
 pub mod range;
