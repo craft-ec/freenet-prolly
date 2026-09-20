@@ -24,17 +24,6 @@ use std::ops::Bound;
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
-fn value_of(v: &[u8]) -> Value<'_> {
-    if v.len() <= MAX_INLINE {
-        Value::Inline(v)
-    } else {
-        Value::Ref {
-            cid: block_id(kind::RAW, v),
-            len: v.len() as u32,
-        }
-    }
-}
-
 /// Build `m` into a tree, keeping the nodes AND the blocks of values too large
 /// to inline — a scan must be able to materialise either kind.
 fn scratch(m: &Map) -> (Cid, MemBlocks) {
