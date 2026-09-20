@@ -471,6 +471,21 @@ fn frozen_vectors() {
         MAX_INLINE,
         freenet_prolly::node::MAX_VALUE
     );
+    // The parity rule's constants, on the wire line rather than only in the
+    // source: a change to any of them moves a frozen vector, which is what a
+    // reviewer sees. `0x11D` is the field polynomial, then the group bounds,
+    // the close threshold, and the size classes.
+    {
+        use freenet_prolly::parity::{CLASSES, CLOSE_THRESHOLD_FOR_VECTORS, MAX_GROUP, MIN_GROUP};
+        got += &format!(
+            "pconst 11d {MIN_GROUP} {MAX_GROUP} {CLOSE_THRESHOLD_FOR_VECTORS} {}\n",
+            CLASSES
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     for (k, body) in [(0u8, &b""[..]), (0, b"value"), (1, b"value")] {
         let id = freenet_prolly::block_id(k, body);
         got += &format!("id {k} {} {}\n", hex(body), hex(&id));
@@ -500,6 +515,7 @@ fn frozen_vectors() {
         );
         got += &format!("prepair {k} {}\n", hex(&parity_repair_digest(k)));
     }
+    got += &format!("puneven {}\n", hex(&parity_uneven_digest()));
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -942,8 +958,58 @@ pub fn parity_members(k: usize) -> Vec<Vec<u8>> {
 /// Every way to lose three of the `k + 3`, rebuilt, digested. This is what
 /// says a repairer on another target gets the same bytes back — the claim
 /// "anyone can repair without a key" rests on it.
+/// A repair sweep over a group of UNEQUAL lengths, with the cases that make
+/// trimming hard forced rather than hoped for: the longest member dropped, and
+/// a parity block among the lost. The k = 1/7/12 vectors use one shape of
+/// member each; this is the shape where the width is not recoverable from
+/// what survives.
+pub fn parity_uneven_digest() -> [u8; 32] {
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
+    use freenet_prolly::rs::PARITY;
+    // Strictly increasing, so the LAST member is the one that sets the width.
+    let states: Vec<Vec<u8>> = (0..6).map(|i| vec![(i as u8) + 1; 1 + i * 37]).collect();
+    let k = states.len();
+    let parity = encode_group(&states).expect("codeable");
+    let all: Vec<Vec<u8>> = states
+        .iter()
+        .map(|s| symbol(s))
+        .chain(parity.iter().cloned())
+        .collect();
+    let mut h = blake3::Hasher::new();
+    // Every loss that includes the longest member, and every one that includes
+    // a parity block — the two cases the equal-length vectors cannot reach.
+    let mut cases = 0usize;
+    let mut parity_lost = 0usize;
+    for a in 0..k + PARITY {
+        for b in a + 1..k + PARITY {
+            let gone = [k - 1, a, b];
+            if a == k - 1 || b == k - 1 {
+                continue;
+            }
+            let have: Vec<Option<Vec<u8>>> = (0..k + PARITY)
+                .map(|j| (!gone.contains(&j)).then(|| all[j].clone()))
+                .collect();
+            let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+            assert_eq!(got, states, "uneven: lost {gone:?}");
+            for s in &got {
+                h.update(s);
+            }
+            cases += 1;
+            if a >= k || b >= k {
+                parity_lost += 1;
+            }
+        }
+    }
+    assert!(cases > 20, "only {cases} uneven cases");
+    assert!(
+        parity_lost > 0,
+        "no case dropped a parity block: that half of the sweep is untested"
+    );
+    *h.finalize().as_bytes()
+}
+
 pub fn parity_repair_digest(k: usize) -> [u8; 32] {
-    use freenet_prolly::parity::{encode_group, repair_group, symbol};
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
     use freenet_prolly::rs::PARITY;
     let states = parity_members(k);
     let parity = encode_group(&states).expect("a codeable group");
@@ -961,7 +1027,7 @@ pub fn parity_repair_digest(k: usize) -> [u8; 32] {
                 let have: Vec<Option<Vec<u8>>> = (0..n)
                     .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
                     .collect();
-                let got = repair_group(k, &have).expect("k of k+3 present");
+                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
                 assert_eq!(got, states, "k = {k}: lost {a},{b},{c}");
                 for s in &got {
                     h.update(s);

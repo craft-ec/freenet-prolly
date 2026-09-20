@@ -138,6 +138,25 @@ pub fn encode(data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, RsError> {
     Ok(out)
 }
 
+/// Byte columns solved. What a HOSTILE group costs a repairer is a property in
+/// its own right: the answer is "refused" either way, and only a counter can
+/// see the difference between refusing after four columns and after four
+/// billion.
+#[cfg(any(test, feature = "testing"))]
+pub mod work {
+    use core::cell::Cell;
+    thread_local! { static N: Cell<usize> = const { Cell::new(0) }; }
+    pub fn columns() -> usize {
+        N.with(|n| n.get())
+    }
+    pub fn reset() {
+        N.with(|n| n.set(0));
+    }
+    pub(super) fn tick() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+}
+
 /// Drop trailing zero bytes. The canonical stored form of a parity block.
 pub fn trim(v: &mut Vec<u8>) {
     while v.last() == Some(&0) {
@@ -162,7 +181,7 @@ pub fn byte_at(b: &[u8], i: usize) -> u8 {
 /// each data symbol's length prefix; the last index any of them needs is then
 /// known exactly, so no index is ever revisited and the answer equals what an
 /// untrimmed repair would have produced.
-pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsError> {
+pub fn repair(k: usize, have: &[Option<Vec<u8>>], max_len: usize) -> Result<Vec<Vec<u8>>, RsError> {
     if k == 0 || k > MAX_K {
         return Err(RsError::GroupSize(k));
     }
@@ -195,6 +214,8 @@ pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsErro
 
     // One column of the solve: the data bytes at index `i`.
     let solve = |i: usize| -> Vec<u8> {
+        #[cfg(any(test, feature = "testing"))]
+        work::tick();
         (0..k)
             .map(|r| {
                 let mut acc = 0u8;
@@ -217,6 +238,15 @@ pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsErro
         .iter()
         .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize)
         .collect();
+    // THE REBUILT LENGTH IS A STRANGER'S NUMBER. Parity ids are not checkable
+    // by a host, so a writer can list ids of blocks whose bytes it chose; a
+    // keeper repairing that tree would otherwise solve up to 4 GiB of byte
+    // columns before the caller ever gets a block to hash. The caller knows
+    // what kind of member this group holds, so it supplies the ceiling, and it
+    // is checked BEFORE any index past the prefixes is solved.
+    if let Some(&bad) = lens.iter().find(|&&l| l > max_len) {
+        return Err(RsError::MemberTooLong(bad));
+    }
     let end = lens.iter().map(|l| 4 + l).max().unwrap_or(4);
     for i in 4..end {
         for (r, b) in solve(i).into_iter().enumerate() {
@@ -280,6 +310,10 @@ pub enum RsError {
     NotEnough(usize),
     /// Should be unreachable: any k rows of a Cauchy `[I;C]` are independent.
     Singular,
+    /// A rebuilt member claims to be longer than its kind allows. The prefix
+    /// came out of a solve over blocks a stranger may have chosen, so it is a
+    /// claim and is bounded before it costs anything.
+    MemberTooLong(usize),
 }
 
 #[cfg(test)]
@@ -370,7 +404,7 @@ mod tests {
                         let have: Vec<Option<Vec<u8>>> = (0..n)
                             .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
                             .collect();
-                        let got = repair(k, &have).expect("k of k+3 present");
+                        let got = repair(k, &have, usize::MAX).expect("k of k+3 present");
                         assert_eq!(got, data, "k = {k}: lost {a},{b},{c}");
                     }
                 }
@@ -390,7 +424,7 @@ mod tests {
         let have: Vec<Option<Vec<u8>>> = (0..k + PARITY)
             .map(|j| (j >= 4).then(|| all[j].clone()))
             .collect();
-        assert_eq!(repair(k, &have), Err(RsError::NotEnough(k - 1)));
+        assert_eq!(repair(k, &have, usize::MAX), Err(RsError::NotEnough(k - 1)));
         assert_eq!(encode(&[]), Err(RsError::GroupSize(0)));
         assert!(matches!(
             encode(&vec![vec![0u8; 4]; MAX_K + 1]),

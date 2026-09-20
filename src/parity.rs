@@ -52,6 +52,9 @@ pub const MIN_GROUP: usize = 7;
 pub const MAX_GROUP: usize = rs::MAX_K;
 /// Mean group size ≈ 9: after the 7th member, one member in three closes it.
 const CLOSE_THRESHOLD: u32 = (u32::MAX / 3) + 1;
+/// The same value, exposed so a frozen vector can carry it: a constant only
+/// the source knows is a constant nobody reviewing a diff can see move.
+pub const CLOSE_THRESHOLD_FOR_VECTORS: u32 = CLOSE_THRESHOLD;
 
 /// The size classes for referenced values, in bytes — §11's padding classes.
 /// Every Ref value is 1 KiB + 1 .. [`MAX_VALUE`], so these four cover all of
@@ -192,12 +195,26 @@ pub fn encode_group(states: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
 /// `have` holds the blocks as they are STORED: data symbols as `symbol`
 /// produces them, parity trimmed. Each answer is the member's state, its length
 /// taken from its own prefix.
-pub fn repair_group(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    Ok(rs::repair(k, have)?
+/// `max_len` is the largest a member of THIS group may be — the caller knows
+/// which kind it holds, and a rebuilt length is a stranger's number until it is
+/// bounded. [`MAX_MEMBER_VALUE`] and [`MAX_MEMBER_NODE`] are the two.
+pub fn repair_group(
+    k: usize,
+    have: &[Option<Vec<u8>>],
+    max_len: usize,
+) -> Result<Vec<Vec<u8>>, rs::RsError> {
+    Ok(rs::repair(k, have, max_len)?
         .into_iter()
         .map(|s| s[4..].to_vec())
         .collect())
 }
+
+/// The longest state a leaf's parity member can have: a `RAW` block holding a
+/// value at the tree's cap, plus its kind byte.
+pub const MAX_MEMBER_VALUE: usize = 1 + MAX_VALUE;
+/// The longest state a branch's parity member can have: a node at `MAX_NODE`,
+/// plus its kind byte.
+pub const MAX_MEMBER_NODE: usize = 1 + crate::node::MAX_NODE;
 
 /// A member changed: the new parity, from the OLD parity and the two symbols.
 ///
@@ -352,7 +369,10 @@ mod tests {
         let have: Vec<Option<Vec<u8>>> = (0..k + rs::PARITY)
             .map(|j| (!(1..=3).contains(&j)).then(|| all[j].clone()))
             .collect();
-        assert_eq!(repair_group(k, &have).expect("repairable"), states);
+        assert_eq!(
+            repair_group(k, &have, MAX_MEMBER_VALUE).expect("repairable"),
+            states
+        );
     }
 
     /// The delta update equals coding the group from scratch — in place, and
@@ -388,7 +408,10 @@ mod tests {
         // And it repairs: every index reads zero, the prefixes say zero, and
         // the members come back empty.
         let all: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY).map(|_| Some(Vec::new())).collect();
-        assert_eq!(repair_group(4, &all).expect("repairable"), states);
+        assert_eq!(
+            repair_group(4, &all, MAX_MEMBER_VALUE).expect("repairable"),
+            states
+        );
     }
 }
 
@@ -420,13 +443,19 @@ mod repair_cases {
         //    group reaches except the rebuilt length prefix.
         let states: Vec<Vec<u8>> = vec![vec![1u8; 10], vec![2u8; 20], vec![3u8; 500]];
         let (k, all) = blocks(&states);
-        assert_eq!(repair_group(k, &lose(k, &all, &[2])).unwrap(), states);
+        assert_eq!(
+            repair_group(k, &lose(k, &all, &[2]), MAX_MEMBER_VALUE).unwrap(),
+            states
+        );
 
         // 2. BOTH of two equal-longest members lost, which is the case where
         //    the parity tail can cancel while the data is not zero.
         let states: Vec<Vec<u8>> = vec![vec![1u8; 8], vec![5u8; 300], vec![9u8; 300]];
         let (k, all) = blocks(&states);
-        assert_eq!(repair_group(k, &lose(k, &all, &[1, 2])).unwrap(), states);
+        assert_eq!(
+            repair_group(k, &lose(k, &all, &[1, 2]), MAX_MEMBER_VALUE).unwrap(),
+            states
+        );
 
         // 3. A member whose parity tail CANCELLED: two equal-longest members
         //    chosen so the trimmed parity stops short of the data. Constructed,
@@ -443,13 +472,16 @@ mod repair_cases {
             parity.len(),
             4 + states[1].len()
         );
-        assert_eq!(repair_group(k, &lose(k, &all, &[1])).unwrap(), states);
+        assert_eq!(
+            repair_group(k, &lose(k, &all, &[1]), MAX_MEMBER_VALUE).unwrap(),
+            states
+        );
 
         // 4. A PARITY block lost along with two data blocks.
         let states: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8 + 1; 30 + i * 11]).collect();
         let (k, all) = blocks(&states);
         assert_eq!(
-            repair_group(k, &lose(k, &all, &[0, 3, k + 1])).unwrap(),
+            repair_group(k, &lose(k, &all, &[0, 3, k + 1]), MAX_MEMBER_VALUE).unwrap(),
             states
         );
 
@@ -460,6 +492,131 @@ mod repair_cases {
             all.iter().skip(k).all(|p| p.is_empty()),
             "parity must be empty"
         );
-        assert_eq!(repair_group(k, &lose(k, &all, &[0, 1, 2])).unwrap(), states);
+        assert_eq!(
+            repair_group(k, &lose(k, &all, &[0, 1, 2]), MAX_MEMBER_VALUE).unwrap(),
+            states
+        );
+    }
+}
+
+#[cfg(test)]
+mod hostile_repair {
+    use super::*;
+
+    /// **What a hostile group costs a repairer.** Parity ids are not checkable
+    /// by a host, so a writer can list ids of blocks whose bytes it chose; a
+    /// keeper repairing that tree solves whatever the rebuilt prefixes claim.
+    /// Unbounded, a prefix of 4 GiB is four billion byte columns before the
+    /// caller ever gets a block to hash — a stall, from a tree that validated.
+    ///
+    /// Counted, because the verdict is "refused" either way.
+    #[test]
+    fn a_rebuilt_length_past_its_kinds_ceiling_is_refused_after_the_prefixes() {
+        // A group whose symbols say their members are 4 GiB long. Nothing
+        // here is a real block; that is the point — the ids were a stranger's.
+        let huge = u32::MAX as usize;
+        let states: Vec<Vec<u8>> = (0..4)
+            .map(|i| {
+                let mut v = (huge as u32).to_le_bytes().to_vec();
+                v.push(i as u8);
+                v
+            })
+            .collect();
+        let parity = rs::encode(&states).expect("codeable");
+        let all: Vec<Vec<u8>> = states.iter().cloned().chain(parity).collect();
+        let have: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY)
+            .map(|j| (j >= rs::PARITY).then(|| all[j].clone()))
+            .collect();
+
+        rs::work::reset();
+        assert_eq!(
+            rs::repair(4, &have, MAX_MEMBER_VALUE),
+            Err(rs::RsError::MemberTooLong(huge))
+        );
+        assert_eq!(
+            rs::work::columns(),
+            4,
+            "a hostile length was solved past its prefix"
+        );
+
+        // The control: an honest member at the ceiling still repairs, so the
+        // bound is a bound and not a refusal of everything large.
+        let big = vec![0xabu8; MAX_MEMBER_VALUE];
+        let small = vec![1u8, 2, 3];
+        let states = vec![big.clone(), small.clone()];
+        let parity = encode_group(&states).expect("codeable");
+        let all: Vec<Vec<u8>> = states
+            .iter()
+            .map(|s| symbol(s))
+            .chain(parity.iter().cloned())
+            .collect();
+        let have: Vec<Option<Vec<u8>>> = (0..2 + rs::PARITY)
+            .map(|j| (j != 0).then(|| all[j].clone()))
+            .collect();
+        rs::work::reset();
+        assert_eq!(
+            repair_group(2, &have, MAX_MEMBER_VALUE).expect("an honest member at the cap"),
+            states
+        );
+        assert!(
+            rs::work::columns() > MAX_MEMBER_VALUE,
+            "the control must really solve the whole member"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frozen_constants {
+    use super::*;
+
+    /// The close comparison is `<`, at exactly `2³²/3 + 1`.
+    ///
+    /// `group_sizes` is otherwise exercised with synthetic hashes of `0` and
+    /// `u32::MAX`, which cannot tell `<` from `<=` at the threshold. Searching
+    /// for a real key whose grouping hash lands exactly on it is a 2³² search,
+    /// so the comparison is pinned here with injected values instead — and the
+    /// threshold itself is on the vectors' const line, so a change to either
+    /// shows up in two places.
+    #[test]
+    fn the_close_threshold_comparison_is_pinned_at_its_exact_value() {
+        // A run long enough that the FOLD cannot hide the difference: with a
+        // short tail, a group of 7 and a tail of 1 merge back into 8 and both
+        // answers look alike. Nineteen members give 7+12 against 12+7.
+        let run = |seventh: u32| {
+            let mut h = vec![u32::MAX; 6];
+            h.push(seventh);
+            h.extend(std::iter::repeat_n(u32::MAX, 12));
+            group_sizes(&h)
+        };
+        assert_eq!(
+            run(CLOSE_THRESHOLD - 1),
+            vec![7, 12],
+            "a hash one below the threshold must close the group"
+        );
+        assert_eq!(
+            run(CLOSE_THRESHOLD),
+            vec![12, 7],
+            "a hash AT the threshold must not: the comparison is `<`, not `<=`"
+        );
+    }
+
+    /// The class boundaries are inclusive upper bounds, pinned at each edge.
+    #[test]
+    fn the_class_edges_are_where_the_rule_says() {
+        for (i, &c) in CLASSES.iter().enumerate() {
+            assert_eq!(class_of(c), i, "{c} must be the top of class {i}");
+            if i + 1 < CLASSES.len() {
+                assert_eq!(
+                    class_of(c + 1),
+                    i + 1,
+                    "{} must open class {}",
+                    c + 1,
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(class_of(4096), 0);
+        assert_eq!(class_of(4097), 1);
+        assert_eq!(class_of(MAX_VALUE), CLASSES.len() - 1);
     }
 }

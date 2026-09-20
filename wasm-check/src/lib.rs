@@ -255,7 +255,7 @@ pub extern "C" fn parity_len(k: u32) -> u32 {
 /// on the one the vectors were generated on.
 #[no_mangle]
 pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
-    use freenet_prolly::parity::{encode_group, repair_group, symbol};
+    use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
     use freenet_prolly::rs::PARITY;
     let k = k as usize;
     let states = parity_members(k);
@@ -273,7 +273,7 @@ pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
                 let have: Vec<Option<Vec<u8>>> = (0..n)
                     .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
                     .collect();
-                let got = repair_group(k, &have).expect("k of k+3 present");
+                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
                 // If a rebuild differs here, the digest differs and the driver
                 // says so — but assert too, so the failure names the case.
                 assert!(got == states, "repair differs on wasm32");
