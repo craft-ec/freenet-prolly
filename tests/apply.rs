@@ -1088,55 +1088,112 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
         ),
     ];
 
-    for (what, batch) in cases {
-        let mut m = base.clone();
-        let (mut root, mut store) = scratch(splits_after, &m);
-        // Values live in the store too: a leaf's parity is over them.
-        for (k, v) in &m {
-            let _ = k;
-            let (val, block) = freenet_prolly::node::Value::for_bytes(v);
-            let _ = val;
-            if let Some((c, b)) = block {
-                store.insert(c, b);
-            }
-        }
-
-        source::reset();
-        let applied = freenet_prolly::apply::apply_into(&mut store, &root, &batch)
-            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
-        root = applied.root;
-        let (reused, recoded) = (source::reused(), source::recoded());
-
-        for (k, e) in &batch {
-            match e {
-                Edit::Put(v) => {
-                    m.insert(k.clone(), v.clone());
-                }
-                Edit::Delete => {
-                    m.remove(k);
+    // Every case runs twice. With the writer's parity blocks in the store a
+    // one-member change can be CORRECTED; without them the same change must
+    // fall back to a recode. Both passes assert the same bytes, so the fallback
+    // is a negative control that actually executes rather than a comment about
+    // one.
+    for (what, batch) in &cases {
+        let mut counts = Vec::new();
+        for with_parity in [true, false] {
+            let mut m = base.clone();
+            let (mut root, mut store) = scratch(splits_after, &m);
+            // Values live in the store too: a leaf's parity is over them.
+            for (k, v) in &m {
+                let _ = k;
+                let (val, block) = freenet_prolly::node::Value::for_bytes(v);
+                let _ = val;
+                if let Some((c, b)) = block {
+                    store.insert(c, b);
                 }
             }
-        }
-        let (want_root, want_nodes) = scratch(splits_after, &m);
-        assert_eq!(root, want_root, "{what}: the root differs from a rebuild");
 
-        // Block for block, not just the root: identical roots with different
-        // parity ids is impossible, but identical roots are also what a bug
-        // shared by both paths would produce, so the nodes are compared too.
-        for (cid, bytes) in &want_nodes.0 {
-            let got = store
-                .0
-                .get(cid)
-                .unwrap_or_else(|| panic!("{what}: the rebuild's node {cid:?} is missing"));
-            assert_eq!(got, bytes, "{what}: node bytes differ");
+            // The parity BLOCKS a writer would have put after its own commit. The
+            // library lists parity ids and does not emit the bytes, so a writer
+            // that did not keep them has nothing to correct — which is the second
+            // pass.
+            if with_parity {
+                let mut parity_blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
+                for bytes in store.0.values() {
+                    if let Ok(n) = Node::parse(bytes) {
+                        if let Some(ps) = freenet_prolly::parity::blocks_of(&n, &store) {
+                            parity_blocks.extend(ps);
+                        }
+                    }
+                }
+                for (c, b) in parity_blocks {
+                    store.insert(c, &b);
+                }
+            }
+
+            source::reset();
+            let applied = freenet_prolly::apply::apply_into(&mut store, &root, batch)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            root = applied.root;
+            let (reused, delta, recoded) = (source::reused(), source::delta(), source::recoded());
+
+            for (k, e) in batch {
+                match e {
+                    Edit::Put(v) => {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    Edit::Delete => {
+                        m.remove(k);
+                    }
+                }
+            }
+            let (want_root, want_nodes) = scratch(splits_after, &m);
+            assert_eq!(root, want_root, "{what}: the root differs from a rebuild");
+
+            // Block for block, not just the root: identical roots with different
+            // parity ids is impossible, but identical roots are also what a bug
+            // shared by both paths would produce, so the nodes are compared too.
+            for (cid, bytes) in &want_nodes.0 {
+                let got = store
+                    .0
+                    .get(cid)
+                    .unwrap_or_else(|| panic!("{what}: the rebuild's node {cid:?} is missing"));
+                assert_eq!(got, bytes, "{what}: node bytes differ");
+            }
+
+            // And reuse must actually have happened, or the equality above is the
+            // equality of two recodes and this test is about nothing.
+            assert!(
+                reused > 0,
+                "{what}: no group was reused ({reused} reused, {recoded} recoded)"
+            );
+            // And the delta path is the point of the first pass; without this the
+            // two passes could be the same run twice.
+            if with_parity {
+                assert!(
+                delta > 0,
+                "{what}: the old parity was there and no group was corrected ({reused} reused, {delta} delta, {recoded} recoded)"
+            );
+            } else {
+                assert_eq!(
+                    delta, 0,
+                    "{what}: no old parity block exists, yet a group claimed to correct one"
+                );
+            }
+            let held = if with_parity {
+                "parity held"
+            } else {
+                "no parity  "
+            };
+            println!("  {held}  {reused:3} reused, {delta:3} delta, {recoded:3} recoded  {what}");
+            counts.push((reused, delta, recoded));
         }
 
-        // And reuse must actually have happened, or the equality above is the
-        // equality of two recodes and this test is about nothing.
-        assert!(
-            reused > 0,
-            "{what}: no group was reused ({reused} reused, {recoded} recoded)"
+        // The two passes must differ in exactly one way: the groups the first
+        // CORRECTED are the groups the second RE-CODED. Equal reuse, and equal
+        // work overall, is what says the fallback caught precisely the delta
+        // path's groups and did not quietly widen or narrow.
+        let ((r0, d0, c0), (r1, d1, c1)) = (counts[0], counts[1]);
+        assert_eq!(r0, r1, "{what}: reuse should not depend on holding parity");
+        assert_eq!(
+            d0 + c0,
+            d1 + c1,
+            "{what}: {d0} corrected + {c0} recoded, but without parity {d1} + {c1}"
         );
-        println!("  {reused:3} reused, {recoded:3} recoded  {what}");
     }
 }

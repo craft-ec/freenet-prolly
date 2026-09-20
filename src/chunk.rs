@@ -84,20 +84,28 @@ pub mod source {
     use core::cell::Cell;
     thread_local! {
         static REUSED: Cell<usize> = const { Cell::new(0) };
+        static DELTA: Cell<usize> = const { Cell::new(0) };
         static RECODED: Cell<usize> = const { Cell::new(0) };
     }
     pub fn reused() -> usize {
         REUSED.with(|n| n.get())
+    }
+    pub fn delta() -> usize {
+        DELTA.with(|n| n.get())
     }
     pub fn recoded() -> usize {
         RECODED.with(|n| n.get())
     }
     pub fn reset() {
         REUSED.with(|n| n.set(0));
+        DELTA.with(|n| n.set(0));
         RECODED.with(|n| n.set(0));
     }
     pub(super) fn tick_reused() {
         REUSED.with(|n| n.set(n.get() + 1));
+    }
+    pub(super) fn tick_delta() {
+        DELTA.with(|n| n.set(n.get() + 1));
     }
     pub(super) fn tick_recoded() {
         RECODED.with(|n| n.set(n.get() + 1));
@@ -161,6 +169,17 @@ impl Run {
                 source::tick_reused();
                 return Ok(ids);
             }
+            // One member changed in place: the correction needs only that
+            // member's two versions and the three old parity BLOCKS. If any of
+            // them is not to hand, fall through and recode — never produce
+            // parity that does not cover what it claims.
+            if let Some((pos, was, old_ids)) = idx.one_off(self.class, members) {
+                if let Some(ids) = self.delta(leaf, blocks, members, pos, was, old_ids)? {
+                    #[cfg(any(test, feature = "testing"))]
+                    source::tick_delta();
+                    return Ok(ids);
+                }
+            }
         }
         #[cfg(any(test, feature = "testing"))]
         source::tick_recoded();
@@ -174,6 +193,45 @@ impl Run {
             block_id(kind::PARITY, &parity[1]),
             block_id(kind::PARITY, &parity[2]),
         ])
+    }
+
+    /// Correct a group's parity for a single member changing in place.
+    ///
+    /// `None` when the old parity blocks are not available: the caller recodes.
+    fn delta(
+        &self,
+        leaf: bool,
+        blocks: &dyn crate::store::Blocks,
+        members: &[Cid],
+        pos: usize,
+        was: Cid,
+        old_ids: [Cid; crate::rs::PARITY],
+    ) -> Result<Option<[Cid; crate::rs::PARITY]>, BuildError> {
+        let mut old_parity = Vec::with_capacity(crate::rs::PARITY);
+        for id in &old_ids {
+            match blocks.get(id) {
+                Some(b) => old_parity.push(b.to_vec()),
+                // A parity block that was never put, or has been dropped. The
+                // fallback is a recode, never "no parity".
+                None => return Ok(None),
+            }
+        }
+        let Some(old_state) = blocks.get(&was).map(|b| {
+            let mut st = Vec::with_capacity(1 + b.len());
+            st.push(if leaf { kind::RAW } else { kind::TREE_NODE });
+            st.extend_from_slice(b);
+            st
+        }) else {
+            return Ok(None);
+        };
+        let new_state = Run::state(blocks, leaf, &members[pos])?;
+        let parity = crate::parity::update_group(&old_parity, pos, &old_state, &new_state)
+            .map_err(|_| BuildError::NodeTooLarge)?;
+        Ok(Some([
+            block_id(kind::PARITY, &parity[0]),
+            block_id(kind::PARITY, &parity[1]),
+            block_id(kind::PARITY, &parity[2]),
+        ]))
     }
 }
 
