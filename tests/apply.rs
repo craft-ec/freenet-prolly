@@ -47,6 +47,17 @@ fn value_of(v: &[u8]) -> Value<'_> {
 /// that restated the rule could drift from it, and then this gate would be
 /// comparing two implementations of one mistake.
 fn scratch(rule: SplitRule, m: &Map) -> (Cid, MemBlocks) {
+    let (root, nodes, _) = scratch_with_parity(rule, m);
+    (root, nodes)
+}
+
+/// The same build, keeping the parity blocks it coded.
+///
+/// This is what a writer that stores the tree has to hand: the bytes behind
+/// the parity ids its nodes list. Nothing else can produce them -- which is
+/// why a test that wants a tree WITH its redundancy present has to build it
+/// this way rather than recompute it on the side.
+fn scratch_with_parity(rule: SplitRule, m: &Map) -> (Cid, MemBlocks, Vec<(Cid, Vec<u8>)>) {
     let mut nodes = MemBlocks::default();
     let mut t = TreeBuilder::with_rule(rule, |c, b: &[u8]| {
         // Only the NODES: this oracle is about the tree's shape, and everything
@@ -58,7 +69,8 @@ fn scratch(rule: SplitRule, m: &Map) -> (Cid, MemBlocks) {
     for (k, v) in m {
         t.push_bytes(k, v).unwrap();
     }
-    (t.finish().unwrap(), nodes)
+    let (root, parity) = t.finish_with_parity().unwrap();
+    (root, nodes, parity)
 }
 
 /// A block source that records what was read.
@@ -1039,12 +1051,14 @@ fn twenty_thousand_appends_one_at_a_time() {
 /// with no membership change, an insert that shifts a group boundary and one
 /// that does not, a delete, a value crossing a size class, and a short tail
 /// folding and unfolding.
-#[test]
-fn reuse_gives_the_same_bytes_as_coding_every_group() {
-    use freenet_prolly::chunk::source;
-
-    // Values large enough to be stored by REFERENCE, so the leaves carry parity
-    // and the leaf grouping (by size class) is exercised, not only the branches.
+/// The case list PR B (#40) established, and the fixture behind it: values
+/// large enough to be stored by REFERENCE, so the leaves carry parity and the
+/// leaf grouping (by size class) is exercised, not only the branches.
+///
+/// Shared rather than copied, so a case added for one property is tested by
+/// the other. Each case is a label and the batch it applies.
+type Case = (&'static str, Vec<(Vec<u8>, Edit)>);
+fn reuse_cases() -> (Map, Vec<Case>) {
     let big = |n: usize, b: u8| vec![b; n];
     let mut base: Map = dataset(11, 900).into_iter().collect();
     for (i, (_, v)) in base.iter_mut().enumerate() {
@@ -1057,10 +1071,6 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
     before_mid.push(0);
     let mut fresh = keys[3].clone();
     fresh.push(7);
-
-    // Named so the list reads as what it is: each case is a label and the
-    // batch that case applies.
-    type Case = (&'static str, Vec<(Vec<u8>, Edit)>);
     let cases: Vec<Case> = vec![
         (
             "an update beneath a child, no membership change",
@@ -1087,6 +1097,14 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
                 .collect(),
         ),
     ];
+    (base, cases)
+}
+
+#[test]
+fn reuse_gives_the_same_bytes_as_coding_every_group() {
+    use freenet_prolly::chunk::source;
+
+    let (base, cases) = reuse_cases();
 
     // Every case runs twice. With the writer's parity blocks in the store a
     // one-member change can be CORRECTED; without them the same change must
@@ -1097,7 +1115,7 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
         let mut counts = Vec::new();
         for with_parity in [true, false] {
             let mut m = base.clone();
-            let (mut root, mut store) = scratch(splits_after, &m);
+            let (mut root, mut store, owed) = scratch_with_parity(splits_after, &m);
             // Values live in the store too: a leaf's parity is over them.
             for (k, v) in &m {
                 let _ = k;
@@ -1113,16 +1131,12 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
             // that did not keep them has nothing to correct — which is the second
             // pass.
             if with_parity {
-                let mut parity_blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
-                for bytes in store.0.values() {
-                    if let Ok(n) = Node::parse(bytes) {
-                        if let Some(ps) = freenet_prolly::parity::blocks_of(&n, &store) {
-                            parity_blocks.extend(ps);
-                        }
-                    }
-                }
-                for (c, b) in parity_blocks {
-                    store.insert(c, &b);
+                // Exactly what the BUILDER reported, put the way an engine
+                // would put it. Not a recomputation on the side: the point is
+                // that a writer which puts what it was handed can then correct
+                // its parity, and one that drops them cannot.
+                for (c, b) in &owed {
+                    store.insert(*c, b);
                 }
             }
 
@@ -1194,6 +1208,140 @@ fn reuse_gives_the_same_bytes_as_coding_every_group() {
             d0 + c0,
             d1 + c1,
             "{what}: {d0} corrected + {c0} recoded, but without parity {d1} + {c1}"
+        );
+    }
+}
+
+/// Every parity block a rewrite reports is one the new tree lists, and every
+/// group the new tree lists has its parity either reported now or published
+/// already.
+///
+/// Both halves matter and they fail in opposite directions. A block reported
+/// that no node lists is a PUT the engine pays for redundancy over a node that
+/// is not in the tree — a rewrite closes nodes at one level that a later level
+/// then drops, and the parity goes with them. A group listed whose parity is
+/// neither reported nor already out is the reverse: a node promising
+/// redundancy that exists nowhere, which nothing downstream can detect,
+/// because the ids are there and look exactly like ids whose blocks were put.
+#[test]
+fn reported_parity_is_exactly_what_the_new_tree_lists() {
+    use freenet_prolly::chunk::source;
+    let (base, mut cases) = reuse_cases();
+    // PR B's list plus the one shape that DROPS a node after its parity has
+    // been coded: deleting nearly everything collapses the upper levels to
+    // single-child branches, and step 5 throws them away. Without it the
+    // "no wasted PUT" half of this test passes whatever the code does --
+    // verified, by a mutant that reports every coded block unfiltered and
+    // survives the other six cases.
+    let keys: Vec<Vec<u8>> = base.keys().cloned().collect();
+    cases.push((
+        "a delete that collapses the tree",
+        keys.iter().skip(2).map(|k| del(k)).collect(),
+    ));
+
+    for (what, batch) in &cases {
+        let (root, mut store) = scratch(splits_after, &base);
+        for v in base.values() {
+            let (_, block) = freenet_prolly::node::Value::for_bytes(v);
+            if let Some((c, b)) = block {
+                store.insert(c, b);
+            }
+        }
+        // What the OLD tree already listed. Those groups' parity is out (or
+        // owed from an earlier commit); a group carried through the rewrite
+        // unchanged is not this rewrite's debt.
+        let mut already: HashSet<Cid> = HashSet::new();
+        for bytes in store.0.values() {
+            if let Ok(n) = Node::parse(bytes) {
+                already.extend(n.parity());
+            }
+        }
+
+        // The nodes this rewrite emits, taken from the sink rather than from
+        // the store, so a node that was dropped is not mistaken for one that
+        // was kept.
+        let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
+        source::reset();
+        let applied = freenet_prolly::apply::apply_with(
+            Options::default(),
+            &store,
+            &root,
+            batch,
+            |c, b: &[u8]| emitted.push((c, b.to_vec())),
+        )
+        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+
+        let mut listed: HashSet<Cid> = HashSet::new();
+        let mut n_nodes = 0;
+        for (_, bytes) in &emitted {
+            if let Ok(n) = Node::parse(bytes) {
+                n_nodes += 1;
+                listed.extend(n.parity());
+            }
+        }
+        assert!(n_nodes > 0, "{what}: the rewrite emitted no nodes");
+
+        // A reported block must BE its id. Nothing downstream re-derives this:
+        // the engine puts the bytes under the id it was handed.
+        let mut reported: HashSet<Cid> = HashSet::new();
+        for (id, bytes) in &applied.parity {
+            assert_eq!(
+                *id,
+                freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes),
+                "{what}: a reported parity block does not hash to its id"
+            );
+            assert!(
+                reported.insert(*id),
+                "{what}: parity block {id:?} reported twice — two PUTs for one block"
+            );
+        }
+
+        // No more: nothing reported that no node lists.
+        for id in &reported {
+            assert!(
+                listed.contains(id),
+                "{what}: reported a parity block no new node lists — a wasted PUT"
+            );
+        }
+        // No fewer: nothing listed without its parity either reported now or
+        // out already.
+        let gaps: Vec<&Cid> = listed
+            .iter()
+            .filter(|id| !reported.contains(*id) && !already.contains(*id))
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "{what}: {} group(s) list parity that exists nowhere and nobody owes",
+            gaps.len()
+        );
+        assert!(
+            !applied.parity.is_empty(),
+            "{what}: nothing was reported at all, so neither half above was tested"
+        );
+
+        // The tripwire. A rewrite reports the parity of the nodes it KEEPS, so
+        // a node closed and then dropped takes its parity with it. That filter
+        // has never been observed to remove anything -- not here, and not
+        // anywhere in this suite, including the randomised edit sequences and
+        // `deleting_everything_but_an_untouched_node_makes_that_node_the_root`.
+        // It is asserted rather than assumed so that the day a case reaches
+        // it, this says so, instead of the filter mattering for the first time
+        // in production.
+        //
+        // If this fires it is NOT a defect: it means the guard earned its
+        // keep. Record the case and relax the assertion to name it.
+        assert_eq!(
+            source::filtered(),
+            0,
+            "{what}: {} coded parity block(s) were withheld -- the kept-nodes \
+             filter is no longer a formality, which no case has reached before",
+            source::filtered()
+        );
+
+        println!(
+            "  {:3} reported, {:3} listed by {n_nodes} new node(s)  {what}",
+            applied.parity.len(),
+            listed.len()
         );
     }
 }

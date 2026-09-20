@@ -36,6 +36,10 @@ struct Level {
     closed: usize,
 }
 
+/// Parity blocks with their ids: what a writer must PUT so the redundancy its
+/// nodes promise actually exists.
+pub type ParityBlocks = Vec<(Cid, Vec<u8>)>;
+
 /// Streaming tree builder. Closed nodes are handed to `sink` as `(cid, bytes)`.
 pub struct TreeBuilder<F: FnMut(Cid, &[u8])> {
     /// Every block this build has produced or been handed, so a parity member
@@ -144,23 +148,55 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
     }
 
     /// Close every level and return the root's cid.
-    pub fn finish(mut self) -> Result<Cid, TreeError> {
+    ///
+    /// The parity blocks this build coded are DROPPED. That is right for a
+    /// caller building a tree it is not going to store — a fixture, an oracle,
+    /// a comparison — and wrong for one that is: the nodes it just took name
+    /// parity ids whose bytes now exist nowhere, so every group of the new
+    /// tree has no redundancy until someone codes it again. A caller that
+    /// stores the tree wants [`TreeBuilder::finish_with_parity`].
+    pub fn finish(self) -> Result<Cid, TreeError> {
+        self.finish_with_parity().map(|(root, _)| root)
+    }
+
+    /// Close every level, returning the root's cid and the parity blocks the
+    /// build coded.
+    ///
+    /// Separate from the sink, and returned rather than streamed, because the
+    /// order is the caller's decision: data nodes, then the head, then parity
+    /// (ARCHITECTURE §7). Every group of a fresh tree is coded — there is no
+    /// older tree to reuse from — so this is three blocks per group.
+    pub fn finish_with_parity(mut self) -> Result<(Cid, ParityBlocks), TreeError> {
         if self.poisoned {
             return Err(TreeError::Poisoned);
         }
         if self.levels.is_empty() {
             let leaf = empty_leaf();
             (self.sink)(leaf.cid, &leaf.bytes);
-            return Ok(leaf.cid);
+            // The empty leaf has no members, so no group and no parity.
+            return Ok((leaf.cid, Vec::new()));
         }
+        // A chunker holds what it coded until it is drained, so each level is
+        // drained once, after its own finish — and the levels above the one
+        // that produced the root are drained at the end, since the loop never
+        // reaches them.
+        let mut parity: ParityBlocks = Vec::new();
         let mut l = 0;
         loop {
             let mut done = Vec::new();
             self.levels[l].chunker.finish(&self.seen, &mut done)?;
+            parity.extend(self.levels[l].chunker.take_coded());
             self.closed(l, done)?;
             let lv = &mut self.levels[l];
             if lv.closed == 1 {
-                return Ok(lv.first.take().expect("held back").cid);
+                let root = lv.first.take().expect("held back").cid;
+                // The levels above this one were never reached, but a level
+                // that closed nodes earlier in the loop has already been
+                // drained; only the ones after `l` can still hold anything.
+                for lv in self.levels.iter_mut().skip(l + 1) {
+                    parity.extend(lv.chunker.take_coded());
+                }
+                return Ok((root, parity));
             }
             l += 1;
         }
