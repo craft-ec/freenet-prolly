@@ -175,13 +175,10 @@ pub fn check_node(node: &Node<'_>) -> Result<(), BoundaryError> {
         }
         s = after;
     }
-    // `check_parity` is NOT called here yet, and that is deliberate. It
-    // requires `pcount == 3 · groups(entries)`, so every node would need
-    // parity — and the writer cannot emit it until `TreeBuilder` can reach a
-    // pushed `Ref`'s bytes (freenet-prolly#19). Wiring the call in before the
-    // writer can satisfy it would make the library unable to build a tree at
-    // all. It lands in the same change as the writer.
-    Ok(())
+    // Last, because it walks the keys again and the entry checks above are the
+    // cheaper refusals: a node that is mis-cut or oversized is refused without
+    // paying for the grouping hashes.
+    check_parity(node)
 }
 
 /// The reserve arithmetic, derived here rather than asserted from memory.

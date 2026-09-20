@@ -464,7 +464,12 @@ pub enum BuildError {
     ValueTooShort,
     TooManyEntries,
     NodeTooLarge,
-    /// A value was pushed to a branch, or a child to a leaf, or parity to a leaf.
+    /// A parity member's bytes could not be found, so its group cannot be
+    /// coded. The cid is carried so a caller with a remote store can FETCH it
+    /// and try again: refusing outright is right only when the bytes can never
+    /// arrive, which is a build with no base store.
+    MissingMember(Cid),
+    /// A value was pushed to a branch, or a child to a leaf.
     WrongKind,
     Overflow,
 }
@@ -658,10 +663,9 @@ impl NodeBuilder {
         Ok(())
     }
 
+    /// A leaf carries parity too now — over the values it stores by reference —
+    /// so the level no longer decides whether an id may be added.
     pub fn push_parity(&mut self, cid: Cid) -> Result<(), BuildError> {
-        if self.level == 0 {
-            return Err(BuildError::WrongKind);
-        }
         if self.parity.len() >= u16::MAX as usize || self.encoded_bound() + REF_LEN > MAX_NODE {
             return Err(BuildError::NodeTooLarge);
         }

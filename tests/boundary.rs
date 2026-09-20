@@ -172,6 +172,10 @@ fn a_rejected_push_does_not_change_the_root() {
                 ];
                 rejected += bad.iter().filter(|r| r.is_err()).count();
             }
+            // The builder codes a referenced value into its leaf's parity, so
+            // it must have been handed the bytes. A `Ref` it never saw is
+            // refused — which is the point, not an obstacle.
+            t.see(cid, &vec![0xab; 9000]);
             t.push(k, Value::Ref { cid, len: 9000 }).unwrap();
         }
         (t.finish().unwrap(), rejected)

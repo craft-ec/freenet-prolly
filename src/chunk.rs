@@ -42,6 +42,68 @@ impl Entry {
     }
 }
 
+/// The parity a node owes, accumulated as its members arrive.
+///
+/// **Bounded by design.** A group can still gain members while it is the last
+/// one in its run — that is the fold rule — so the states of at most the last
+/// closed group and the open one are held, per class. Everything earlier is
+/// encoded and dropped as soon as a later group closes and proves it final:
+/// `4 classes × 2 groups × 12 members × 256 KiB ≈ 24 MB` worst case, and a few
+/// hundred kilobytes in any real tree. Buffering whole leaves would be ≈ 70 MB.
+///
+/// The grouping itself is [`crate::parity::group_sizes`] — the SAME function
+/// `check_parity` uses. A writer with its own copy of the rule is the one way
+/// this could drift into producing nodes the format refuses.
+#[derive(Default)]
+struct Run {
+    /// One per member, in key order. Four bytes each, so keeping all of them
+    /// costs nothing and removes any need to re-derive the grouping.
+    hashes: Vec<u32>,
+    /// States for the members not yet encoded: the tail of `hashes`.
+    held: Vec<Vec<u8>>,
+    encoded: usize,
+    ids: Vec<Cid>,
+}
+
+impl Run {
+    fn push(&mut self, h: u32, state: Vec<u8>) -> Result<(), BuildError> {
+        self.hashes.push(h);
+        self.held.push(state);
+        // Every group but the last is final: only the last can still fold.
+        let sizes = crate::parity::group_sizes(&self.hashes);
+        let settled: usize = sizes[..sizes.len().saturating_sub(1)].iter().sum();
+        self.encode_to(settled, &sizes)
+    }
+
+    fn finish(&mut self) -> Result<Vec<Cid>, BuildError> {
+        let sizes = crate::parity::group_sizes(&self.hashes);
+        self.encode_to(self.hashes.len(), &sizes)?;
+        Ok(std::mem::take(&mut self.ids))
+    }
+
+    /// Encode whole groups until `members` of the run have been coded.
+    fn encode_to(&mut self, members: usize, sizes: &[usize]) -> Result<(), BuildError> {
+        let mut at = 0usize;
+        for &size in sizes {
+            if at + size > members {
+                break;
+            }
+            at += size;
+            if at <= self.encoded {
+                continue;
+            }
+            let parity = crate::parity::encode_group(&self.held[..size])
+                .map_err(|_| BuildError::NodeTooLarge)?;
+            for p in &parity {
+                self.ids.push(block_id(kind::PARITY, p));
+            }
+            self.held.drain(..size);
+            self.encoded = at;
+        }
+        Ok(())
+    }
+}
+
 /// A node that has been closed.
 #[derive(Clone, Debug)]
 pub struct Closed {
@@ -68,6 +130,9 @@ pub struct LevelChunker {
     level: u8,
     rule: SplitRule,
     open: NodeBuilder,
+    /// The open node's parity. A branch has one run over its children; a leaf
+    /// one per size class, since its members are grouped by class first.
+    runs: Vec<Run>,
 }
 
 fn new_node(level: u8) -> NodeBuilder {
@@ -84,6 +149,7 @@ impl LevelChunker {
             level,
             rule,
             open: new_node(level),
+            runs: Vec::new(),
         }
     }
 
@@ -95,10 +161,18 @@ impl LevelChunker {
 
     /// Add the next entry (keys strictly increasing; the caller has validated
     /// it). Nodes this closes are appended to `out`.
+    /// Add an entry.
+    ///
+    /// `blocks` is where a parity member's bytes come from: every child of a
+    /// branch, every referenced value of a leaf. An inline value is not a
+    /// member of anything. A member whose bytes cannot be found is REFUSED —
+    /// coding it as absent would produce a node whose parity does not protect
+    /// what it claims to.
     pub fn push(
         &mut self,
         key: &[u8],
         body: &Body,
+        blocks: &dyn crate::store::Blocks,
         out: &mut Vec<Closed>,
     ) -> Result<(), BuildError> {
         let cost = match body {
@@ -116,6 +190,26 @@ impl LevelChunker {
         if self.open.logical_len() + cost > boundary::MAX_LOGICAL {
             self.close(out)?;
         }
+        // The member's bytes are fetched BEFORE anything is mutated: a refused
+        // entry must leave the chunker exactly as it was, and a miss here is a
+        // refusal (or, for a caller with a store to fetch from, a Need).
+        let member = match body {
+            Body::Inline(_) => None,
+            Body::Ref { cid, len } => {
+                Some((crate::parity::class_of(*len as usize), kind::RAW, *cid))
+            }
+            Body::Child { cid, .. } => Some((0, kind::TREE_NODE, *cid)),
+        };
+        let state = match member {
+            None => None,
+            Some((class, k, cid)) => {
+                let bytes = blocks.get(&cid).ok_or(BuildError::MissingMember(cid))?;
+                let mut st = Vec::with_capacity(1 + bytes.len());
+                st.push(k);
+                st.extend_from_slice(bytes);
+                Some((class, st))
+            }
+        };
         let before = self.open.logical_len();
         match body {
             Body::Inline(b) => self.open.push(key, Value::Inline(b))?,
@@ -127,6 +221,10 @@ impl LevelChunker {
                 },
             )?,
             Body::Child { cid, agg } => self.open.push_child(key, *cid, *agg)?,
+        }
+        if let Some((class, st)) = state {
+            let h = crate::parity::group_hash_parts(self.level, key, &[]);
+            self.run(class).push(h, st)?;
         }
         if (self.rule)(self.level, key, before, self.open.logical_len()) {
             self.close(out)?;
@@ -142,8 +240,22 @@ impl LevelChunker {
         Ok(())
     }
 
+    fn run(&mut self, class: usize) -> &mut Run {
+        while self.runs.len() <= class {
+            self.runs.push(Run::default());
+        }
+        &mut self.runs[class]
+    }
+
     fn close(&mut self, out: &mut Vec<Closed>) -> Result<(), BuildError> {
-        let done = std::mem::replace(&mut self.open, new_node(self.level));
+        let mut done = std::mem::replace(&mut self.open, new_node(self.level));
+        // Ids in the order the format requires: class ascending, group order
+        // within a class.
+        for run in std::mem::take(&mut self.runs).iter_mut() {
+            for id in run.finish()? {
+                done.push_parity(id)?;
+            }
+        }
         let min_key = done.min_key().unwrap_or_default().to_vec();
         let agg = done.agg();
         let bytes = done.finish()?;

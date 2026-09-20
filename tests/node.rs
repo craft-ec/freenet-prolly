@@ -141,7 +141,9 @@ fn builder_refuses_disorder_and_wrong_kinds() {
         b.push_child(b"c", [0; 32], Agg::default()),
         Err(BuildError::WrongKind)
     );
-    assert_eq!(b.push_parity([0; 32]), Err(BuildError::WrongKind));
+    // A LEAF may carry parity now — it protects the values it stores by
+    // reference — so the level no longer decides whether an id may be added.
+    assert_eq!(b.push_parity([0; 32]), Ok(()));
     let mut br = NodeBuilder::branch(1);
     assert_eq!(
         br.push(b"a", Value::Inline(b"")),

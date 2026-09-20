@@ -43,6 +43,18 @@ pub enum ApplyError {
     Node(BuildError),
 }
 
+impl ApplyError {
+    /// A missing parity member is a READ, not a malformed tree: the caller
+    /// fetches it and calls again, exactly as for a missing node. Only a build
+    /// with no store to fetch from turns it into a refusal.
+    fn from_build(e: BuildError) -> Self {
+        match e {
+            BuildError::MissingMember(cid) => ApplyError::Read(ReadError::Need(vec![cid])),
+            other => ApplyError::Node(other),
+        }
+    }
+}
+
 impl From<ReadError> for ApplyError {
     fn from(e: ReadError) -> Self {
         ApplyError::Read(e)
@@ -111,6 +123,7 @@ fn rewrite_level<B: Blocks>(
     root: &Cid,
     floor: u8,
     edits: &LevelEdits,
+    overlay: &mut crate::store::Overlay<'_, B>,
     opts: Options,
 ) -> Result<LevelResult, ApplyError> {
     let rule = opts.rule;
@@ -120,6 +133,10 @@ fn rewrite_level<B: Blocks>(
         whole: true,
         effective: vec![false; edits.len()],
     };
+    // How much of `res.new` the overlay has already been told about. A branch's
+    // parity members are the children this same rebuild just closed, so they
+    // have to be readable the moment the level above asks for them.
+    let mut synced = 0usize;
     let mut i = 0;
     let mut reached_end = false;
     // Smallest key of the node after the last one streamed.
@@ -130,11 +147,17 @@ fn rewrite_level<B: Blocks>(
             let mut chunker = LevelChunker::new(floor, rule);
             for (n, (key, body)) in edits.iter().enumerate() {
                 if let Some(body) = body {
-                    chunker.push(key, body, &mut res.new)?;
+                    chunker
+                        .push(key, body, overlay, &mut res.new)
+                        .map_err(ApplyError::from_build)?;
+                    sync(overlay, &res.new, &mut synced);
                     res.effective[n] = true;
                 }
             }
-            chunker.finish(&mut res.new)?;
+            chunker
+                .finish(&mut res.new)
+                .map_err(ApplyError::from_build)?;
+            sync(overlay, &res.new, &mut synced);
             return Ok(res);
         };
         // A node closed by the hard limit ended because of the entry AFTER it.
@@ -183,11 +206,17 @@ fn rewrite_level<B: Blocks>(
                 match (have, edit) {
                     (None, None) => break,
                     (Some(e), Some((k, _))) if e.key < *k => {
-                        chunker.push(&e.key, &e.body, &mut res.new)?;
+                        chunker
+                            .push(&e.key, &e.body, overlay, &mut res.new)
+                            .map_err(ApplyError::from_build)?;
+                        sync(overlay, &res.new, &mut synced);
                         j += 1;
                     }
                     (Some(e), None) => {
-                        chunker.push(&e.key, &e.body, &mut res.new)?;
+                        chunker
+                            .push(&e.key, &e.body, overlay, &mut res.new)
+                            .map_err(ApplyError::from_build)?;
+                        sync(overlay, &res.new, &mut synced);
                         j += 1;
                     }
                     (have, Some((k, body))) => {
@@ -195,7 +224,10 @@ fn rewrite_level<B: Blocks>(
                         let old_body = have.filter(|_| same_key).map(|e| e.body);
                         res.effective[i] = old_body.as_ref() != body.as_ref();
                         if let Some(body) = body {
-                            chunker.push(k, body, &mut res.new)?;
+                            chunker
+                                .push(k, body, overlay, &mut res.new)
+                                .map_err(ApplyError::from_build)?;
+                            sync(overlay, &res.new, &mut synced);
                         }
                         if same_key {
                             j += 1;
@@ -205,7 +237,10 @@ fn rewrite_level<B: Blocks>(
                 }
             }
             if upper.is_none() {
-                chunker.finish(&mut res.new)?;
+                chunker
+                    .finish(&mut res.new)
+                    .map_err(ApplyError::from_build)?;
+                sync(overlay, &res.new, &mut synced);
                 reached_end = true;
                 break;
             }
@@ -225,6 +260,14 @@ fn rewrite_level<B: Blocks>(
 }
 
 /// Ids of every node of the tree at `root` above `floor`.
+/// Tell the overlay about every node closed since the last call.
+fn sync<B: Blocks>(overlay: &mut crate::store::Overlay<'_, B>, new: &[Closed], synced: &mut usize) {
+    for c in &new[*synced..] {
+        overlay.put(c.cid, &c.bytes);
+    }
+    *synced = new.len();
+}
+
 fn nodes_above<B: Blocks>(blocks: &B, root: &Cid, floor: u8) -> Result<Vec<Cid>, ReadError> {
     let mut out = Vec::new();
     let mut todo = vec![(*root, load(blocks, root)?)];
@@ -301,6 +344,10 @@ pub fn apply_with<B: Blocks>(
     // 2. The library owns the inline-or-reference decision, in one place:
     //    `Value::for_bytes`. A caller building the same tree by hand calls the
     //    same function, so an oracle cannot drift from the rule.
+    // Fresh blocks first, the caller's store second: a branch's parity members
+    // are the children this rebuild just closed, and those are not in the
+    // caller's store until it inserts what the sink gave it.
+    let mut overlay = crate::store::Overlay::new(Some(blocks));
     let mut values: Vec<Option<(Cid, &[u8])>> = Vec::with_capacity(edits.len());
     let mut level: LevelEdits = Vec::with_capacity(edits.len());
     for (key, edit) in edits {
@@ -313,6 +360,13 @@ pub fn apply_with<B: Blocks>(
         };
         values.push(block);
         level.push((key.clone(), body));
+    }
+    // The values this call is writing must be readable as parity members
+    // before the leaf that references them is coded — they are not in the
+    // caller's store yet, and will not be until it inserts what the sink gave
+    // it. An OLD value that a leaf still references comes from the store.
+    for (cid, bytes) in values.iter().flatten() {
+        overlay.put(*cid, bytes);
     }
     // 3. Name every missing block the edits already point at, in one go.
     let mut need: Vec<Cid> = Vec::new();
@@ -351,7 +405,7 @@ pub fn apply_with<B: Blocks>(
     let mut new_root = *root;
     let mut floor: u8 = 0;
     loop {
-        let r = rewrite_level(blocks, root, floor, &level, opts)?;
+        let r = rewrite_level(blocks, root, floor, &level, &mut overlay, opts)?;
         if floor == 0 {
             value_blocks = values
                 .iter()

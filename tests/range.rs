@@ -41,7 +41,11 @@ fn scratch(m: &Map) -> (Cid, MemBlocks) {
     let mut store = MemBlocks::default();
     let mut t = TreeBuilder::new(|c, b: &[u8]| store.insert(c, b));
     for (k, v) in m {
-        t.push(k, value_of(v)).unwrap();
+        // `push_bytes` hands the builder the value AND registers it, so a
+        // referenced value can be coded into its leaf's parity. Building the
+        // `Ref` by hand and pushing it would be refused, which is the rule
+        // doing its job.
+        t.push_bytes(k, v).unwrap();
     }
     let root = t.finish().unwrap();
     for v in m.values() {
