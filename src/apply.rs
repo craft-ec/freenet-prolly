@@ -155,7 +155,7 @@ fn rewrite_level<B: Blocks>(
                 }
             }
             chunker
-                .finish(&mut res.new)
+                .finish(overlay, &mut res.new)
                 .map_err(ApplyError::from_build)?;
             sync(overlay, &res.new, &mut synced);
             return Ok(res);
@@ -188,6 +188,11 @@ fn rewrite_level<B: Blocks>(
         let mut chunker = LevelChunker::new(floor, rule);
         loop {
             let node = *cur.node();
+            // This node is being replaced, so its groups are available to the
+            // nodes that replace it: parity is a pure function of a group's
+            // members, so a group that survives the rewrite needs no recoding
+            // and its ids are already stored.
+            chunker.replacing(&node);
             let upper = cur.next_min_key();
             res.old.push((
                 cur.id(),
@@ -238,7 +243,7 @@ fn rewrite_level<B: Blocks>(
             }
             if upper.is_none() {
                 chunker
-                    .finish(&mut res.new)
+                    .finish(overlay, &mut res.new)
                     .map_err(ApplyError::from_build)?;
                 sync(overlay, &res.new, &mut synced);
                 reached_end = true;
