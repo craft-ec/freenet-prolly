@@ -11,3 +11,11 @@ blake3 = "1"
 
 [profile.test]
 opt-level = 2
+
+[features]
+# The grouping-work counter, for the tests and for wasm-check. Off by default,
+# so no contract pays a counter tick per member.
+testing = []
+
+[dev-dependencies]
+freenet-prolly = { path = ".", features = ["testing"] }

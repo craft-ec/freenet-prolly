@@ -63,6 +63,7 @@ name = "freenet-prolly"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "freenet-prolly",
 ]
 
 [[package]]

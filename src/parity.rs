@@ -66,9 +66,30 @@ pub fn class_of(len: usize) -> usize {
         .unwrap_or(CLASSES.len() - 1)
 }
 
+/// Grouping hashes taken. `check_node` pays one per member, so what a REFUSED
+/// node costs is a property in its own right — a node that is mis-cut or
+/// oversized must be refused without buying the grouping. Thread-local: the
+/// harness runs tests on many threads and a shared counter reports all of them.
+#[cfg(any(test, feature = "testing"))]
+pub mod work {
+    use core::cell::Cell;
+    thread_local! { static N: Cell<usize> = const { Cell::new(0) }; }
+    pub fn hashes() -> usize {
+        N.with(|n| n.get())
+    }
+    pub fn reset() {
+        N.with(|n| n.set(0));
+    }
+    pub(super) fn tick() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+}
+
 /// The grouping hash of one key, held as `prefix ‖ suffix` so a reader checking
 /// a whole node never allocates a key.
 pub fn group_hash_parts(level: u8, prefix: &[u8], suffix: &[u8]) -> u32 {
+    #[cfg(any(test, feature = "testing"))]
+    work::tick();
     let mut h = blake3::Hasher::new();
     h.update(DOMAIN);
     h.update(&[level]);

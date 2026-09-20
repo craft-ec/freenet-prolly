@@ -84,6 +84,27 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
       console.error(`empty final page (${n} entries): not verified on wasm32`);
     }
   }
+  // What check_node now costs a host per tree-node block, including the
+  // grouping it must recompute to verify `pcount`.
+  const time = (fn, arg, runs) => {
+    fn(arg, Math.min(runs, 20));
+    const t = process.hrtime.bigint();
+    const ok = fn(arg, runs);
+    const ns = Number(process.hrtime.bigint() - t) / runs;
+    if (ok !== runs) throw new Error(`only ${ok}/${runs} passed`);
+    return ns / 1000;
+  };
+  // The BRANCH is the one that pays for grouping: this dataset's values are
+  // inline, so its leaves have no referenced values and therefore no parity
+  // members. Labelled as it is rather than as "a leaf with parity", which it
+  // is not.
+  for (const [what, leaf] of [['leaf (inline values: no parity members)', 1],
+                              ['branch (every child a member)', 0]]) {
+    const entries = instance.exports.check_with_grouping_members(leaf);
+    const us = time(instance.exports.check_with_grouping_n, leaf, 500);
+    console.log(`  check_node, full ${what}: ${entries} entries, ${us.toFixed(1)} us`);
+  }
+
   // Every lane prints what it COVERED, not only that it found nothing wrong:
   // "0 bad" over a lane that never ran reads exactly like a passing one.
   console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs, ${rproofs.length} range proofs, ${parity.length} parity groups and ${prepair.length} repair sweeps match native and verify (${bad} bad)`);

@@ -1010,3 +1010,82 @@ fn the_parity_code_is_deterministic_and_repairs() {
     lens.dedup();
     assert_eq!(lens.len(), before, "the members must differ in length");
 }
+
+/// What a host can be made to do by a node it is going to refuse.
+///
+/// `check_node` now pays a grouping hash per member, which is the most
+/// expensive thing in it — so a node that fails a cheaper check must be refused
+/// before buying any. Counted, because the verdict is "refused" either way and
+/// no assertion about it can see the difference.
+#[test]
+fn a_node_refused_for_anything_cheaper_costs_no_grouping() {
+    use freenet_prolly::boundary::{check_node, BoundaryError};
+    use freenet_prolly::parity::work;
+
+    // A well-formed branch, for the control: it pays one hash per child.
+    let good = {
+        let mut b = NodeBuilder::branch(1);
+        for i in 0..8u8 {
+            b.push_child(
+                &[b'k', i],
+                [i; 32],
+                freenet_prolly::node::Agg {
+                    count: 1,
+                    bytes: 10,
+                },
+            )
+            .unwrap();
+        }
+        // Eight children are one group, so three ids.
+        for p in 0..3u8 {
+            b.push_parity([0x70 + p; 32]).unwrap();
+        }
+        b.finish().unwrap()
+    };
+    let n = Node::parse(&good).expect("parses");
+    work::reset();
+    assert_eq!(check_node(&n), Ok(()));
+    assert_eq!(
+        work::hashes(),
+        8,
+        "the control must pay one hash per member"
+    );
+
+    // The cheapest refusals of all: a node whose parity count is wrong is
+    // refused only AFTER the entry walk, but one that is over the hard limit
+    // never reaches the grouping at all.
+    let oversized = {
+        let mut b = NodeBuilder::branch(1);
+        let mut i = 0u32;
+        while b.logical_len() < freenet_prolly::boundary::MAX_LOGICAL - 200 {
+            b.push_child(
+                &[b'k', (i >> 8) as u8, i as u8],
+                [i as u8; 32],
+                freenet_prolly::node::Agg {
+                    count: 1,
+                    bytes: 10,
+                },
+            )
+            .unwrap();
+            i += 1;
+        }
+        b.finish().unwrap()
+    };
+    let n = Node::parse(&oversized).expect("parses");
+    work::reset();
+    let verdict = check_node(&n);
+    if verdict == Ok(()) {
+        // It fitted; then it must have paid for every member, which is the
+        // honest control for the counter rather than a silent skip.
+        assert_eq!(work::hashes(), n.len());
+    } else {
+        assert!(
+            matches!(
+                verdict,
+                Err(BoundaryError::TooLarge) | Err(BoundaryError::InteriorSplit(_))
+            ),
+            "unexpected refusal {verdict:?}"
+        );
+        assert_eq!(work::hashes(), 0, "an entry-level refusal bought grouping");
+    }
+}

@@ -289,3 +289,68 @@ pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
         &raw const OUT as *const u8
     }
 }
+
+/// `check_node` including the grouping, on a node filled to the hard limit —
+/// what every hosting node pays per tree-node block, now that `pcount` is
+/// verified exactly.
+#[no_mangle]
+pub extern "C" fn check_with_grouping_n(leaf: u32, runs: u32) -> u32 {
+    use freenet_prolly::boundary::check_node;
+    let body = if leaf == 1 {
+        worst_case_leaf()
+    } else {
+        worst_case_branch()
+    };
+    let node = freenet_prolly::node::Node::parse(&body).expect("a node");
+    let mut ok = 0;
+    for _ in 0..runs {
+        if check_node(&node).is_ok() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// Members of the node the timing above runs on, so the number has a size.
+#[no_mangle]
+pub extern "C" fn check_with_grouping_members(leaf: u32) -> u32 {
+    let body = if leaf == 1 {
+        worst_case_leaf()
+    } else {
+        worst_case_branch()
+    };
+    freenet_prolly::node::Node::parse(&body).expect("a node").len() as u32
+}
+
+/// The biggest node of its kind in a real tree — chunker-produced, because a
+/// hand-filled node is mis-cut and `check_node` rightly refuses it, which
+/// would make the timing a measurement of a refusal.
+fn worst_case(leaf: bool) -> Vec<u8> {
+    use freenet_prolly::store::MemBlocks;
+    let e = common::dataset(1, 20_000);
+    let mut store = MemBlocks::default();
+    build(
+        e.iter().map(|(k, v)| (k.as_slice(), Value::Inline(v))),
+        |c, b| store.insert(c, b),
+    )
+    .unwrap();
+    store
+        .0
+        .values()
+        .filter(|b| {
+            freenet_prolly::node::Node::parse(b)
+                .map(|n| n.is_leaf() == leaf)
+                .unwrap_or(false)
+        })
+        .max_by_key(|b| freenet_prolly::node::Node::parse(b).unwrap().len())
+        .cloned()
+        .expect("a node of this kind exists")
+}
+
+fn worst_case_branch() -> Vec<u8> {
+    worst_case(false)
+}
+
+fn worst_case_leaf() -> Vec<u8> {
+    worst_case(true)
+}
