@@ -19,7 +19,7 @@ use crate::cursor::LevelCursor;
 use crate::node::{Agg, BuildError, Node, Value, HEADER, MAX_INLINE, MAX_KEY};
 use crate::store::{load, load_child, Blocks, BlocksMut, ReadError};
 use crate::Cid;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use crate::node::MAX_VALUE;
 /// At most this many missing blocks are named at once.
@@ -73,6 +73,23 @@ pub struct Applied {
     /// caches and retention, never a delete list: another tree may still use
     /// them. (Value blocks are not listed: another key may hold the same value.)
     pub replaced: Vec<Cid>,
+    /// The parity blocks this rewrite CODED, with their bytes: the redundancy
+    /// the new nodes promise and nobody had until now.
+    ///
+    /// A node lists parity ids; the bytes behind them are separate blocks, and
+    /// ARCHITECTURE §7 has the commit go data nodes → head → parity. So they
+    /// are handed over apart from the sink rather than interleaved with it,
+    /// and the ORDER stays the caller's decision.
+    ///
+    /// **What the engine owes.** A group's parity ids may be listed before its
+    /// parity blocks exist, but the engine owes those blocks, and it should
+    /// track the debt the way it tracks an unpublished commit. Until they are
+    /// put, that group has NO redundancy — and a later edit to it falls back
+    /// to a full recode, because a correction needs the old parity to correct.
+    ///
+    /// Groups that were REUSED are not listed: their parity is already out.
+    /// Corrected and recoded groups are, three blocks each.
+    pub parity: crate::build::ParityBlocks,
 }
 
 /// How to apply. The format is [`Options::default`]; anything else exists so
@@ -104,6 +121,9 @@ struct LevelResult {
     whole: bool,
     /// Per edit: did it change anything?
     effective: Vec<bool>,
+    /// Parity blocks coded while rewriting this level. Not yet filtered: a
+    /// node closed here can still be dropped later, and its parity with it.
+    coded: Vec<(Cid, Vec<u8>)>,
 }
 
 /// From a leaf's recorded aggregate alone: can it have been closed by the hard
@@ -132,6 +152,7 @@ fn rewrite_level<B: Blocks>(
         old: Vec::new(),
         whole: true,
         effective: vec![false; edits.len()],
+        coded: Vec::new(),
     };
     // How much of `res.new` the overlay has already been told about. A branch's
     // parity members are the children this same rebuild just closed, so they
@@ -157,6 +178,7 @@ fn rewrite_level<B: Blocks>(
             chunker
                 .finish(overlay, &mut res.new)
                 .map_err(ApplyError::from_build)?;
+            res.coded.extend(chunker.take_coded());
             sync(overlay, &res.new, &mut synced);
             return Ok(res);
         };
@@ -245,6 +267,7 @@ fn rewrite_level<B: Blocks>(
                 chunker
                     .finish(overlay, &mut res.new)
                     .map_err(ApplyError::from_build)?;
+                res.coded.extend(chunker.take_coded());
                 sync(overlay, &res.new, &mut synced);
                 reached_end = true;
                 break;
@@ -254,6 +277,12 @@ fn rewrite_level<B: Blocks>(
             // an edit says otherwise — and then the outer loop starts again
             // there. The next node is not loaded just to find that out.
             if chunker.is_clean() {
+                // This chunker is abandoned here and the run resumes with a
+                // fresh one, so what it coded has to come out now. The nodes
+                // it closed are already in `res.new`; their parity would
+                // otherwise be dropped on the floor, and the engine would
+                // never learn it owed them.
+                res.coded.extend(chunker.take_coded());
                 resume_at = upper;
                 break;
             }
@@ -405,6 +434,11 @@ pub fn apply_with<B: Blocks>(
     .map_err(|e| ReadError::Corrupt(*root, e))?
     .level();
     let mut new_nodes: Vec<Closed> = Vec::new();
+    // Every parity block coded anywhere in this rewrite. Not what gets
+    // reported: a node closed at one level can still be dropped at the next,
+    // and reporting its parity would have the engine pay PUTs for redundancy
+    // over a node that is not in the tree. The kept nodes decide, below.
+    let mut coded: Vec<(Cid, Vec<u8>)> = Vec::new();
     let mut old_ids: Vec<Cid> = Vec::new();
     let mut value_blocks: Vec<(Cid, &[u8])> = Vec::new();
     let mut new_root = *root;
@@ -419,6 +453,7 @@ pub fn apply_with<B: Blocks>(
                 .collect();
         }
         old_ids.extend(r.old.iter().map(|(id, _)| *id));
+        coded.extend(r.coded);
         let mut done = false;
         if r.whole && r.new.len() <= 1 {
             // The lowest level with exactly one node is the root.
@@ -512,8 +547,41 @@ pub fn apply_with<B: Blocks>(
             replaced.push(id);
         }
     }
+    // The parity the tree actually promises. Driven by the KEPT nodes' own
+    // parity lists rather than by what the chunkers happened to code, which is
+    // what makes both halves true at once: nothing reported that no node lists
+    // (a wasted PUT over a node that was dropped), and nothing listed left
+    // unreported except a reused group, whose parity is already out.
+    //
+    // An id can be listed by two nodes — two groups with the same members and
+    // the same class have the same parity, because parity is a function of
+    // exactly those two things — so it is reported once.
+    let mut have: HashMap<Cid, Vec<u8>> = HashMap::new();
+    for (id, bytes) in coded {
+        have.entry(id).or_insert(bytes);
+    }
+    let mut parity: Vec<(Cid, Vec<u8>)> = Vec::new();
+    let mut reported: HashSet<Cid> = HashSet::new();
+    for n in &new_nodes {
+        let node = Node::parse(&n.bytes).map_err(|e| ReadError::Corrupt(n.cid, e))?;
+        for id in node.parity() {
+            if let Some(bytes) = have.get(&id) {
+                if reported.insert(id) {
+                    parity.push((id, bytes.clone()));
+                }
+            }
+        }
+    }
+
+    // The tripwire, not a safety net: `parity` is already correct either way.
+    // If this is ever non-zero, a node this rewrite closed was dropped with
+    // its parity, and the filter above stopped being a formality.
+    #[cfg(any(test, feature = "testing"))]
+    crate::chunk::source::tick_filtered(have.len() - parity.len());
+
     Ok(Applied {
         root: new_root,
         replaced,
+        parity,
     })
 }

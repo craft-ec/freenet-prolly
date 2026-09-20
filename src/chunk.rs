@@ -86,6 +86,9 @@ pub mod source {
         static REUSED: Cell<usize> = const { Cell::new(0) };
         static DELTA: Cell<usize> = const { Cell::new(0) };
         static RECODED: Cell<usize> = const { Cell::new(0) };
+        /// Parity blocks a rewrite coded and then did NOT report, because no
+        /// node it kept lists them. See `filtered`.
+        static FILTERED: Cell<usize> = const { Cell::new(0) };
     }
     pub fn reused() -> usize {
         REUSED.with(|n| n.get())
@@ -96,10 +99,25 @@ pub mod source {
     pub fn recoded() -> usize {
         RECODED.with(|n| n.get())
     }
+    /// Parity blocks coded and then withheld: a node was closed, its groups
+    /// coded, and the node later dropped from the tree (a rewrite whose root
+    /// collapses to a single-child branch). Reporting them would be PUTs for
+    /// redundancy over a node nobody has.
+    ///
+    /// This is a TRIPWIRE, not a statistic. It is zero across the whole suite
+    /// -- 143 tests, including the randomised edit sequences and the case that
+    /// collapses the root -- so the filter that produces it has never been
+    /// observed to remove anything. The test asserts the zero, so the day a
+    /// case does reach it, the suite says so instead of the filter quietly
+    /// mattering for the first time in production.
+    pub fn filtered() -> usize {
+        FILTERED.with(|n| n.get())
+    }
     pub fn reset() {
         REUSED.with(|n| n.set(0));
         DELTA.with(|n| n.set(0));
         RECODED.with(|n| n.set(0));
+        FILTERED.with(|n| n.set(0));
     }
     pub(super) fn tick_reused() {
         REUSED.with(|n| n.set(n.get() + 1));
@@ -109,6 +127,9 @@ pub mod source {
     }
     pub(super) fn tick_recoded() {
         RECODED.with(|n| n.set(n.get() + 1));
+    }
+    pub fn tick_filtered(n_blocks: usize) {
+        FILTERED.with(|n| n.set(n.get() + n_blocks));
     }
 }
 
@@ -141,17 +162,34 @@ impl Run {
         leaf: bool,
         blocks: &dyn crate::store::Blocks,
         old: Option<&crate::parity::GroupIndex>,
+        coded: &mut Vec<(Cid, Vec<u8>)>,
     ) -> Result<Vec<Cid>, BuildError> {
         let sizes = crate::parity::group_sizes(&self.hashes);
         let mut at = 0usize;
         for size in sizes {
             let members = &self.cids[at..at + size];
             at += size;
-            let ids = self.group_ids(leaf, blocks, old, members)?;
+            let ids = self.group_ids(leaf, blocks, old, members, coded)?;
             self.ids.extend_from_slice(&ids);
         }
         self.encoded = at;
         Ok(std::mem::take(&mut self.ids))
+    }
+
+    /// Hand three freshly coded parity blocks to the caller and return their
+    /// ids. Only a group that was actually CODED reports: a reused group's
+    /// parity is already out on the network, and re-reporting it would have
+    /// the engine pay PUTs for blocks it has already put.
+    fn record(coded: &mut Vec<(Cid, Vec<u8>)>, parity: Vec<Vec<u8>>) -> [Cid; crate::rs::PARITY] {
+        let ids = [
+            block_id(kind::PARITY, &parity[0]),
+            block_id(kind::PARITY, &parity[1]),
+            block_id(kind::PARITY, &parity[2]),
+        ];
+        for (id, bytes) in ids.iter().zip(parity) {
+            coded.push((*id, bytes));
+        }
+        ids
     }
 
     fn group_ids(
@@ -160,6 +198,7 @@ impl Run {
         blocks: &dyn crate::store::Blocks,
         old: Option<&crate::parity::GroupIndex>,
         members: &[Cid],
+        coded: &mut Vec<(Cid, Vec<u8>)>,
     ) -> Result<[Cid; crate::rs::PARITY], BuildError> {
         if let Some(idx) = old {
             // Already had this exact group: its parity is a pure function of
@@ -174,10 +213,10 @@ impl Run {
             // them is not to hand, fall through and recode — never produce
             // parity that does not cover what it claims.
             if let Some((pos, was, old_ids)) = idx.one_off(self.class, members) {
-                if let Some(ids) = self.delta(leaf, blocks, members, pos, was, old_ids)? {
+                if let Some(parity) = self.delta(leaf, blocks, members, pos, was, old_ids)? {
                     #[cfg(any(test, feature = "testing"))]
                     source::tick_delta();
-                    return Ok(ids);
+                    return Ok(Self::record(coded, parity));
                 }
             }
         }
@@ -188,11 +227,7 @@ impl Run {
             states.push(Run::state(blocks, leaf, c)?);
         }
         let parity = crate::parity::encode_group(&states).map_err(|_| BuildError::NodeTooLarge)?;
-        Ok([
-            block_id(kind::PARITY, &parity[0]),
-            block_id(kind::PARITY, &parity[1]),
-            block_id(kind::PARITY, &parity[2]),
-        ])
+        Ok(Self::record(coded, parity))
     }
 
     /// Correct a group's parity for a single member changing in place.
@@ -206,7 +241,7 @@ impl Run {
         pos: usize,
         was: Cid,
         old_ids: [Cid; crate::rs::PARITY],
-    ) -> Result<Option<[Cid; crate::rs::PARITY]>, BuildError> {
+    ) -> Result<Option<Vec<Vec<u8>>>, BuildError> {
         let mut old_parity = Vec::with_capacity(crate::rs::PARITY);
         for id in &old_ids {
             match blocks.get(id) {
@@ -227,11 +262,7 @@ impl Run {
         let new_state = Run::state(blocks, leaf, &members[pos])?;
         let parity = crate::parity::update_group(&old_parity, pos, &old_state, &new_state)
             .map_err(|_| BuildError::NodeTooLarge)?;
-        Ok(Some([
-            block_id(kind::PARITY, &parity[0]),
-            block_id(kind::PARITY, &parity[1]),
-            block_id(kind::PARITY, &parity[2]),
-        ]))
+        Ok(Some(parity))
     }
 }
 
@@ -267,6 +298,15 @@ pub struct LevelChunker {
     /// The groups of every node this rewrite is REPLACING. Empty for a build
     /// from scratch, where there is nothing to reuse.
     old: crate::parity::GroupIndex,
+    /// Parity blocks this chunker has CODED, with their bytes.
+    ///
+    /// A node lists its parity ids; nothing until now produced the bytes
+    /// behind them, so the caller had no way to put what the node promised.
+    /// These are kept apart from the closed nodes rather than pushed into the
+    /// same `out`, because the order is the caller's to choose: data nodes,
+    /// then the head, then parity (ARCHITECTURE §7). The library must not
+    /// interleave them.
+    coded: Vec<(Cid, Vec<u8>)>,
 }
 
 fn new_node(level: u8) -> NodeBuilder {
@@ -285,6 +325,7 @@ impl LevelChunker {
             open: new_node(level),
             runs: Vec::new(),
             old: crate::parity::GroupIndex::default(),
+            coded: Vec::new(),
         }
     }
 
@@ -386,6 +427,16 @@ impl LevelChunker {
         self.old.add(node);
     }
 
+    /// The parity blocks coded since the last call, and their ids.
+    ///
+    /// Only groups this chunker actually coded — one that was reused already
+    /// has its parity out, and one that was corrected reports the corrected
+    /// bytes. Taking them empties the list, so a caller draining as it goes
+    /// never reports a block twice.
+    pub fn take_coded(&mut self) -> Vec<(Cid, Vec<u8>)> {
+        std::mem::take(&mut self.coded)
+    }
+
     fn close(
         &mut self,
         blocks: &dyn crate::store::Blocks,
@@ -400,9 +451,12 @@ impl LevelChunker {
         // rewrite reuse from it too.
         let old = std::mem::take(&mut self.old);
         let mut runs = std::mem::take(&mut self.runs);
+        // Out for the same reason as `old`: the runs borrow it while `self` is
+        // borrowed mutably.
+        let mut coded = std::mem::take(&mut self.coded);
         let mut result = Ok(());
         for run in runs.iter_mut() {
-            match run.finish(leaf, blocks, Some(&old)) {
+            match run.finish(leaf, blocks, Some(&old), &mut coded) {
                 Ok(ids) => {
                     for id in ids {
                         if let Err(e) = done.push_parity(id) {
@@ -417,6 +471,7 @@ impl LevelChunker {
                 break;
             }
         }
+        self.coded = coded;
         self.old = old;
         result?;
         let min_key = done.min_key().unwrap_or_default().to_vec();
