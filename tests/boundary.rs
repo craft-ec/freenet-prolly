@@ -484,11 +484,18 @@ fn frozen_vectors() {
         let (nodes, bytes, hash) = range_proof_vector(n);
         got += &format!("rproof {n} {nodes} {bytes} {}\n", hex(&hash));
     }
-    // Parity vectors are HELD until the canonical form of a parity block is
-    // settled (trailing-zero trimming, freenet-prolly#19): freezing them now
-    // would freeze bytes that are about to change. The computation is written
-    // and exercised by `the_parity_code_is_deterministic_and_repairs`; only the
-    // freezing waits.
+    // Parity: the code frozen to the byte, its canonical trimmed form, and
+    // repair frozen with it.
+    for k in [1usize, 7, 12] {
+        let (plen, ids) = parity_vector(k);
+        got += &format!(
+            "parity {k} {plen} {} {} {}\n",
+            hex(&ids[0]),
+            hex(&ids[1]),
+            hex(&ids[2])
+        );
+        got += &format!("prepair {k} {}\n", hex(&parity_repair_digest(k)));
+    }
     let want = include_str!("vectors.txt");
     assert_eq!(got, want, "\n--- computed ---\n{got}");
 }
@@ -894,7 +901,7 @@ fn range_proof_vector(n: usize) -> (usize, usize, [u8; 32]) {
 /// are deliberately unequal so the padding and the length prefix are exercised
 /// rather than skipped.
 pub fn parity_vector(k: usize) -> (usize, [Cid; 3]) {
-    use freenet_prolly::parity::{encode_group, group_width};
+    use freenet_prolly::parity::encode_group;
     let states = parity_members(k);
     let parity = encode_group(&states).expect("a codeable group");
     let ids = [
@@ -902,7 +909,10 @@ pub fn parity_vector(k: usize) -> (usize, [Cid; 3]) {
         freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[1]),
         freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[2]),
     ];
-    (group_width(&states), ids)
+    // The STORED length of the first parity block, which is a function of its
+    // own bytes and not of the group's longest member. Frozen so that a change
+    // to trimming shows up here rather than only in the ids.
+    (parity[0].len(), ids)
 }
 
 /// Deterministic members of unequal length, each a plausible block state
@@ -929,14 +939,13 @@ pub fn parity_members(k: usize) -> Vec<Vec<u8>> {
 /// says a repairer on another target gets the same bytes back — the claim
 /// "anyone can repair without a key" rests on it.
 pub fn parity_repair_digest(k: usize) -> [u8; 32] {
-    use freenet_prolly::parity::{encode_group, group_width, repair_group, symbol};
+    use freenet_prolly::parity::{encode_group, repair_group, symbol};
     use freenet_prolly::rs::PARITY;
     let states = parity_members(k);
-    let width = group_width(&states);
     let parity = encode_group(&states).expect("a codeable group");
     let all: Vec<Vec<u8>> = states
         .iter()
-        .map(|s| symbol(s, width))
+        .map(|s| symbol(s))
         .chain(parity.iter().cloned())
         .collect();
     let n = k + PARITY;
@@ -980,7 +989,11 @@ fn the_parity_code_is_deterministic_and_repairs() {
             "k = {k}: parity ids repeat"
         );
         let states = parity_members(k);
-        assert_eq!(width, 4 + states.iter().map(|s| s.len()).max().unwrap());
+        // The stored parity length is its own, and never the group's width.
+        assert!(
+            width <= 4 + states.iter().map(|s| s.len()).max().unwrap(),
+            "a parity block longer than the untrimmed width"
+        );
         // Every way to lose three, rebuilt and compared — the assertion lives
         // inside the digest helper, which also counts the combinations.
         let _ = parity_repair_digest(k);

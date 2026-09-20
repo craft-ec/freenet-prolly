@@ -36,6 +36,30 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
       bad++; console.error(`proof ${n}: does not verify on wasm32`);
     }
   }
+  // Parity: the code and the repair must be identical on this target, or
+  // "anyone can repair without a key" is a claim about one machine.
+  const parity = lines.filter(l => l.startsWith('parity ')).map(l => l.split(' '));
+  const prepair = lines.filter(l => l.startsWith('prepair ')).map(l => l.split(' '));
+  if (parity.length === 0 || prepair.length === 0) {
+    console.error('no parity vectors found'); process.exit(1);
+  }
+  for (const [, k, plen, p0, p1, p2] of parity) {
+    const at = instance.exports.parity_ids(Number(k));
+    const got = [0, 1, 2].map(i =>
+      Buffer.from(new Uint8Array(instance.exports.memory.buffer, at + i * 32, 32)).toString('hex'));
+    if (got[0] !== p0 || got[1] !== p1 || got[2] !== p2) {
+      bad++; console.error(`parity ${k}: wasm32 ${got.join(' ')} != native ${p0} ${p1} ${p2}`);
+    }
+    const gotLen = instance.exports.parity_len(Number(k));
+    if (gotLen !== Number(plen)) {
+      bad++; console.error(`parity ${k}: wasm32 trimmed length ${gotLen} != native ${plen}`);
+    }
+  }
+  for (const [, k, hex] of prepair) {
+    const got = read32(instance.exports.parity_repair_digest(Number(k)));
+    if (got !== hex) { bad++; console.error(`prepair ${k}: wasm32 ${got} != native ${hex}`); }
+  }
+
   // Range proofs: a LISTING must be the same bytes here and verify here.
   const rproofs = lines.filter(l => l.startsWith('rproof ')).map(l => l.split(' '));
   if (rproofs.length === 0) { console.error('no range-proof vectors found'); process.exit(1); }
@@ -60,7 +84,12 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
       console.error(`empty final page (${n} entries): not verified on wasm32`);
     }
   }
-  console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs, ${rproofs.length} range proofs and the empty final page match native and verify (${bad} bad)`);
+  // Every lane prints what it COVERED, not only that it found nothing wrong:
+  // "0 bad" over a lane that never ran reads exactly like a passing one.
+  console.log(`wasm32: ${want.length} roots, ${proofs.length} key proofs, ${rproofs.length} range proofs, ${parity.length} parity groups and ${prepair.length} repair sweeps match native and verify (${bad} bad)`);
+  if (parity.length === 0 || prepair.length === 0) {
+    console.error('parity lane covered nothing'); process.exit(1);
+  }
   process.exit(bad ? 1 : 0);
 });
 JS

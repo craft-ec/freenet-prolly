@@ -232,17 +232,22 @@ pub extern "C" fn parity_ids(k: u32) -> *const u8 {
     use freenet_prolly::parity::encode_group;
     let states = parity_members(k as usize);
     let parity = encode_group(&states).expect("a codeable group");
-    let mut out = Vec::with_capacity(96);
-    for p in &parity {
-        out.extend_from_slice(&freenet_prolly::block_id(freenet_prolly::kind::PARITY, p));
+    static mut OUT: [u8; 96] = [0; 96];
+    unsafe {
+        for (i, p) in parity.iter().enumerate() {
+            let id = freenet_prolly::block_id(freenet_prolly::kind::PARITY, p);
+            OUT[i * 32..(i + 1) * 32].copy_from_slice(&id);
+        }
+        &raw const OUT as *const u8
     }
-    leak(out)
 }
 
-/// The padded symbol width of the frozen group.
+/// The STORED length of the group's first parity block — a function of its own
+/// bytes, since parity is trimmed. Never the group's width.
 #[no_mangle]
-pub extern "C" fn parity_width(k: u32) -> u32 {
-    freenet_prolly::parity::group_width(&parity_members(k as usize)) as u32
+pub extern "C" fn parity_len(k: u32) -> u32 {
+    use freenet_prolly::parity::encode_group;
+    encode_group(&parity_members(k as usize)).expect("codeable")[0].len() as u32
 }
 
 /// Every way to lose three of the `k + 3`, rebuilt, digested — the claim
@@ -250,15 +255,14 @@ pub extern "C" fn parity_width(k: u32) -> u32 {
 /// on the one the vectors were generated on.
 #[no_mangle]
 pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
-    use freenet_prolly::parity::{encode_group, group_width, repair_group, symbol};
+    use freenet_prolly::parity::{encode_group, repair_group, symbol};
     use freenet_prolly::rs::PARITY;
     let k = k as usize;
     let states = parity_members(k);
-    let width = group_width(&states);
     let parity = encode_group(&states).expect("a codeable group");
     let all: Vec<Vec<u8>> = states
         .iter()
-        .map(|s| symbol(s, width))
+        .map(|s| symbol(s))
         .chain(parity.iter().cloned())
         .collect();
     let n = k + PARITY;
@@ -279,5 +283,9 @@ pub extern "C" fn parity_repair_digest(k: u32) -> *const u8 {
             }
         }
     }
-    leak(h.finalize().as_bytes().to_vec())
+    static mut OUT: [u8; 32] = [0; 32];
+    unsafe {
+        OUT = *h.finalize().as_bytes();
+        &raw const OUT as *const u8
+    }
 }

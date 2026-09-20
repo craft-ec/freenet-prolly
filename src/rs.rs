@@ -73,6 +73,16 @@ fn mul(a: u8, b: u8) -> u8 {
     T.exp[T.log[a as usize] as usize + T.log[b as usize] as usize]
 }
 
+/// Multiplication, for the incremental update in [`crate::parity`].
+pub fn mul_pub(a: u8, b: u8) -> u8 {
+    mul(a, b)
+}
+
+/// Division, for constructing a cancelling fixture in the tests.
+pub fn div_pub(a: u8, b: u8) -> u8 {
+    div(a, b)
+}
+
 /// Division in GF(2⁸). `b` must not be zero; every call here divides by a
 /// Cauchy denominator `x_r ⊕ y_c`, which is non-zero because the index sets are
 /// disjoint.
@@ -98,18 +108,18 @@ pub fn coeff(r: usize, c: usize) -> u8 {
 
 /// The three parity symbols of a group.
 ///
-/// Every data symbol must already be the same length — the caller pads them,
-/// because padding is where the length prefix lives and that belongs to the
-/// block format rather than to the code.
+/// **There is no padding in the rule.** A symbol is its bytes followed by
+/// infinitely many zeros, and parity is defined per byte index — so a member's
+/// length is not part of the group's definition and changing one member cannot
+/// change what the others contribute. The result is stored with its trailing
+/// zeros trimmed, which makes a parity block's length a function of its own
+/// bytes alone. Nothing may read that length as the group's width.
 pub fn encode(data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, RsError> {
     let k = data.len();
     if k == 0 || k > MAX_K {
         return Err(RsError::GroupSize(k));
     }
-    let width = data[0].len();
-    if data.iter().any(|d| d.len() != width) {
-        return Err(RsError::Ragged);
-    }
+    let width = data.iter().map(|d| d.len()).max().unwrap_or(0);
     let mut out = vec![vec![0u8; width]; PARITY];
     for (c, d) in data.iter().enumerate() {
         for (r, p) in out.iter_mut().enumerate() {
@@ -122,14 +132,36 @@ pub fn encode(data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, RsError> {
             }
         }
     }
+    for p in out.iter_mut() {
+        trim(p);
+    }
     Ok(out)
 }
 
-/// Rebuild the missing data symbols from any `k` of the `k + 3` blocks.
+/// Drop trailing zero bytes. The canonical stored form of a parity block.
+pub fn trim(v: &mut Vec<u8>) {
+    while v.last() == Some(&0) {
+        v.pop();
+    }
+}
+
+/// Byte `i` of a block, which is zero past its end — the whole of what makes
+/// trimming lossless.
+pub fn byte_at(b: &[u8], i: usize) -> u8 {
+    b.get(i).copied().unwrap_or(0)
+}
+
+/// Rebuild every data symbol from any `k` of the `k + 3` blocks.
 ///
-/// `have[j]` is `Some` for a block that is present: indices `0..k` are the data
-/// symbols in group order, `k..k+3` the parity symbols. What comes back is the
-/// full data set, so a caller can take whichever symbols it was missing.
+/// `have[j]` is `Some` for a present block: `0..k` the data symbols in group
+/// order, `k..k+3` the parity. Blocks are ragged — a data symbol ends after its
+/// own bytes, a parity block after its last non-zero one — and every index past
+/// an end reads as zero.
+///
+/// The solve is per byte index against one inverted matrix. Indices 0..4 give
+/// each data symbol's length prefix; the last index any of them needs is then
+/// known exactly, so no index is ever revisited and the answer equals what an
+/// untrimmed repair would have produced.
 pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsError> {
     if k == 0 || k > MAX_K {
         return Err(RsError::GroupSize(k));
@@ -137,18 +169,9 @@ pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsErro
     if have.len() != k + PARITY {
         return Err(RsError::Ragged);
     }
-    let width = have
-        .iter()
-        .flatten()
-        .map(|b| b.len())
-        .next()
-        .ok_or(RsError::NotEnough(0))?;
-    if have.iter().flatten().any(|b| b.len() != width) {
-        return Err(RsError::Ragged);
-    }
     // The first k present blocks, and the rows of [I;C] they stand for.
     let mut rows: Vec<[u8; MAX_K]> = Vec::with_capacity(k);
-    let mut vals: Vec<&Vec<u8>> = Vec::with_capacity(k);
+    let mut vals: Vec<&[u8]> = Vec::with_capacity(k);
     for (j, b) in have.iter().enumerate() {
         if rows.len() == k {
             break;
@@ -168,43 +191,83 @@ pub fn repair(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, RsErro
     if rows.len() < k {
         return Err(RsError::NotEnough(rows.len()));
     }
+    let inv = invert(&mut rows, k)?;
 
-    // Gauss–Jordan on the k × k matrix, applying the same operations to the
-    // symbols. Any k rows of [I;C] are independent — that is the Cauchy
-    // property — so a pivot always exists.
-    let mut sym: Vec<Vec<u8>> = vals.into_iter().cloned().collect();
+    // One column of the solve: the data bytes at index `i`.
+    let solve = |i: usize| -> Vec<u8> {
+        (0..k)
+            .map(|r| {
+                let mut acc = 0u8;
+                for (c, v) in vals.iter().enumerate() {
+                    acc ^= mul(inv[r][c], byte_at(v, i));
+                }
+                acc
+            })
+            .collect()
+    };
+
+    // The length prefixes first: four indices, and they bound everything else.
+    let mut out: Vec<Vec<u8>> = vec![Vec::new(); k];
+    for i in 0..4 {
+        for (r, b) in solve(i).into_iter().enumerate() {
+            out[r].push(b);
+        }
+    }
+    let lens: Vec<usize> = out
+        .iter()
+        .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize)
+        .collect();
+    let end = lens.iter().map(|l| 4 + l).max().unwrap_or(4);
+    for i in 4..end {
+        for (r, b) in solve(i).into_iter().enumerate() {
+            out[r].push(b);
+        }
+    }
+    // Each symbol ends where its own prefix says.
+    for (r, o) in out.iter_mut().enumerate() {
+        o.truncate(4 + lens[r]);
+    }
+    Ok(out)
+}
+
+/// Invert the k x k matrix in place, returning the inverse. Any k rows of a
+/// systematic Cauchy `[I;C]` are independent, so a pivot always exists.
+fn invert(rows: &mut [[u8; MAX_K]], k: usize) -> Result<Vec<[u8; MAX_K]>, RsError> {
+    let mut inv: Vec<[u8; MAX_K]> = (0..k)
+        .map(|r| {
+            let mut e = [0u8; MAX_K];
+            e[r] = 1;
+            e
+        })
+        .collect();
     for col in 0..k {
         let p = (col..k)
             .find(|&r| rows[r][col] != 0)
             .ok_or(RsError::Singular)?;
         rows.swap(col, p);
-        sym.swap(col, p);
-        let inv = div(1, rows[col][col]);
+        inv.swap(col, p);
+        let f = div(1, rows[col][col]);
         for v in rows[col].iter_mut().take(k) {
-            *v = mul(*v, inv);
+            *v = mul(*v, f);
         }
-        for b in sym[col].iter_mut() {
-            *b = mul(*b, inv);
+        for v in inv[col].iter_mut().take(k) {
+            *v = mul(*v, f);
         }
-        // The pivot's symbol is lifted out so the other rows can borrow
-        // mutably while reading it; it goes back before the next column.
-        let pivot_row = rows[col];
-        let pivot_sym = core::mem::take(&mut sym[col]);
         for r in 0..k {
             if r == col || rows[r][col] == 0 {
                 continue;
             }
             let f = rows[r][col];
+            let (pr, pi) = (rows[col], inv[col]);
             for (c, v) in rows[r].iter_mut().enumerate().take(k) {
-                *v ^= mul(f, pivot_row[c]);
+                *v ^= mul(f, pr[c]);
             }
-            for (o, p) in sym[r].iter_mut().zip(pivot_sym.iter()) {
-                *o ^= mul(f, *p);
+            for (c, v) in inv[r].iter_mut().enumerate().take(k) {
+                *v ^= mul(f, pi[c]);
             }
         }
-        sym[col] = pivot_sym;
     }
-    Ok(sym)
+    Ok(inv)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,12 +322,14 @@ mod tests {
         for k in 1..=MAX_K {
             // Non-zero: an all-zero data symbol codes to all-zero parity,
             // which is correct and makes the distinctness check below vacuous.
-            let data: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8 + 1; 16]).collect();
+            let data: Vec<Vec<u8>> = (0..k).map(|i| sym(&[i as u8 + 1; 16])).collect();
             let a = encode(&data).expect("a codeable group");
             let b = encode(&data).expect("a codeable group");
             assert_eq!(a, b, "k = {k}: not deterministic");
             assert_eq!(a.len(), PARITY);
-            assert!(a.iter().all(|p| p.len() == 16));
+            // Trimmed, so a parity block is at most the longest symbol and may
+            // be shorter — never a fixed width.
+            assert!(a.iter().all(|p| p.len() <= 20));
             // k = 1 is the degenerate case worth naming: three DIFFERENT
             // scalar multiples of one symbol, not three copies of it.
             if k == 1 {
@@ -273,17 +338,32 @@ mod tests {
         }
     }
 
-    /// Any three losses, at every group size: the whole point of 3 parity.
+    /// A symbol as the format defines it: a length prefix, then that many
+    /// bytes. `repair` reads the prefix to know where a rebuilt block ends, so
+    /// a fixture of raw padded vectors would be testing a shape the format
+    /// never produces.
+    fn sym(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Any three losses, at every group size, with symbols of UNEQUAL length —
+    /// which is the case trimming exists for.
     #[test]
     fn any_three_losses_are_repairable_at_every_group_size() {
         for k in 1..=MAX_K {
             let data: Vec<Vec<u8>> = (0..k)
-                .map(|i| (0..32u8).map(|b| b.wrapping_mul(i as u8 + 1)).collect())
+                .map(|i| {
+                    let payload: Vec<u8> = (0..(1 + i * 5) as u8)
+                        .map(|b| b.wrapping_mul(i as u8 + 1).wrapping_add(1))
+                        .collect();
+                    sym(&payload)
+                })
                 .collect();
             let parity = encode(&data).expect("a codeable group");
             let all: Vec<Vec<u8>> = data.iter().chain(parity.iter()).cloned().collect();
             let n = k + PARITY;
-            // Every way to lose three of the k + 3.
             for a in 0..n {
                 for b in a + 1..n {
                     for c in b + 1..n {
@@ -303,7 +383,7 @@ mod tests {
     #[test]
     fn too_few_blocks_is_refused() {
         let k = 8;
-        let data: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 8]).collect();
+        let data: Vec<Vec<u8>> = (0..k).map(|i| sym(&[i as u8 + 1; 8])).collect();
         let parity = encode(&data).unwrap();
         let all: Vec<Vec<u8>> = data.iter().chain(parity.iter()).cloned().collect();
         // Four losses out of k + 3 = 11 leaves 7 < 8.
@@ -316,7 +396,9 @@ mod tests {
             encode(&vec![vec![0u8; 4]; MAX_K + 1]),
             Err(RsError::GroupSize(_))
         ));
-        assert_eq!(encode(&[vec![0u8; 4], vec![0u8; 5]]), Err(RsError::Ragged));
+        // Ragged input is NOT an error: a symbol is zero past its end, which is
+        // exactly what makes trimming lossless.
+        assert!(encode(&[sym(&[1u8; 4]), sym(&[2u8; 5])]).is_ok());
     }
 
     /// The Cauchy coefficients, spelled out for the sizes the vectors will

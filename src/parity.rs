@@ -141,54 +141,84 @@ pub fn pcount_of(node: &Node<'_>) -> usize {
     rs::PARITY * group_sizes_of(node).len()
 }
 
-/// One member's coded symbol: `len:u32 LE ‖ state ‖ zeros`.
+/// One member's coded symbol: `len:u32 LE ‖ state`, and zeros for ever after.
 ///
-/// `state` is the member's FULL block state — `kind ‖ body` — so a rebuilt
-/// symbol IS the block and verifies against its id by one hash, with nothing
-/// inferred from context. The length prefix is what makes the padding
-/// reversible: the parent stores a cid and an aggregate, neither of which
-/// carries a length, so without it a repairer could not know where the block
-/// ends.
-pub fn symbol(state: &[u8], width: usize) -> Vec<u8> {
-    debug_assert!(state.len() + 4 <= width);
-    let mut out = Vec::with_capacity(width);
+/// `state` is the member's FULL block — `kind ‖ body` — so a rebuilt symbol IS
+/// the block and verifies against its id by one hash, with nothing inferred
+/// from context. The length prefix is what ends it: the parent stores a cid and
+/// an aggregate, neither of which carries a length, so without it a repairer
+/// could not know where the block stops.
+///
+/// There is no padding here. A symbol is these bytes followed by infinitely
+/// many zeros, and parity is defined per byte index — which is what lets a
+/// parity block be stored trimmed, and what stops one member's length from
+/// being part of what the others contribute.
+pub fn symbol(state: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + state.len());
     out.extend_from_slice(&(state.len() as u32).to_le_bytes());
     out.extend_from_slice(state);
-    out.resize(width, 0);
     out
 }
 
-/// The width every symbol of a group is padded to: the longest, prefix
-/// included.
-pub fn group_width(states: &[Vec<u8>]) -> usize {
-    4 + states.iter().map(|s| s.len()).max().unwrap_or(0)
-}
-
-/// The three parity symbols for one group of member states.
+/// The three parity symbols for one group of member states, trimmed.
 pub fn encode_group(states: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    let width = group_width(states);
-    let data: Vec<Vec<u8>> = states.iter().map(|s| symbol(s, width)).collect();
+    let data: Vec<Vec<u8>> = states.iter().map(|s| symbol(s)).collect();
     rs::encode(&data)
 }
 
-/// Recover a member's state from any `k` of the `k + 3` blocks of its group.
+/// Recover every member's state from any `k` of the `k + 3` blocks.
 ///
-/// `have` holds the symbols: `0..k` the members in group order, `k..k+3` the
-/// parity. What comes back is each member's state, padding stripped by the
-/// length its own symbol carries — so the caller can hash it straight against
-/// the id it was missing.
+/// `have` holds the blocks as they are STORED: data symbols as `symbol`
+/// produces them, parity trimmed. Each answer is the member's state, its length
+/// taken from its own prefix.
 pub fn repair_group(k: usize, have: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    let symbols = rs::repair(k, have)?;
-    symbols
+    Ok(rs::repair(k, have)?
         .into_iter()
-        .map(|s| {
-            let len = u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize;
-            if 4 + len > s.len() {
-                return Err(rs::RsError::Ragged);
-            }
-            Ok(s[4..4 + len].to_vec())
-        })
-        .collect()
+        .map(|s| s[4..].to_vec())
+        .collect())
+}
+
+/// A member changed: the new parity, from the OLD parity and the two symbols.
+///
+/// `parity' = trim(parity ⊕ C[·][c] · (symbol' ⊕ symbol))`, per byte index. The
+/// code is linear, so a writer that holds the three old parity blocks and both
+/// versions of the one member it touched needs nothing else — no reads of the
+/// other members, which is what keeps a write off the read path.
+///
+/// This is for a member CHANGING IN PLACE. A membership change — an insert, a
+/// removal, a value crossing a size class — moves the columns, and columns are
+/// positional, so the group is recoded from its members instead.
+pub fn update_group(
+    old_parity: &[Vec<u8>],
+    column: usize,
+    old_state: &[u8],
+    new_state: &[u8],
+) -> Result<Vec<Vec<u8>>, rs::RsError> {
+    if old_parity.len() != rs::PARITY {
+        return Err(rs::RsError::Ragged);
+    }
+    if column >= rs::MAX_K {
+        return Err(rs::RsError::GroupSize(column + 1));
+    }
+    let (old, new) = (symbol(old_state), symbol(new_state));
+    let width = old_parity
+        .iter()
+        .map(|p| p.len())
+        .chain([old.len(), new.len()])
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(rs::PARITY);
+    for (r, p) in old_parity.iter().enumerate() {
+        let f = rs::coeff(r, column);
+        let mut v = vec![0u8; width];
+        for (i, o) in v.iter_mut().enumerate() {
+            let d = rs::byte_at(&new, i) ^ rs::byte_at(&old, i);
+            *o = rs::byte_at(p, i) ^ rs::mul_pub(f, d);
+        }
+        rs::trim(&mut v);
+        out.push(v);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -278,8 +308,8 @@ mod tests {
         assert_eq!(class_of(MAX_VALUE), 3, "the largest value a Ref can hold");
     }
 
-    /// A symbol carries its own length, so padding is reversible without the
-    /// parent knowing anything about the child's size.
+    /// A symbol carries its own length, so trimming is lossless: a group round
+    /// trips through its parity at wildly unequal lengths.
     #[test]
     fn a_group_round_trips_through_its_parity_at_unequal_lengths() {
         let states: Vec<Vec<u8>> = vec![
@@ -289,18 +319,126 @@ mod tests {
             vec![9u8; 33],
         ];
         let parity = encode_group(&states).expect("a codeable group");
-        let width = group_width(&states);
-        assert!(parity.iter().all(|p| p.len() == width));
         let k = states.len();
         let all: Vec<Vec<u8>> = states
             .iter()
-            .map(|s| symbol(s, width))
+            .map(|s| symbol(s))
             .chain(parity.iter().cloned())
             .collect();
-        // Lose the three largest data symbols; rebuild from the rest.
+        // Lose the three largest data symbols — including the LONGEST, which
+        // is the case that makes trimming non-trivial: nothing left says how
+        // far the group reaches except the rebuilt length prefixes.
         let have: Vec<Option<Vec<u8>>> = (0..k + rs::PARITY)
             .map(|j| (!(1..=3).contains(&j)).then(|| all[j].clone()))
             .collect();
         assert_eq!(repair_group(k, &have).expect("repairable"), states);
+    }
+
+    /// The delta update equals coding the group from scratch — in place, and
+    /// across the length boundary in both directions, which is where a rule
+    /// that read a parity block's length as the width would break.
+    #[test]
+    fn an_incremental_update_equals_coding_the_group_again() {
+        let base: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8 + 1; 40 + i * 7]).collect();
+        let old_parity = encode_group(&base).expect("codeable");
+        for (what, column, new_state) in [
+            ("in place, same length", 2, vec![0xaa; 54]),
+            ("grows past the longest", 0, vec![0xbb; 5_000]),
+            ("shrinks below every other", 4, vec![0xcc; 1]),
+            ("becomes empty", 3, Vec::new()),
+        ] {
+            let mut want_states = base.clone();
+            want_states[column] = new_state.clone();
+            let want = encode_group(&want_states).expect("codeable");
+            let got =
+                update_group(&old_parity, column, &base[column], &new_state).expect("updatable");
+            assert_eq!(got, want, "{what}: delta differs from a fresh coding");
+        }
+    }
+
+    /// Members that are all empty code to empty parity, and it is legal.
+    #[test]
+    fn all_empty_members_give_empty_parity() {
+        // An empty STATE still has a non-zero length prefix of zero... which is
+        // four zero bytes, so the symbol is entirely zero and so is the parity.
+        let states: Vec<Vec<u8>> = vec![Vec::new(); 4];
+        let parity = encode_group(&states).expect("codeable");
+        assert!(parity.iter().all(|p| p.is_empty()), "empty parity expected");
+        // And it repairs: every index reads zero, the prefixes say zero, and
+        // the members come back empty.
+        let all: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY).map(|_| Some(Vec::new())).collect();
+        assert_eq!(repair_group(4, &all).expect("repairable"), states);
+    }
+}
+
+#[cfg(test)]
+mod repair_cases {
+    use super::*;
+
+    fn blocks(states: &[Vec<u8>]) -> (usize, Vec<Vec<u8>>) {
+        let parity = encode_group(states).expect("codeable");
+        let all: Vec<Vec<u8>> = states
+            .iter()
+            .map(|s| symbol(s))
+            .chain(parity.iter().cloned())
+            .collect();
+        (states.len(), all)
+    }
+
+    fn lose(k: usize, all: &[Vec<u8>], gone: &[usize]) -> Vec<Option<Vec<u8>>> {
+        (0..k + rs::PARITY)
+            .map(|j| (!gone.contains(&j)).then(|| all[j].clone()))
+            .collect()
+    }
+
+    /// The cases trimming makes non-trivial, each named because each is a
+    /// different reason the width could be unrecoverable.
+    #[test]
+    fn the_cases_that_trimming_makes_hard_all_repair() {
+        // 1. The LONGEST member is the one lost: nothing left says how far the
+        //    group reaches except the rebuilt length prefix.
+        let states: Vec<Vec<u8>> = vec![vec![1u8; 10], vec![2u8; 20], vec![3u8; 500]];
+        let (k, all) = blocks(&states);
+        assert_eq!(repair_group(k, &lose(k, &all, &[2])).unwrap(), states);
+
+        // 2. BOTH of two equal-longest members lost, which is the case where
+        //    the parity tail can cancel while the data is not zero.
+        let states: Vec<Vec<u8>> = vec![vec![1u8; 8], vec![5u8; 300], vec![9u8; 300]];
+        let (k, all) = blocks(&states);
+        assert_eq!(repair_group(k, &lose(k, &all, &[1, 2])).unwrap(), states);
+
+        // 3. A member whose parity tail CANCELLED: two equal-longest members
+        //    chosen so the trimmed parity stops short of the data. Constructed,
+        //    not hoped for — the assertion below is what says it happened.
+        let a = vec![0xa5u8; 64];
+        let scale = rs::mul_pub(rs::coeff(0, 1), rs::div_pub(1, rs::coeff(0, 2)));
+        let b: Vec<u8> = a.iter().map(|&x| rs::mul_pub(x, scale)).collect();
+        let states = vec![vec![7u8; 4], a.clone(), b];
+        let (k, all) = blocks(&states);
+        let parity = &all[k];
+        assert!(
+            parity.len() < 4 + states[1].len(),
+            "the fixture must really cancel: parity is {} and the data reaches {}",
+            parity.len(),
+            4 + states[1].len()
+        );
+        assert_eq!(repair_group(k, &lose(k, &all, &[1])).unwrap(), states);
+
+        // 4. A PARITY block lost along with two data blocks.
+        let states: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8 + 1; 30 + i * 11]).collect();
+        let (k, all) = blocks(&states);
+        assert_eq!(
+            repair_group(k, &lose(k, &all, &[0, 3, k + 1])).unwrap(),
+            states
+        );
+
+        // 5. All-empty members: every block is empty, and it still repairs.
+        let states: Vec<Vec<u8>> = vec![Vec::new(); 5];
+        let (k, all) = blocks(&states);
+        assert!(
+            all.iter().skip(k).all(|p| p.is_empty()),
+            "parity must be empty"
+        );
+        assert_eq!(repair_group(k, &lose(k, &all, &[0, 1, 2])).unwrap(), states);
     }
 }
