@@ -21,6 +21,18 @@ pub trait Blocks {
     fn get(&self, cid: &Cid) -> Option<&[u8]>;
 }
 
+/// So a `&B` is a block source wherever `B` is.
+///
+/// Without it, anything that WRAPS a block source — the probed source in the
+/// tests, a caching layer, a counting one — has to own it, which means cloning
+/// a store to hand it to two wrappers. The trait takes `&self` already, so
+/// this costs nothing and removes a copy.
+impl<B: Blocks + ?Sized> Blocks for &B {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        (**self).get(cid)
+    }
+}
+
 /// A block source that can also be written to.
 ///
 /// [`apply_into`](crate::apply::apply_into) uses it so that no caller has to
