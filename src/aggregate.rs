@@ -248,7 +248,7 @@ pub fn fraud(parent: &[u8], child: &[u8]) -> bool {
     let id = block_id(kind::TREE_NODE, child);
     (0..p.len()).filter(|i| p.child(*i).0 == id).any(|i| {
         p.child(i).1 != c.agg()
-            || c.level() + 1 != p.level()
+            || !crate::node::one_level_below(p.level(), c.level())
             || (!c.is_empty() && p.key(i) != c.key(0))
     })
 }

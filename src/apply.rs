@@ -310,7 +310,9 @@ fn nodes_above<B: Blocks>(blocks: &B, root: &Cid, floor: u8) -> Result<Vec<Cid>,
             continue;
         }
         out.push(id);
-        if node.level() > floor + 1 {
+        // Saturating: `floor` is a caller's number, and "above floor + 1" at
+        // 255 is simply nothing (freenet-prolly#55).
+        if node.level() > floor.saturating_add(1) {
             for i in 0..node.len() {
                 todo.push((node.child(i).0, node.open(blocks, i)?));
             }
