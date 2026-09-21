@@ -34,7 +34,7 @@
 
 use crate::node::{Agg, Node, Value};
 use crate::range::{children, in_range, Range, Span, MAX_NEED};
-use crate::store::{load, load_child, Blocks, ReadError};
+use crate::store::{Blocks, Held, ReadError};
 use crate::{block_id, kind, Cid};
 
 /// A count taken from what branches RECORD about subtrees nobody opened.
@@ -126,10 +126,10 @@ pub fn aggregate_verified<B: Blocks>(
 
 fn run<B: Blocks>(blocks: &B, root: &Cid, r: &Range, trust: Trust) -> Result<Agg, AggError> {
     whole_range(r)?;
-    let node = load(blocks, root)?;
+    let node = Held::root(blocks, root)?;
     let mut out = Agg::default();
     let mut need = Vec::new();
-    count(blocks, &node, None, r, trust, &mut out, &mut need)?;
+    count(blocks, &node, r, trust, &mut out, &mut need)?;
     if !need.is_empty() {
         return Err(ReadError::Need(need).into());
     }
@@ -157,10 +157,9 @@ fn whole_range(r: &Range) -> Result<(), AggError> {
     Ok(())
 }
 
-fn count<B: Blocks>(
-    blocks: &B,
-    node: &Node<'_>,
-    upper: Option<&[u8]>,
+fn count<'a, B: Blocks>(
+    blocks: &'a B,
+    node: &Held<'a>,
     r: &Range,
     trust: Trust,
     out: &mut Agg,
@@ -187,7 +186,7 @@ fn count<B: Blocks>(
         }
         return Ok(());
     }
-    for c in children(node, upper, r) {
+    for c in children(node, r) {
         // A subtree wholly inside the range is the whole point: take what the
         // parent says and do not open it.
         if c.span == Span::Inside && trust == Trust::Claimed {
@@ -206,19 +205,12 @@ fn count<B: Blocks>(
             }
             continue;
         }
-        // `load_child` is what makes `Verified` mean anything: it refuses a
-        // child whose level, first key or aggregate disagrees with its parent.
-        let child = load_child(blocks, node, c.idx, upper)?;
-        let next = (c.idx + 1 < node.len()).then(|| node.key(c.idx + 1));
-        count(
-            blocks,
-            &child,
-            next.as_deref().or(upper),
-            r,
-            trust,
-            out,
-            need,
-        )?;
+        // `Held::open` is what makes `Verified` mean anything: it refuses a
+        // child whose level, first key or aggregate disagrees with its parent,
+        // or whose keys run past the bound it inherits (freenet-prolly#52 —
+        // before that, this counted `z` under `a` when `m` followed).
+        let child = node.open(blocks, c.idx)?;
+        count(blocks, &child, r, trust, out, need)?;
     }
     Ok(())
 }

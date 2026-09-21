@@ -17,7 +17,7 @@ use crate::boundary::{self, MAX_LOGICAL};
 use crate::chunk::{empty_leaf, Body, Closed, LevelChunker, SplitRule};
 use crate::cursor::LevelCursor;
 use crate::node::{Agg, BuildError, Node, Value, HEADER, MAX_INLINE, MAX_KEY};
-use crate::store::{child_upper, load, load_child, Blocks, BlocksMut, ReadError};
+use crate::store::{Blocks, BlocksMut, Held, ReadError};
 use crate::Cid;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -304,20 +304,15 @@ fn sync<B: Blocks>(overlay: &mut crate::store::Overlay<'_, B>, new: &[Closed], s
 
 fn nodes_above<B: Blocks>(blocks: &B, root: &Cid, floor: u8) -> Result<Vec<Cid>, ReadError> {
     let mut out = Vec::new();
-    let mut todo = vec![(*root, load(blocks, root)?, None::<Vec<u8>>)];
-    while let Some((id, node, upper)) = todo.pop() {
+    let mut todo = vec![(*root, Held::root(blocks, root)?)];
+    while let Some((id, node)) = todo.pop() {
         if node.level() <= floor {
             continue;
         }
         out.push(id);
         if node.level() > floor + 1 {
             for i in 0..node.len() {
-                let up = upper.as_deref();
-                todo.push((
-                    node.child(i).0,
-                    load_child(blocks, &node, i, up)?,
-                    child_upper(&node, i, up),
-                ));
+                todo.push((node.child(i).0, node.open(blocks, i)?));
             }
         }
     }

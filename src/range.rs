@@ -32,7 +32,7 @@
 use crate::boundary::MAX_LOGICAL;
 use crate::cursor::Cursor;
 use crate::node::{Agg, Node, Value};
-use crate::store::{load, Blocks, ReadError};
+use crate::store::{Blocks, Held, ReadError};
 use crate::Cid;
 use core::cmp::Ordering;
 use std::ops::Bound;
@@ -542,8 +542,8 @@ fn frontier<B: Blocks>(
         agg_bound: opts.agg_bound,
         cap_leaf_bytes: opts.cap_leaf_bytes,
     };
-    let node = load(blocks, root)?;
-    walk(blocks, &node, None, rest, &mut |c: &Child| {
+    let node = Held::root(blocks, root)?;
+    walk(blocks, &node, rest, &mut |c: &Child| {
         if f.covered {
             return Visit::Stop;
         }
@@ -667,13 +667,12 @@ pub(crate) enum Visit {
 /// consumer, and the range aggregate (#7) is another that needs the same
 /// classification for a different purpose. Neither belongs inside the walk.
 ///
-/// `upper` is the smallest key of whatever follows this node — the bound its
-/// last child's coverage ends at, which the node itself cannot know. That is
-/// what makes [`Span::Inside`] decidable for a last child.
-pub(crate) fn walk<B: Blocks>(
-    blocks: &B,
-    node: &Node<'_>,
-    upper: Option<&[u8]>,
+/// The node is [`Held`], so it carries the smallest key of whatever follows it
+/// — the bound its last child's coverage ends at, which the node itself cannot
+/// know. That is what makes [`Span::Inside`] decidable for a last child.
+pub(crate) fn walk<'a, B: Blocks>(
+    blocks: &'a B,
+    node: &Held<'a>,
     r: &Range,
     visit: &mut impl FnMut(&Child) -> Visit,
 ) -> Result<(), ReadError> {
@@ -684,7 +683,7 @@ pub(crate) fn walk<B: Blocks>(
     // Classified one index at a time rather than through a list, so a walk
     // allocates nothing per node either.
     for i in scan_order(node, r) {
-        let Some(c) = classify(node, i, upper, r) else {
+        let Some(c) = classify(node, i, node.upper(), r) else {
             continue;
         };
         match visit(&c) {
@@ -695,16 +694,13 @@ pub(crate) fn walk<B: Blocks>(
         if c.is_leaf || blocks.get(&c.id).is_none() {
             continue;
         }
-        let loaded = load(blocks, &c.id)?;
-        // Aggregates are believed for budgeting; how deep to recurse is not
-        // something an unverified chain gets to decide.
-        if loaded.level() + 1 != node.level() {
-            return Err(ReadError::Mismatch(c.id));
-        }
-        // Only here is a key actually built: the bound this child's own last
-        // child ends at.
-        let next = (c.idx + 1 < node.len()).then(|| node.key(c.idx + 1));
-        walk(blocks, &loaded, next.as_deref().or(upper), r, visit)?;
+        // Opened through `Held`, like every other child. This walk used to take
+        // a child on a level check alone ("aggregates are believed for
+        // budgeting"), but a SPAN is not a budget: an unchecked one made the
+        // frontier unsorted, and reverse paging over it returned the same page
+        // for ever (freenet-prolly#52).
+        let loaded = node.open(blocks, c.idx)?;
+        walk(blocks, &loaded, r, visit)?;
     }
     Ok(())
 }
@@ -714,9 +710,9 @@ pub(crate) fn walk<B: Blocks>(
 /// One level only, and it loads nothing: everything a [`Child`] carries is read
 /// from this node. A caller that wants to go deeper decides how, which is what
 /// separates the frontier from the range aggregate.
-pub(crate) fn children(node: &Node<'_>, upper: Option<&[u8]>, r: &Range) -> Vec<Child> {
+pub(crate) fn children(node: &Held<'_>, r: &Range) -> Vec<Child> {
     scan_order(node, r)
-        .filter_map(|i| classify(node, i, upper, r))
+        .filter_map(|i| classify(node, i, node.upper(), r))
         .collect()
 }
 

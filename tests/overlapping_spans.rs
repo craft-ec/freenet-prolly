@@ -37,7 +37,8 @@ fn leaf(es: &[(&[u8], &[u8])]) -> Vec<u8> {
 fn branch(level: u8, kids: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut n = NodeBuilder::branch(level);
     for (k, b) in kids {
-        n.push_child(k, id(b), Node::parse(b).unwrap().agg()).unwrap();
+        n.push_child(k, id(b), Node::parse(b).unwrap().agg())
+            .unwrap();
     }
     n.finish().unwrap()
 }
@@ -53,7 +54,7 @@ fn store(nodes: &[&Vec<u8>]) -> MemBlocks {
 }
 
 /// A malformed tree: its root, its blocks, and a hand-built range proof over
-/// all of it — every node, in the order a read takes them.
+/// all of it — every node, in the order the verifier replays them.
 struct Bad {
     root: Cid,
     blocks: MemBlocks,
@@ -69,8 +70,14 @@ fn adjacent() -> Bad {
     Bad {
         root: id(&p),
         blocks: store(&[&l1, &l2, &p]),
-        range_proof: Proof { nodes: vec![p.clone(), l1, l2.clone()], value: None },
-        z_proof: Proof { nodes: vec![p, l2], value: None },
+        range_proof: Proof {
+            nodes: vec![p.clone(), l1, l2.clone()],
+            value: None,
+        },
+        z_proof: Proof {
+            nodes: vec![p, l2],
+            value: None,
+        },
     }
 }
 
@@ -84,10 +91,15 @@ fn ancestor() -> Bad {
         root: id(&g),
         blocks: store(&[&la, &lm, &pa, &pm, &g]),
         range_proof: Proof {
-            nodes: vec![g.clone(), pa, la, pm.clone(), lm.clone()],
+            // Level by level, the order the prover emits (a depth-first order
+            // is refused as OutOfOrder before any span is looked at).
+            nodes: vec![g.clone(), pa, pm.clone(), la, lm.clone()],
             value: None,
         },
-        z_proof: Proof { nodes: vec![g, pm, lm], value: None },
+        z_proof: Proof {
+            nodes: vec![g, pm, lm],
+            value: None,
+        },
     }
 }
 
@@ -123,7 +135,12 @@ fn a_range_proof_over_an_overlap_is_refused() {
     }
     // CONTROL: an honest proof of the same entries is accepted.
     let (root, b) = honest();
-    let page = verify_range_bytes(&root, &all(), &prove_range(&b, &root, &all()).unwrap().encode()).unwrap();
+    let page = verify_range_bytes(
+        &root,
+        &all(),
+        &prove_range(&b, &root, &all()).unwrap().encode(),
+    )
+    .unwrap();
     assert_eq!(page.entries.len(), 3, "CONTROL: the honest range proof");
 }
 
@@ -144,7 +161,13 @@ fn the_prover_cannot_build_one_either() {
 /// parent says the leaf under `a` ends at `m`, so a read of `[n, ..)` never
 /// opens it — see `a_range_that_never_opens_the_bad_leaf_agrees_with_descent`.
 fn touching() -> [Range; 2] {
-    [all(), Range { hi: Bound::Excluded(b"m".to_vec()), ..all() }]
+    [
+        all(),
+        Range {
+            hi: Bound::Excluded(b"m".to_vec()),
+            ..all()
+        },
+    ]
 }
 
 #[test]
@@ -160,7 +183,11 @@ fn the_plain_read_path_refuses_too() {
         }
     }
     let (root, b) = honest();
-    assert_eq!(range(&b, &root, &all()).unwrap().entries.len(), 3, "CONTROL");
+    assert_eq!(
+        range(&b, &root, &all()).unwrap().entries.len(),
+        3,
+        "CONTROL"
+    );
 }
 
 /// `Verified` means "independent of the writer's word". A range whose read
@@ -180,8 +207,15 @@ fn aggregate_verified_refuses_rather_than_answers() {
         }
     }
     let (root, b) = honest();
-    let n = Range { lo: Bound::Included(b"n".to_vec()), ..all() };
-    assert_eq!(aggregate_verified(&b, &root, &n).unwrap().agg().count, 1, "CONTROL: keys >= n");
+    let n = Range {
+        lo: Bound::Included(b"n".to_vec()),
+        ..all()
+    };
+    assert_eq!(
+        aggregate_verified(&b, &root, &n).unwrap().agg().count,
+        1,
+        "CONTROL: keys >= n"
+    );
 }
 
 /// CONSISTENCY, not detection — the same property as the point proof for `z`
@@ -192,12 +226,26 @@ fn aggregate_verified_refuses_rather_than_answers() {
 /// OTHER answers (a range proof showing `z`) that disagreed with it.
 #[test]
 fn a_range_that_never_opens_the_bad_leaf_agrees_with_descent() {
-    let n = Range { lo: Bound::Included(b"n".to_vec()), ..all() };
+    let n = Range {
+        lo: Bound::Included(b"n".to_vec()),
+        ..all()
+    };
     for (name, t) in both() {
-        assert_eq!(range(&t.blocks, &t.root, &n).map(|p| p.entries.len()), Ok(0), "{name}: range [n, ..)");
-        assert_eq!(aggregate_verified(&t.blocks, &t.root, &n).map(|v| v.agg().count), Ok(0), "{name}: aggregate_verified [n, ..)");
+        assert_eq!(
+            range(&t.blocks, &t.root, &n).map(|p| p.entries.len()),
+            Ok(0),
+            "{name}: range [n, ..)"
+        );
+        assert_eq!(
+            aggregate_verified(&t.blocks, &t.root, &n).map(|v| v.agg().count),
+            Ok(0),
+            "{name}: aggregate_verified [n, ..)"
+        );
         assert!(
-            matches!(verify_bytes(&t.root, b"z", &t.z_proof.encode()), Ok(ProvenOwned::Absent)),
+            matches!(
+                verify_bytes(&t.root, b"z", &t.z_proof.encode()),
+                Ok(ProvenOwned::Absent)
+            ),
             "{name}: and the point proof agrees"
         );
     }
@@ -209,7 +257,11 @@ fn a_range_that_never_opens_the_bad_leaf_agrees_with_descent() {
 fn paging_terminates_in_both_directions() {
     for (name, t) in both() {
         for reverse in [false, true] {
-            let mut r = Range { max_entries: 2, reverse, ..all() };
+            let mut r = Range {
+                max_entries: 2,
+                reverse,
+                ..all()
+            };
             let mut pages = 0;
             let ended = loop {
                 if pages == 10 {
@@ -217,29 +269,49 @@ fn paging_terminates_in_both_directions() {
                 }
                 pages += 1;
                 // Through the proof path, the way a reader of a foreign tree pages.
-                let Ok(pf) = prove_range(&t.blocks, &t.root, &r) else { break true };
-                let Ok(pg) = verify_range_bytes(&t.root, &r, &pf.encode()) else { break true };
+                let Ok(pf) = prove_range(&t.blocks, &t.root, &r) else {
+                    break true;
+                };
+                let Ok(pg) = verify_range_bytes(&t.root, &r, &pf.encode()) else {
+                    break true;
+                };
                 match pg.next {
                     Some(n) => r.after = Some(n),
                     None => break true,
                 }
             };
-            assert!(ended, "{name}: paging (reverse={reverse}) did not end in 10 pages of 2 over 3 entries");
+            assert!(
+                ended,
+                "{name}: paging (reverse={reverse}) did not end in 10 pages of 2 over 3 entries"
+            );
         }
     }
     // CONTROL: over the honest tree, paging really runs AND finishes, with every key.
     let (root, b) = honest();
     for reverse in [false, true] {
-        let (mut r, mut seen) = (Range { max_entries: 2, reverse, ..all() }, vec![]);
+        let (mut r, mut seen) = (
+            Range {
+                max_entries: 2,
+                reverse,
+                ..all()
+            },
+            vec![],
+        );
         for _ in 0..10 {
-            let pg = verify_range_bytes(&root, &r, &prove_range(&b, &root, &r).unwrap().encode()).unwrap();
+            let pg = verify_range_bytes(&root, &r, &prove_range(&b, &root, &r).unwrap().encode())
+                .unwrap();
             seen.extend(pg.entries.iter().map(|(k, _)| k.clone()));
             match pg.next {
                 Some(n) => r.after = Some(n),
                 None => break,
             }
         }
-        assert_eq!(seen.len(), 3, "CONTROL: honest paging (reverse={reverse}) reached {} of 3", seen.len());
+        assert_eq!(
+            seen.len(),
+            3,
+            "CONTROL: honest paging (reverse={reverse}) reached {} of 3",
+            seen.len()
+        );
     }
 }
 
@@ -256,9 +328,17 @@ fn the_point_proof_for_z_still_says_absent() {
             matches!(got, Ok(ProvenOwned::Absent)),
             "{name}: the point proof for `z` gave {got:?}"
         );
-        assert_eq!(read::get(&t.blocks, &t.root, b"z").map(|v| v.is_some()), Ok(false), "{name}: read::get(z)");
+        assert_eq!(
+            read::get(&t.blocks, &t.root, b"z").map(|v| v.is_some()),
+            Ok(false),
+            "{name}: read::get(z)"
+        );
         // And `m`, the other side of the same bad parent, still reads.
-        assert_eq!(read::get(&t.blocks, &t.root, b"m").map(|v| v.is_some()), Ok(true), "{name}: read::get(m)");
+        assert_eq!(
+            read::get(&t.blocks, &t.root, b"m").map(|v| v.is_some()),
+            Ok(true),
+            "{name}: read::get(m)"
+        );
     }
 }
 
@@ -293,14 +373,26 @@ fn spans(b: &MemBlocks, cid: &Cid, upper: Option<Vec<u8>>, inherit: bool) -> (us
 #[test]
 fn adjacent_only_check_misses_the_ancestor_variant() {
     let (a, g) = (adjacent(), ancestor());
-    assert_eq!(spans(&a.blocks, &a.root, None, false).1, 1, "adjacent-only sees the adjacent overlap");
+    assert_eq!(
+        spans(&a.blocks, &a.root, None, false).1,
+        1,
+        "adjacent-only sees the adjacent overlap"
+    );
     assert_eq!(
         spans(&g.blocks, &g.root, None, false).1,
         0,
         "adjacent-only MISSES the ancestor overlap — if this is 1, the ancestor fixture no longer tests the inheritance"
     );
-    assert_eq!(spans(&a.blocks, &a.root, None, true).1, 1, "inherited sees the adjacent overlap");
-    assert_eq!(spans(&g.blocks, &g.root, None, true).1, 1, "inherited sees the ancestor overlap");
+    assert_eq!(
+        spans(&a.blocks, &a.root, None, true).1,
+        1,
+        "inherited sees the adjacent overlap"
+    );
+    assert_eq!(
+        spans(&g.blocks, &g.root, None, true).1,
+        1,
+        "inherited sees the ancestor overlap"
+    );
 }
 
 /// The falsifier for the whole fix: the WRITER never produces an overlap. If
@@ -317,10 +409,26 @@ fn an_honest_tree_has_no_overlapping_spans() {
     es.sort();
     es.dedup_by(|a, b| a.0 == b.0);
     let mut b = MemBlocks::default();
-    let root = build::build(es.iter().map(|(k, v)| (&k[..], Value::Inline(&v[..]))), |c, x| b.insert(c, x)).unwrap();
+    let root = build::build(
+        es.iter().map(|(k, v)| (&k[..], Value::Inline(&v[..]))),
+        |c, x| b.insert(c, x),
+    )
+    .unwrap();
     let (seen, bad) = spans(&b, &root, None, true);
-    assert!(seen > 1_000, "the tree has {seen} nodes — too small to say anything about the writer");
-    assert_eq!(bad, 0, "the writer produced {bad} overlapping spans in {seen} nodes");
+    assert!(
+        seen > 1_000,
+        "the tree has {seen} nodes — too small to say anything about the writer"
+    );
+    assert_eq!(
+        bad, 0,
+        "the writer produced {bad} overlapping spans in {seen} nodes"
+    );
     // And the reader agrees: every entry comes back through the checked path.
-    assert_eq!(freenet_prolly::aggregate::aggregate_verified(&b, &root, &all()).unwrap().agg().count as usize, es.len());
+    assert_eq!(
+        freenet_prolly::aggregate::aggregate_verified(&b, &root, &all())
+            .unwrap()
+            .agg()
+            .count as usize,
+        es.len()
+    );
 }

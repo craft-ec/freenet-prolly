@@ -5,24 +5,17 @@
 //! [`ReadError::Need`] the caller supplies the block and simply repeats it.
 
 use crate::node::{Agg, Node, Value};
-use crate::store::{child_upper, load, load_child, Blocks, ReadError};
+use crate::store::{Blocks, Held, ReadError};
 use crate::Cid;
 
 struct Step<'a> {
     id: Cid,
-    node: Node<'a>,
+    /// Held, not bare: the bound this node's keys must stay under travels with
+    /// it, so every child opened below it is checked against the whole path
+    /// (freenet-prolly#52).
+    node: Held<'a>,
     /// Which child the path takes below this node (unused at the floor).
     taken: usize,
-}
-
-/// The smallest key after the subtree `path`'s LAST step sits in: the deepest
-/// step with a child after the one it took. What `load_child` needs as the
-/// bound of a child of the step BELOW these (freenet-prolly#52).
-fn bound_above(path: &[Step<'_>]) -> Option<Vec<u8>> {
-    path.iter()
-        .rev()
-        .find(|s| s.taken + 1 < s.node.len())
-        .map(|s| s.node.key(s.taken + 1))
 }
 
 pub struct LevelCursor<'a, B: Blocks> {
@@ -43,7 +36,7 @@ pub(crate) fn child_for(node: &Node<'_>, key: &[u8]) -> usize {
 impl<'a, B: Blocks> LevelCursor<'a, B> {
     /// A cursor on the LAST node of the floor level.
     pub fn seek_last(blocks: &'a B, root: &Cid, floor: u8) -> Result<Option<Self>, ReadError> {
-        let node = load(blocks, root)?;
+        let node = Held::root(blocks, root)?;
         if node.level() < floor {
             return Ok(None);
         }
@@ -72,7 +65,7 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         floor: u8,
         pick: impl Fn(&Node<'a>) -> Option<usize>,
     ) -> Result<Option<Self>, ReadError> {
-        let node = load(blocks, root)?;
+        let node = Held::root(blocks, root)?;
         if node.level() < floor {
             return Ok(None);
         }
@@ -104,7 +97,7 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         floor: u8,
         key: &[u8],
     ) -> Result<Option<Self>, ReadError> {
-        let node = load(blocks, root)?;
+        let node = Held::root(blocks, root)?;
         if node.level() < floor {
             return Ok(None);
         }
@@ -128,10 +121,8 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
             while self.path.last().expect("non-empty").node.level() > self.floor {
                 let top = self.path.last_mut().expect("non-empty");
                 top.taken = pick(&top.node);
-                let upper = bound_above(&self.path[..self.path.len() - 1]);
-                let top = self.path.last().expect("non-empty");
                 let (id, _) = top.node.child(top.taken);
-                let node = load_child(self.blocks, &top.node, top.taken, upper.as_deref())?;
+                let node = top.node.open(self.blocks, top.taken)?;
                 self.path.push(Step { id, node, taken: 0 });
             }
             Ok(())
@@ -185,10 +176,9 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         s.taken = if right { s.taken + 1 } else { s.taken - 1 };
         // `descend` sets `taken` on the node it starts from, so start one below.
         let r = (|| {
-            let upper = bound_above(&self.path[..d]);
             let top = &self.path[d];
             let (id, _) = top.node.child(top.taken);
-            let node = load_child(self.blocks, &top.node, top.taken, upper.as_deref())?;
+            let node = top.node.open(self.blocks, top.taken)?;
             self.path.push(Step { id, node, taken: 0 });
             self.descend(|n| if right { 0 } else { n.len() - 1 })
         })();
@@ -223,11 +213,8 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         let mut i = s.taken - 1;
         let mut held;
         let mut node = &s.node;
-        let mut upper = bound_above(&self.path[..d]);
         while node.level() > self.floor + 1 {
-            let next = child_upper(node, i, upper.as_deref());
-            held = load_child(self.blocks, node, i, upper.as_deref())?;
-            upper = next;
+            held = node.open(self.blocks, i)?;
             node = &held;
             i = node.len() - 1;
         }
@@ -562,7 +549,7 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
     /// at a cost of one block each, and at NO cost when their roots are equal,
     /// because the caller compares the ids it already has before opening.
     pub fn open(blocks: &'a B, root: &Cid) -> Result<Option<Self>, ReadError> {
-        let node = load(blocks, root)?;
+        let node = Held::root(blocks, root)?;
         if node.is_empty() {
             return Ok(None);
         }
@@ -625,8 +612,13 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
         }
     }
 
-    /// The first key AFTER this slot, read from the ancestors — never by
-    /// loading anything. `None` at the end of the tree.
+    /// The first key AFTER this slot — never by loading anything. `None` at the
+    /// end of the tree.
+    ///
+    /// The slot's next sibling, else the bound its node was OPENED under: the
+    /// same fact `Held::open` checked, read rather than re-derived from the
+    /// ancestors (it used to be computed here and enforced nowhere, while
+    /// `diff` dismissed whole subtrees on it — freenet-prolly#52).
     ///
     /// This is what lets a whole subtree be dismissed as lying below the other
     /// side's position without opening it.
@@ -636,16 +628,7 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
             return None;
         }
         let s = self.top();
-        if s.taken + 1 < s.node.len() {
-            return Some(s.node.key(s.taken + 1));
-        }
-        self.path[..self.path.len() - 1]
-            .iter()
-            .rposition(|s| s.taken + 1 < s.node.len())
-            .map(|d| {
-                let s = &self.path[d];
-                s.node.key(s.taken + 1)
-            })
+        s.node.child_upper(s.taken)
     }
 
     /// Load the current slot's child and stand on its first slot.
@@ -658,11 +641,10 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
             self.at_root = false;
             return Ok(self.top().id);
         }
-        let upper = bound_above(&self.path[..self.path.len() - 1]);
         let top = self.path.last().expect("non-empty");
         debug_assert!(!top.node.is_leaf(), "an entry has nothing below it");
         let (id, _) = top.node.child(top.taken);
-        let node = load_child(self.blocks, &top.node, top.taken, upper.as_deref())?;
+        let node = top.node.open(self.blocks, top.taken)?;
         self.path.push(Step { id, node, taken: 0 });
         Ok(id)
     }
@@ -714,6 +696,6 @@ impl<'a, B: Blocks> SlotCursor<'a, B> {
         self.path
             .iter()
             .find(|s| s.node.level() == level)
-            .map(|s| (&s.node, s.taken))
+            .map(|s| (s.node.node(), s.taken))
     }
 }

@@ -118,63 +118,118 @@ pub enum ReadError {
     Mismatch(Cid),
 }
 
-/// Load and parse the node `cid`.
+/// Load and parse the node `cid`, UNCHECKED — for a root, or a block looked at
+/// on its own. A child reached from a parent is opened with [`Held::open`],
+/// which is what checks it; a `Node` from here is not bound to any parent.
 pub fn load<'a>(blocks: &'a impl Blocks, cid: &Cid) -> Result<Node<'a>, ReadError> {
     let bytes = blocks.get(cid).ok_or_else(|| ReadError::Need(vec![*cid]))?;
     Node::parse(bytes).map_err(|e| ReadError::Corrupt(*cid, e))
 }
 
-/// The smallest key AFTER child `i` of `parent`: its next sibling's key, else
-/// whatever follows the parent itself (`upper`, the caller's own bound).
+/// A node reached from a trusted root, carrying the bound its keys must stay
+/// under (freenet-prolly#52).
 ///
-/// `None` only at the right edge of the whole tree.
-pub fn child_upper(parent: &Node<'_>, i: usize, upper: Option<&[u8]>) -> Option<Vec<u8>> {
-    if i + 1 < parent.len() {
-        Some(parent.key(i + 1))
-    } else {
-        upper.map(<[u8]>::to_vec)
+/// THE ONLY WAY TO HOLD A CHILD. A parent records each child's FIRST key and
+/// nothing about its last, so a writer can put `z` in the leaf under `a` and `m`
+/// in the next one: one root, and a range read says `z` is present while a
+/// point read — which descends to the child under `m` — says it is absent.
+/// Equivocation without a fork. The fix is that a child's keys END before
+/// whatever follows it, and that bound is INHERITED: a leaf that is the last
+/// child of its parent is bounded by the parent's own successor, which only the
+/// path from the root knows. (A next-sibling-only check was tried: it refused
+/// the adjacent overlap, kept the suite green, and still accepted the same
+/// overlap one level up. `tests/overlapping_spans.rs` keeps it as the control.)
+///
+/// So the bound travels WITH the node rather than as a parameter: a parameter
+/// was computed in two places and enforced in none, and the next call site
+/// would forget it again. The fields are private, [`Held::root`] is the only
+/// way in and [`Held::open`] the only way down, so a child that skipped the
+/// checks cannot exist:
+///
+/// ```compile_fail,E0451
+/// # use freenet_prolly::{node::Node, store::Held};
+/// fn forge<'a>(node: Node<'a>) -> Held<'a> { Held { node, upper: None } }
+/// ```
+/// and the unchecked route it replaced is gone:
+/// ```compile_fail,E0432
+/// use freenet_prolly::store::load_child;
+/// ```
+/// The CONTROL for both — the sanctioned route compiles, so the two above fail
+/// for the reason they name and not a typo:
+/// ```
+/// # use freenet_prolly::{store::{Held, MemBlocks, ReadError}, Cid};
+/// fn way_in(b: &MemBlocks, root: &Cid) -> Result<Option<Vec<u8>>, ReadError> {
+///     let h = Held::root(b, root)?;
+///     Ok(if h.is_leaf() { None } else { h.open(b, 0)?.upper().map(<[u8]>::to_vec) })
+/// }
+/// ```
+pub struct Held<'a> {
+    node: Node<'a>,
+    /// The smallest key after this node's whole subtree. `None` at the right
+    /// edge of the tree — nothing follows a root.
+    upper: Option<Vec<u8>>,
+}
+
+impl<'a> Held<'a> {
+    /// The only way in. Nothing follows a whole tree, so a root is unbounded.
+    pub fn root(blocks: &'a impl Blocks, cid: &Cid) -> Result<Held<'a>, ReadError> {
+        Ok(Held {
+            node: load(blocks, cid)?,
+            upper: None,
+        })
+    }
+
+    /// The only way down: load child `i` and check it against what this node
+    /// records — its level, its first key, its aggregate — and that its keys
+    /// END before the bound it inherits.
+    ///
+    /// One comparison suffices for the span: `Node::parse` refuses unsorted
+    /// keys, so a last key under the bound puts every key under it, and a
+    /// branch's own children are held to the same bound when THEY are opened.
+    pub fn open(&self, blocks: &'a impl Blocks, i: usize) -> Result<Held<'a>, ReadError> {
+        let (cid, agg) = self.node.child(i);
+        let child = load(blocks, &cid)?;
+        let upper = self.child_upper(i);
+        let ok = child.level() + 1 == self.node.level()
+            && !child.is_empty()
+            && child.agg() == agg
+            && child.key(0) == self.node.key(i)
+            && match &upper {
+                Some(end) => child.key(child.len() - 1) < *end,
+                None => true,
+            };
+        if ok {
+            Ok(Held { node: child, upper })
+        } else {
+            Err(ReadError::Mismatch(cid))
+        }
+    }
+
+    /// The smallest key after this node's subtree; `None` at the right edge.
+    pub fn upper(&self) -> Option<&[u8]> {
+        self.upper.as_deref()
+    }
+
+    /// The bound child `i` will be held to, without loading it: its next
+    /// sibling's key, else this node's own bound.
+    pub fn child_upper(&self, i: usize) -> Option<Vec<u8>> {
+        if i + 1 < self.node.len() {
+            Some(self.node.key(i + 1))
+        } else {
+            self.upper.clone()
+        }
+    }
+
+    pub fn node(&self) -> &Node<'a> {
+        &self.node
     }
 }
 
-/// Load child `i` of `parent` and check it against what the parent records, so
-/// that everything reached from a trusted root is itself trusted.
-///
-/// `upper` is the smallest key after `parent`'s whole subtree — what the
-/// caller was itself bounded by, `None` at the root. The child's span must
-/// END before its bound (freenet-prolly#52).
-///
-/// WHY THE BOUND IS INHERITED, not just the next sibling's key. A parent
-/// records each child's FIRST key, so without an upper bound a writer can put
-/// `z` in the leaf under `a` and `m` in the next one: one root, and a range
-/// read says `z` is present while a point read — which descends to the child
-/// under `m` — says it is absent. Equivocation without a fork. Checking only
-/// against the next sibling refuses that tree and still accepts the same
-/// overlap one level up: a leaf under the LAST child of a branch is bounded by
-/// the branch's own successor, which only an inherited bound carries. That
-/// adjacent-only check was tried, kept the whole suite green, and still
-/// accepted the ancestor variant — the tests keep it as the control.
-///
-/// One comparison suffices: `Node::parse` refuses unsorted keys, so a last
-/// key below the bound puts every key below it.
-pub fn load_child<'a>(
-    blocks: &'a impl Blocks,
-    parent: &Node<'_>,
-    i: usize,
-    upper: Option<&[u8]>,
-) -> Result<Node<'a>, ReadError> {
-    let (cid, agg) = parent.child(i);
-    let child = load(blocks, &cid)?;
-    let ok = child.level() + 1 == parent.level()
-        && !child.is_empty()
-        && child.agg() == agg
-        && child.key(0) == parent.key(i)
-        && match child_upper(parent, i, upper) {
-            Some(end) => child.key(child.len() - 1) < end,
-            None => true,
-        };
-    if ok {
-        Ok(child)
-    } else {
-        Err(ReadError::Mismatch(cid))
+/// Read access to the node. Reading is free; only CONSTRUCTING a `Held` is
+/// guarded, and that is what `Deref` cannot do.
+impl<'a> core::ops::Deref for Held<'a> {
+    type Target = Node<'a>;
+    fn deref(&self) -> &Node<'a> {
+        &self.node
     }
 }
