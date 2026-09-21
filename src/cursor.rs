@@ -213,7 +213,9 @@ impl<'a, B: Blocks> LevelCursor<'a, B> {
         let mut i = s.taken - 1;
         let mut held;
         let mut node = &s.node;
-        while node.level() > self.floor + 1 {
+        // Saturating, as in `apply::nodes_above`: `floor` comes from the
+        // caller, and nothing is above 256 (freenet-prolly#55).
+        while node.level() > self.floor.saturating_add(1) {
             held = node.open(self.blocks, i)?;
             node = &held;
             i = node.len() - 1;

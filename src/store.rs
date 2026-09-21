@@ -190,7 +190,7 @@ impl<'a> Held<'a> {
         let (cid, agg) = self.node.child(i);
         let child = load(blocks, &cid)?;
         let upper = self.child_upper(i);
-        let ok = child.level() + 1 == self.node.level()
+        let ok = crate::node::one_level_below(self.node.level(), child.level())
             && !child.is_empty()
             && child.agg() == agg
             && child.key(0) == self.node.key(i)

@@ -735,3 +735,15 @@ impl NodeBuilder {
         Ok(out)
     }
 }
+
+/// Is `child` exactly one level below `parent`? The ONE place this is decided.
+///
+/// Both levels come from bytes a stranger may have written, and a level is a
+/// `u8`: `child + 1 == parent` overflows at 255 (freenet-prolly#55). With
+/// overflow checks on that is a PANIC inside the verifiers that exist to take
+/// strangers' bytes; with them off it wraps to 0, and the answer was right only
+/// because no branch has level 0. Checked arithmetic makes the answer the same
+/// in every profile, on purpose rather than by accident.
+pub(crate) fn one_level_below(parent: u8, child: u8) -> bool {
+    child.checked_add(1) == Some(parent)
+}
