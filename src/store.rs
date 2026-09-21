@@ -124,19 +124,54 @@ pub fn load<'a>(blocks: &'a impl Blocks, cid: &Cid) -> Result<Node<'a>, ReadErro
     Node::parse(bytes).map_err(|e| ReadError::Corrupt(*cid, e))
 }
 
+/// The smallest key AFTER child `i` of `parent`: its next sibling's key, else
+/// whatever follows the parent itself (`upper`, the caller's own bound).
+///
+/// `None` only at the right edge of the whole tree.
+pub fn child_upper(parent: &Node<'_>, i: usize, upper: Option<&[u8]>) -> Option<Vec<u8>> {
+    if i + 1 < parent.len() {
+        Some(parent.key(i + 1))
+    } else {
+        upper.map(<[u8]>::to_vec)
+    }
+}
+
 /// Load child `i` of `parent` and check it against what the parent records, so
 /// that everything reached from a trusted root is itself trusted.
+///
+/// `upper` is the smallest key after `parent`'s whole subtree — what the
+/// caller was itself bounded by, `None` at the root. The child's span must
+/// END before its bound (freenet-prolly#52).
+///
+/// WHY THE BOUND IS INHERITED, not just the next sibling's key. A parent
+/// records each child's FIRST key, so without an upper bound a writer can put
+/// `z` in the leaf under `a` and `m` in the next one: one root, and a range
+/// read says `z` is present while a point read — which descends to the child
+/// under `m` — says it is absent. Equivocation without a fork. Checking only
+/// against the next sibling refuses that tree and still accepts the same
+/// overlap one level up: a leaf under the LAST child of a branch is bounded by
+/// the branch's own successor, which only an inherited bound carries. That
+/// adjacent-only check was tried, kept the whole suite green, and still
+/// accepted the ancestor variant — the tests keep it as the control.
+///
+/// One comparison suffices: `Node::parse` refuses unsorted keys, so a last
+/// key below the bound puts every key below it.
 pub fn load_child<'a>(
     blocks: &'a impl Blocks,
     parent: &Node<'_>,
     i: usize,
+    upper: Option<&[u8]>,
 ) -> Result<Node<'a>, ReadError> {
     let (cid, agg) = parent.child(i);
     let child = load(blocks, &cid)?;
     let ok = child.level() + 1 == parent.level()
         && !child.is_empty()
         && child.agg() == agg
-        && child.key(0) == parent.key(i);
+        && child.key(0) == parent.key(i)
+        && match child_upper(parent, i, upper) {
+            Some(end) => child.key(child.len() - 1) < end,
+            None => true,
+        };
     if ok {
         Ok(child)
     } else {

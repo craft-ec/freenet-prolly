@@ -208,7 +208,7 @@ fn count<B: Blocks>(
         }
         // `load_child` is what makes `Verified` mean anything: it refuses a
         // child whose level, first key or aggregate disagrees with its parent.
-        let child = load_child(blocks, node, c.idx)?;
+        let child = load_child(blocks, node, c.idx, upper)?;
         let next = (c.idx + 1 < node.len()).then(|| node.key(c.idx + 1));
         count(
             blocks,
