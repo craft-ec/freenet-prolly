@@ -514,9 +514,17 @@ impl<'a> ProofStore<'a> {
             return Err(ProofError::Extra);
         }
         // And the list is in the format's order: the order rule.
+        // THE EMPTY TREE. Its root is the one node with no first key; it orders
+        // as `(0, [])`. No "only when alone" condition: an empty block that is not
+        // the root is either never read (`Extra`) or read as a child and refused
+        // by `load_child` (`Mismatch`), both BEFORE this check — so such a
+        // condition would be a guard no test can distinguish (prolly#53).
         let key_of = |b: &[u8]| -> Option<(u8, Vec<u8>)> {
             let n = Node::parse(b).ok()?;
-            (!n.is_empty()).then(|| (n.level(), n.key(0)))
+            if n.is_empty() {
+                return n.is_leaf().then(|| (0, Vec::new()));
+            }
+            Some((n.level(), n.key(0)))
         };
         let mut last: Option<(u8, Vec<u8>)> = None;
         for (_, b) in &self.blocks {
@@ -612,6 +620,7 @@ pub fn verify<'a>(root: &Cid, key: &[u8], proof: &'a Proof) -> Result<Proven<'a>
 /// subtrees nobody opened; a proof shows the writer said so, and no proof can
 /// show it is true.
 pub fn verify_aggregate(root: &Cid, range: &Range, proof: &Proof) -> Result<Claimed, ProofError> {
+    no_trailer(proof)?;
     // An aggregate reads at most the two edge paths, so two per level.
     shape(proof, root, 2)?;
     let store = ProofStore::new(proof)?;
@@ -755,6 +764,18 @@ pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof
     Ok(Proof { nodes, value: None })
 }
 
+/// `Proof::value` carries the bytes behind ONE referenced value, which only a
+/// point proof names. On a range or aggregate proof nothing reads it, so it is
+/// unauthenticated bytes riding along: refused, FIRST, so the decoded door and
+/// the wire door cannot disagree about it (the wire door already answers
+/// `Extra` for an empty query carrying one).
+fn no_trailer(proof: &Proof) -> Result<(), ProofError> {
+    if proof.value.is_some() {
+        return Err(ProofError::Extra);
+    }
+    Ok(())
+}
+
 /// Check a page against a root, from the proof alone.
 ///
 /// Completeness rests on HOW the page ended — `Limit`, `EndOfRange` or
@@ -777,6 +798,7 @@ pub fn prove_range<B: Blocks>(blocks: &B, root: &Cid, r: &Range) -> Result<Proof
 /// question getting a different answer from the tree's: anything needing blocks
 /// the proof does not carry is refused rather than guessed at.
 pub fn verify_range(root: &Cid, r: &Range, proof: &Proof) -> Result<ProvenPage, ProofError> {
+    no_trailer(proof)?;
     let per_page = bounded(r)?;
     // A question whose BOUNDS cannot hold a key is answered by the verifier
     // itself, from its own range — nothing in the proof is consulted, because
