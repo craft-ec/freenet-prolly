@@ -189,6 +189,25 @@ impl From<ReadError> for DiffError {
 }
 
 /// The changes from `a` to `b` within `r`, in key order.
+///
+/// # Paging, and what a page means
+///
+/// A page is a correct PREFIX of the full diff: every change at or before
+/// where it stopped is present and true, nothing past the first key it could
+/// not establish is emitted, and `next` never advances past it. So:
+///
+/// 1. Apply `changes` in order. They are final and will not be re-delivered.
+/// 2. Fetch `need`, then call again with `resume = page.next` — ALWAYS
+///    `page.next`, even when it is `None`.
+/// 3. Finished ⇔ `next` is `None` AND `need` is empty. A page with `need` and
+///    no `next` is "nothing decided yet", not "done".
+/// 4. A page may carry no `changes` and a non-empty `need`. That is never
+///    evidence of no change — nor of change.
+///
+/// Discarding a page because it has `need` and restarting is also correct,
+/// but it needs the diff's whole working set held at once: under eviction it
+/// can fail to finish where applying the prefix finishes
+/// (`tests/diff_missing_root.rs`).
 pub fn diff<'a, B: Blocks>(
     blocks: &'a B,
     a: &Cid,
@@ -255,6 +274,30 @@ pub fn diff<'a, B: Blocks>(
         (Ok(x), Ok(y)) => (x, y),
         (Err(e), _) | (_, Err(e)) => return Err(e.into()),
     };
+    // A ROOT THAT IS NOT HELD IS NOT AN EMPTY TREE (freenet-prolly#51).
+    //
+    // `open` answers `None` for both — a missing root, and a held root with
+    // nothing in it — and `run` reads `None` as a side with nothing left. For
+    // a missing root that is false: with the other tree warm, it came out
+    // wholly `Added` (or `Removed`), `next` ran to the end, and the resume
+    // returned nothing. So when either root is missing, nothing is decided:
+    // the page is the EMPTY PREFIX, with the token echoed for the reason given
+    // at `last:` above. Keyed on `stopped`, which only a `Need` sets here —
+    // NOT on `is_none()`, which would turn a diff to or from a genuinely
+    // empty tree into "nothing yet" for ever.
+    if s.stopped {
+        let next = s.last.clone().map(|after| Resume {
+            a: *a,
+            b: *b,
+            after,
+        });
+        return Ok(DiffPage {
+            changes: Vec::new(),
+            next,
+            need: s.need,
+            new_blocks: Vec::new(),
+        });
+    }
     // `b`'s root is NOT named here. With the cursor standing on the root as a
     // slot, the root is reported by the same rule as every other node: if the
     // comparison against `a` fails, entering it is a `descend` that names it.
