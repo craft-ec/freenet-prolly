@@ -189,7 +189,7 @@ fn control_54_honest_range_aggregate_and_empty_query_still_verify() {
     );
 }
 #[test]
-fn control_54_a_point_proof_with_its_GENUINE_value_trailer_still_verifies() {
+fn control_54_a_point_proof_with_its_genuine_value_trailer_still_verifies() {
     let mut b = MemBlocks::default();
     let start = init(&mut b);
     let root = freenet_prolly::apply::apply_into(
