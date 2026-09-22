@@ -760,9 +760,21 @@ fn check_node_allocating(node: &Node<'_>) -> Result<(), ()> {
 }
 
 /// What the per-entry work actually costs, split into its parts. Printed with
-/// `--nocapture`; the assertion only keeps the measurement honest about what it
+/// `--nocapture`; the assertions keep the measurement honest about what it
 /// measured.
+///
+/// IGNORED, so it is not in the pass/fail set (freenet-prolly#58): it compares
+/// two wall-clock timings ~10 % apart, and under load their spread between
+/// repeats (±15 µs) exceeds that margin — measured failing 1 run in 5 at load
+/// average 23–28 on main and on #56 alike. Because `cargo test` stops at the
+/// first failing binary and this one runs early, a red here also hid every later
+/// binary's tests. It is valid only ALONE ON A QUIET MACHINE:
+///
+/// ```text
+/// cargo test --release --test boundary the_cost_of_check_node_measured -- --ignored --nocapture
+/// ```
 #[test]
+#[ignore = "wall-clock measurement: run alone on a quiet machine (see the doc comment)"]
 fn the_cost_of_check_node_measured() {
     use freenet_prolly::boundary::{check_node, split_hash_parts, MAX_LOGICAL};
     // The worst case a host can be handed: ~12 KiB of minimum-size entries.
