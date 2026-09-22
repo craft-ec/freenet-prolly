@@ -703,6 +703,38 @@ fn a_rejected_batch_leaves_no_trace() {
     assert!(ok >= 2);
 }
 
+/// A value over `MAX_VALUE` is REFUSED, not promoted to a blob (freenet-prolly#50): this crate does not chunk,
+/// and a record type that grows past the limit gets a refused write, not graceful degradation. Pinned so a future
+/// blob path cannot change it silently. The control is the boundary itself: exactly `MAX_VALUE` is written, so a
+/// check that refused everything would fail here.
+#[test]
+fn a_value_over_max_value_is_refused_and_exactly_max_value_is_written() {
+    use freenet_prolly::apply::{apply, ApplyError, MAX_VALUE};
+    // A real (small) tree, built the way every other test here builds one.
+    let (root, store) = scratch(
+        splits_after,
+        &[(b"a".to_vec(), b"1".to_vec())].into_iter().collect(),
+    );
+    let mut emitted = 0;
+    let over = apply(
+        &store,
+        &root,
+        &[put(b"k", &vec![7; MAX_VALUE + 1])],
+        |_, _| emitted += 1,
+    );
+    assert_eq!(over.map(|_| ()), Err(ApplyError::ValueTooLong));
+    assert_eq!(emitted, 0, "a refused write emitted blocks");
+    let mut blocks: HashMap<Cid, Vec<u8>> = HashMap::new();
+    apply(&store, &root, &[put(b"k", &vec![7; MAX_VALUE])], |c, b| {
+        blocks.insert(c, b.to_vec());
+    })
+    .expect("exactly MAX_VALUE is a legal value");
+    assert!(
+        blocks.contains_key(&block_id(kind::RAW, &vec![7; MAX_VALUE])),
+        "the MAX_VALUE value was not written as its own block"
+    );
+}
+
 /// Start holding only what `Need` names, one round at a time.
 #[test]
 fn a_cold_edit_resumes_round_by_round_and_emits_only_at_the_end() {
