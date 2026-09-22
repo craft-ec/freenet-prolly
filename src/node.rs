@@ -47,7 +47,10 @@ pub const MAX_KEY: usize = 512;
 /// the same contents could hash two ways.
 pub const MAX_INLINE: usize = 1024;
 /// Longest value at all. A referenced value is one Block, and this is the Block
-/// contract's body limit; anything larger is a blob (manifest + chunks).
+/// contract's body limit. **This crate does not chunk: a longer value is
+/// refused** (`ApplyError::ValueTooLong`, `BuildError::ValueTooLong`). Storing
+/// one as a blob (manifest + chunks) is a caller's job — see ARCHITECTURE §7
+/// `BlobRef` — and the caller stores the manifest's ref as the value.
 pub const MAX_VALUE: usize = 256 * 1024;
 const LEAF_FIXED: usize = 2 + 1 + 4;
 const BRANCH_FIXED: usize = 2 + 32 + 16;
@@ -89,7 +92,8 @@ impl Agg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value<'a> {
     Inline(&'a [u8]),
-    /// A value stored in its own block (or a blob manifest).
+    /// A value stored in its own block. (A caller's blob manifest is such a
+    /// value too: this crate stores the bytes it is given and never chunks.)
     Ref {
         cid: Cid,
         len: u32,
@@ -458,7 +462,8 @@ pub enum BuildError {
     NotSorted,
     KeyTooLong,
     /// An inline value longer than `MAX_INLINE` (store it by reference), or any
-    /// value longer than `MAX_VALUE` (store it as a blob).
+    /// value longer than `MAX_VALUE` — refused, not chunked: a blob (manifest +
+    /// chunks) is the caller's to build, see [`MAX_VALUE`].
     ValueTooLong,
     /// A reference to a value of at most `MAX_INLINE` bytes: store it inline.
     ValueTooShort,
