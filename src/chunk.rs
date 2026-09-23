@@ -176,16 +176,12 @@ impl Run {
         Ok(std::mem::take(&mut self.ids))
     }
 
-    /// Hand three freshly coded parity blocks to the caller and return their
-    /// ids. Only a group that was actually CODED reports: a reused group's
+    /// Hand a group's freshly coded parity blocks to the caller and return
+    /// their ids. Only a group that was actually CODED reports: a reused group's
     /// parity is already out on the network, and re-reporting it would have
     /// the engine pay PUTs for blocks it has already put.
     fn record(coded: &mut Vec<(Cid, Vec<u8>)>, parity: Vec<Vec<u8>>) -> [Cid; crate::rs::PARITY] {
-        let ids = [
-            block_id(kind::PARITY, &parity[0]),
-            block_id(kind::PARITY, &parity[1]),
-            block_id(kind::PARITY, &parity[2]),
-        ];
+        let ids: [Cid; crate::rs::PARITY] = core::array::from_fn(|r| block_id(kind::PARITY, &parity[r]));
         for (id, bytes) in ids.iter().zip(parity) {
             coded.push((*id, bytes));
         }
@@ -209,7 +205,7 @@ impl Run {
                 return Ok(ids);
             }
             // One member changed in place: the correction needs only that
-            // member's two versions and the three old parity BLOCKS. If any of
+            // member's two versions and the group's old parity BLOCKS. If any of
             // them is not to hand, fall through and recode — never produce
             // parity that does not cover what it claims.
             if let Some((pos, was, old_ids)) = idx.one_off(self.class, members) {

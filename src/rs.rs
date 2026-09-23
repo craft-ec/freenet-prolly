@@ -5,15 +5,24 @@
 //! a pure function of the children" is what makes it deduplicate, verifiable by
 //! plain hash, and repairable by anyone without a key — and it is only true if
 //! two independent implementations produce identical bytes. Two libraries that
-//! both call themselves systematic RS(k+3, k) routinely disagree on the field
+//! both call themselves systematic RS(k+m, k) routinely disagree on the field
 //! polynomial, on how the generator matrix is built, and on which axis the
 //! symbols run along. So each of those is fixed here and frozen by vectors.
 //!
 //! - Field GF(2⁸), reducing polynomial **0x11D**, generator **2**.
-//! - Generator matrix `[I ; C]`, systematic, with `C` a 3 × k Cauchy matrix:
-//!   `C[r][c] = 1 / (x_r ⊕ y_c)`, `x_r = r` for `r ∈ 0..3` and `y_c = 3 + c`
-//!   for `c ∈ 0..k`. The two index sets are disjoint for every `k ≤ 12`, every
-//!   square submatrix of a Cauchy matrix is invertible, and the `k < 12` case
+//! - Generator matrix `[I ; C]`, systematic, with `C` an m × k Cauchy matrix
+//!   (m = [`PARITY`] = 8): `C[r][c] = 1 / (x_r ⊕ y_c)`, with
+//!   - `y_c = 3 + c` for `c ∈ 0..k`: FROZEN from the three-row code, so y runs
+//!     3..=38 at `k ≤ MAX_K = 36`;
+//!   - `x_r = r` for `r ∈ 0..3`: the three original rows, FROZEN, so their bytes
+//!     for a given group are what they were (their vectors still pass);
+//!   - `x_r = MAX_K + r` for `r ∈ 3..8`, i.e. 39..=43: the rows added by the
+//!     m = 8 epoch (sdk#321), placed past the whole y range rather than at
+//!     `r`, which would collide with `y` and shift nothing but break
+//!     invertibility.
+//!
+//!   x and y are disjoint and each distinct (44 ≤ 256 field elements), every
+//!   square submatrix of a Cauchy matrix is invertible, and a `k < MAX_K` group
 //!   is literally the first `k` columns — so ONE definition covers every group
 //!   size, `k = 1` included.
 //! - Layout: byte `i` of every data symbol is one codeword. Parity `p` byte `i`
@@ -21,10 +30,32 @@
 
 /// The reducing polynomial, x⁸ + x⁴ + x³ + x² + 1.
 const POLY: u16 = 0x11D;
-/// Parity symbols per group. Three, so a group survives any three losses.
-pub const PARITY: usize = 3;
+/// Parity symbols per group: a group survives any eight losses (sdk#321; the
+/// owner asked for more parity). A COUNT only -- no coefficient is derived
+/// from it, so changing it cannot move an existing row (see [`x_of`]).
+pub const PARITY: usize = 8;
 /// The largest group the grouping rule can produce.
-pub const MAX_K: usize = 12;
+pub const MAX_K: usize = 36;
+/// The rows of the original three-row code, whose `x_r = r` is frozen.
+const FROZEN_ROWS: usize = 3;
+/// `y_c = Y0 + c`, frozen from the three-row code.
+const Y0: usize = 3;
+
+/// `x_r` of parity row `r`. The first three are the original code's; the rest
+/// sit past every `y` (`Y0 + MAX_K - 1 = 38`), so the sets never meet.
+const fn x_of(r: usize) -> u8 {
+    if r < FROZEN_ROWS {
+        r as u8
+    } else {
+        (MAX_K + r) as u8
+    }
+}
+
+// The index sets are disjoint and fit the field: the one condition the Cauchy
+// construction needs. Checked, not remembered.
+const _: () = assert!(x_of(FROZEN_ROWS) as usize > Y0 + MAX_K - 1);
+const _: () = assert!(FROZEN_ROWS <= Y0);
+const _: () = assert!(MAX_K + PARITY + FROZEN_ROWS <= 256);
 
 /// `exp[i] = 2^i` and `log[2^i] = i` in GF(2⁸), built once from the polynomial
 /// rather than pasted in: a table nobody can check against its own definition
@@ -97,16 +128,16 @@ fn div(a: u8, b: u8) -> u8 {
 
 /// `C[r][c]` of the Cauchy generator, for a group of `k` data symbols.
 ///
-/// `x_r = r`, `y_c = 3 + c`. `r < 3 ≤ 3 + c`, so the denominator is never zero
-/// and the matrix is defined for every `k` — including `k = 1`, where the three
-/// parity symbols are three different scalar multiples of the single data
-/// symbol.
+/// `x_r` from [`x_of`], `y_c = 3 + c`. x and y are disjoint, so the
+/// denominator is never zero and the matrix is defined for every `k` —
+/// including `k = 1`, where the parity symbols are different scalar multiples
+/// of the single data symbol.
 pub fn coeff(r: usize, c: usize) -> u8 {
     debug_assert!(r < PARITY && c < MAX_K);
-    div(1, (r as u8) ^ ((PARITY + c) as u8))
+    div(1, x_of(r) ^ ((Y0 + c) as u8))
 }
 
-/// The three parity symbols of a group.
+/// The [`PARITY`] parity symbols of a group.
 ///
 /// **There is no padding in the rule.** A symbol is its bytes followed by
 /// infinitely many zeros, and parity is defined per byte index — so a member's
@@ -170,10 +201,10 @@ pub fn byte_at(b: &[u8], i: usize) -> u8 {
     b.get(i).copied().unwrap_or(0)
 }
 
-/// Rebuild every data symbol from any `k` of the `k + 3` blocks.
+/// Rebuild every data symbol from any `k` of the `k + PARITY` blocks.
 ///
 /// `have[j]` is `Some` for a present block: `0..k` the data symbols in group
-/// order, `k..k+3` the parity. Blocks are ragged — a data symbol ends after its
+/// order, `k..k+PARITY` the parity. Blocks are ragged — a data symbol ends after its
 /// own bytes, a parity block after its last non-zero one — and every index past
 /// an end reads as zero.
 ///

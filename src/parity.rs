@@ -43,14 +43,15 @@ use crate::rs;
 /// mean one thing to the boundary rule and another to the grouping rule.
 const DOMAIN: &[u8] = b"PT01-pgroup";
 
-/// A group closes on the hash only once it holds this many members. Seven, and
-/// the number is forced by the reserve rather than chosen: at six, a full leaf
-/// of referenced values needs 135 parity ids — 4,320 B — and the reserve is
-/// 4,096.
-pub const MIN_GROUP: usize = 7;
+/// A group closes on the hash only once it holds this many members.
+/// Twenty-one, and the number is forced by the reserve rather than chosen
+/// (sdk#321, m = 8): a full leaf of referenced values is 266 refs in groups of
+/// at least 21 plus one short tail per size class, `(266 / 21 + 4) × 8 = 128`
+/// parity ids — exactly the 4,096 B reserve. At twenty it is 136.
+pub const MIN_GROUP: usize = 21;
 /// A group closes here whatever the hash says.
 pub const MAX_GROUP: usize = rs::MAX_K;
-/// Mean group size ≈ 9: after the 7th member, one member in three closes it.
+/// Mean group size ≈ 23: after the 21st member, one member in three closes it.
 const CLOSE_THRESHOLD: u32 = (u32::MAX / 3) + 1;
 /// The same value, exposed so a frozen vector can carry it: a constant only
 /// the source knows is a constant nobody reviewing a diff can see move.
@@ -621,8 +622,8 @@ mod frozen_constants {
 /// validated when it was stored.
 #[derive(Default)]
 pub struct GroupIndex {
-    /// `(class, member cids) → the group's three parity ids`, in the order the
-    /// node listed them.
+    /// `(class, member cids) → the group's parity ids`, in the order the node
+    /// listed them.
     groups: Vec<(usize, Vec<crate::Cid>, [crate::Cid; rs::PARITY])>,
 }
 
@@ -651,13 +652,13 @@ impl GroupIndex {
         }
         let mut at = 0usize;
         for (class, members) in group_members(node) {
-            let trio = [ids[at], ids[at + 1], ids[at + 2]];
+            let row: [crate::Cid; rs::PARITY] = core::array::from_fn(|r| ids[at + r]);
             at += rs::PARITY;
-            out.groups.push((class, members, trio));
+            out.groups.push((class, members, row));
         }
     }
 
-    /// The three ids for exactly this group, if the node already had it.
+    /// The parity ids for exactly this group, if the node already had it.
     pub fn exact(&self, class: usize, members: &[crate::Cid]) -> Option<[crate::Cid; rs::PARITY]> {
         self.groups
             .iter()
