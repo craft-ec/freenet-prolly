@@ -243,6 +243,11 @@ mod reserve {
             leaf_ids(MIN_GROUP - 1, PARITY)
         );
         assert_eq!((PARITY, MIN_GROUP), (8, 21), "the epoch's numbers moved");
+        assert_eq!(
+            (PARITY, MIN_GROUP, crate::parity::MAX_GROUP),
+            (8, 21, 36),
+            "the node format's grouping moved: a format epoch, never a side effect"
+        );
         assert_eq!(leaf_ids(MIN_GROUP, PARITY), MAX_PCOUNT, "the leaf worst case is not the reserve exactly");
         assert_eq!(leaf_ids(20, PARITY), 136, "MIN 20 would need 136 ids");
         assert!(leaf_ids(20, PARITY) > MAX_PCOUNT);

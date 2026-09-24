@@ -55,10 +55,12 @@ const _: () = assert!(PARITY <= rs::MAX_M);
 /// ids, which at 21 is exactly the reserve's 128 (4,096 B) and at 20 is 136
 /// (`boundary::reserve` asserts both).
 pub const MIN_GROUP: usize = 21;
-/// A group closes here whatever the hash says. A NODE-FORMAT number of its own,
-/// here the codec's whole width (`rs::MAX_K`, 36; the architect's MIN 21 / MAX
-/// 36): the reserve depends on [`MIN_GROUP`] only, MAX sets the repair width.
-pub const MAX_GROUP: usize = rs::MAX_K;
+/// A group closes here whatever the hash says. A NODE-FORMAT number of its own
+/// (the architect's MIN 21 / MAX 36): the reserve depends on [`MIN_GROUP`] only,
+/// MAX sets the repair width. The TREE's literal, never derived from the codec:
+/// a codec that grows `rs::MAX_K` must not silently regroup every tree (a hidden
+/// epoch); the codec only has to be able to code it (asserted below).
+pub const MAX_GROUP: usize = 36;
 const _: () = assert!(MAX_GROUP <= rs::MAX_K);
 /// Mean group size ≈ 23: after the 21st member, one member in three closes it.
 const CLOSE_THRESHOLD: u32 = (u32::MAX / 3) + 1;
