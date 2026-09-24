@@ -48,8 +48,11 @@ const DOMAIN: &[u8] = b"PT01-pgroup";
 /// of referenced values needs 135 parity ids — 4,320 B — and the reserve is
 /// 4,096.
 pub const MIN_GROUP: usize = 7;
-/// A group closes here whatever the hash says.
-pub const MAX_GROUP: usize = rs::MAX_K;
+/// A group closes here whatever the hash says. A NODE-FORMAT number of its own:
+/// the codec can code up to `rs::MAX_K` (36), and that must not move the tree's
+/// groups (the reserve arithmetic and every tree's grouping depend on this 12).
+pub const MAX_GROUP: usize = 12;
+const _: () = assert!(MAX_GROUP <= rs::MAX_K);
 /// Mean group size ≈ 9: after the 7th member, one member in three closes it.
 const CLOSE_THRESHOLD: u32 = (u32::MAX / 3) + 1;
 /// The same value, exposed so a frozen vector can carry it: a constant only
@@ -174,7 +177,7 @@ pub fn symbol(state: &[u8]) -> Vec<u8> {
 /// The three parity symbols for one group of member states, trimmed.
 pub fn encode_group(states: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
     let data: Vec<Vec<u8>> = states.iter().map(|s| symbol(s)).collect();
-    rs::encode(&data)
+    rs::encode(&data, rs::PARITY)
 }
 
 /// Recover every member's state from any `k` of the `k + 3` blocks.
@@ -190,7 +193,7 @@ pub fn repair_group(
     have: &[Option<Vec<u8>>],
     max_len: usize,
 ) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    Ok(rs::repair(k, have, max_len)?
+    Ok(rs::repair(k, rs::PARITY, have, max_len)?
         .into_iter()
         .map(|s| s[4..].to_vec())
         .collect())
@@ -222,7 +225,7 @@ pub fn update_group(
     if old_parity.len() != rs::PARITY {
         return Err(rs::RsError::Ragged);
     }
-    if column >= rs::MAX_K {
+    if column >= MAX_GROUP {
         return Err(rs::RsError::GroupSize(column + 1));
     }
     let (old, new) = (symbol(old_state), symbol(new_state));
@@ -509,7 +512,7 @@ mod hostile_repair {
                 v
             })
             .collect();
-        let parity = rs::encode(&states).expect("codeable");
+        let parity = rs::encode(&states, rs::PARITY).expect("codeable");
         let all: Vec<Vec<u8>> = states.iter().cloned().chain(parity).collect();
         let have: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY)
             .map(|j| (j >= rs::PARITY).then(|| all[j].clone()))
@@ -517,7 +520,7 @@ mod hostile_repair {
 
         rs::work::reset();
         assert_eq!(
-            rs::repair(4, &have, MAX_MEMBER_VALUE),
+            rs::repair(4, rs::PARITY, &have, MAX_MEMBER_VALUE),
             Err(rs::RsError::MemberTooLong(huge))
         );
         assert_eq!(
