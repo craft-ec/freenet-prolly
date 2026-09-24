@@ -1,6 +1,6 @@
 //! Which blocks form a parity group, and what a group's symbols are.
 //!
-//! A node's children are coded in groups; each group gets three parity blocks
+//! A node's children are coded in groups; each group gets [`PARITY`] parity blocks
 //! ([`crate::rs`]), and the node lists their ids. What this module decides is
 //! the **membership** — and it has to decide it the same way for every reader,
 //! because `pcount` is verified exactly and a disagreement about grouping is a
@@ -29,7 +29,7 @@
 //! first** (§11's padding classes) and content-defined by key within a class.
 //! Referenced values run from 1 KiB to 256 KiB with no size-tightness, so
 //! grouping them by key alone would pad a mixed group to its largest and write
-//! three parity blocks of that size: for private data, where every value in a
+//! [`PARITY`] parity blocks of that size: for private data, where every value in a
 //! class is already padded to the class, the waste is instead zero.
 //!
 //! Inline values are not members of anything: they live in the leaf, and the
@@ -43,17 +43,26 @@ use crate::rs;
 /// mean one thing to the boundary rule and another to the grouping rule.
 const DOMAIN: &[u8] = b"PT01-pgroup";
 
-/// A group closes on the hash only once it holds this many members. Seven, and
-/// the number is forced by the reserve rather than chosen: at six, a full leaf
-/// of referenced values needs 135 parity ids — 4,320 B — and the reserve is
-/// 4,096.
-pub const MIN_GROUP: usize = 7;
-/// A group closes here whatever the hash says. A NODE-FORMAT number of its own:
-/// the codec can code up to `rs::MAX_K` (36), and that must not move the tree's
-/// groups (the reserve arithmetic and every tree's grouping depend on this 12).
-pub const MAX_GROUP: usize = 12;
+/// THE TREE'S PARITY PER GROUP (sdk#321, a format epoch): eight, so a group
+/// survives any eight losses. A NODE-FORMAT number, owned HERE -- the codec
+/// (`rs`) takes `m` per call and only bounds it (`rs::MAX_M`) -- and every count
+/// of a node's parity ids derives from it.
+pub const PARITY: usize = 8;
+const _: () = assert!(PARITY <= rs::MAX_M);
+/// A group closes on the hash only once it holds this many members. Twenty-one,
+/// and the number is FORCED by the reserve at [`PARITY`] = 8 rather than chosen:
+/// a full leaf of referenced values needs `(266 / MIN_GROUP + 4) × 8` parity
+/// ids, which at 21 is exactly the reserve's 128 (4,096 B) and at 20 is 136
+/// (`boundary::reserve` asserts both).
+pub const MIN_GROUP: usize = 21;
+/// A group closes here whatever the hash says. A NODE-FORMAT number of its own
+/// (the architect's MIN 21 / MAX 36): the reserve depends on [`MIN_GROUP`] only,
+/// MAX sets the repair width. The TREE's literal, never derived from the codec:
+/// a codec that grows `rs::MAX_K` must not silently regroup every tree (a hidden
+/// epoch); the codec only has to be able to code it (asserted below).
+pub const MAX_GROUP: usize = 36;
 const _: () = assert!(MAX_GROUP <= rs::MAX_K);
-/// Mean group size ≈ 9: after the 7th member, one member in three closes it.
+/// Mean group size ≈ 23: after the 21st member, one member in three closes it.
 const CLOSE_THRESHOLD: u32 = (u32::MAX / 3) + 1;
 /// The same value, exposed so a frozen vector can carry it: a constant only
 /// the source knows is a constant nobody reviewing a diff can see move.
@@ -149,10 +158,10 @@ pub fn group_sizes_of(node: &Node<'_>) -> Vec<usize> {
         .collect()
 }
 
-/// How many parity ids a node must carry: three per group, and a pure function
+/// How many parity ids a node must carry: [`PARITY`] per group, and a pure function
 /// of the entries. This is what `check_node` compares `pcount` against.
 pub fn pcount_of(node: &Node<'_>) -> usize {
-    rs::PARITY * group_sizes_of(node).len()
+    PARITY * group_sizes_of(node).len()
 }
 
 /// One member's coded symbol: `len:u32 LE ‖ state`, and zeros for ever after.
@@ -174,13 +183,13 @@ pub fn symbol(state: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The three parity symbols for one group of member states, trimmed.
+/// The [`PARITY`] parity symbols for one group of member states, trimmed.
 pub fn encode_group(states: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, rs::RsError> {
     let data: Vec<Vec<u8>> = states.iter().map(|s| symbol(s)).collect();
-    rs::encode(&data, rs::PARITY)
+    rs::encode(&data, PARITY)
 }
 
-/// Recover every member's state from any `k` of the `k + 3` blocks.
+/// Recover every member's state from any `k` of the `k + PARITY` blocks.
 ///
 /// `have` holds the blocks as they are STORED: data symbols as `symbol`
 /// produces them, parity trimmed. Each answer is the member's state, its length
@@ -193,7 +202,7 @@ pub fn repair_group(
     have: &[Option<Vec<u8>>],
     max_len: usize,
 ) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    Ok(rs::repair(k, rs::PARITY, have, max_len)?
+    Ok(rs::repair(k, PARITY, have, max_len)?
         .into_iter()
         .map(|s| s[4..].to_vec())
         .collect())
@@ -209,7 +218,7 @@ pub const MAX_MEMBER_NODE: usize = 1 + crate::node::MAX_NODE;
 /// A member changed: the new parity, from the OLD parity and the two symbols.
 ///
 /// `parity' = trim(parity ⊕ C[·][c] · (symbol' ⊕ symbol))`, per byte index. The
-/// code is linear, so a writer that holds the three old parity blocks and both
+/// code is linear, so a writer that holds the [`PARITY`] old parity blocks and both
 /// versions of the one member it touched needs nothing else — no reads of the
 /// other members, which is what keeps a write off the read path.
 ///
@@ -222,7 +231,7 @@ pub fn update_group(
     old_state: &[u8],
     new_state: &[u8],
 ) -> Result<Vec<Vec<u8>>, rs::RsError> {
-    if old_parity.len() != rs::PARITY {
+    if old_parity.len() != PARITY {
         return Err(rs::RsError::Ragged);
     }
     if column >= MAX_GROUP {
@@ -235,7 +244,7 @@ pub fn update_group(
         .chain([old.len(), new.len()])
         .max()
         .unwrap_or(0);
-    let mut out = Vec::with_capacity(rs::PARITY);
+    let mut out = Vec::with_capacity(PARITY);
     for (r, p) in old_parity.iter().enumerate() {
         let f = rs::coeff(r, column);
         let mut v = vec![0u8; width];
@@ -262,18 +271,21 @@ mod tests {
     /// The close rule: never before MIN_GROUP, always by MAX_GROUP.
     #[test]
     fn a_group_never_closes_early_and_never_runs_past_the_maximum() {
+        // A run of three MAX_GROUPs: long enough that the tail's fold cannot
+        // hide the first group, at any MIN and MAX.
+        let n = 3 * MAX_GROUP;
         // A hash that always closes: every group is exactly MIN_GROUP until
         // the tail.
-        let all_close: Vec<u32> = vec![0; 30];
+        let all_close: Vec<u32> = vec![0; n];
         let sizes = group_sizes(&all_close);
         assert!(sizes.iter().all(|&s| (MIN_GROUP..=MAX_GROUP).contains(&s)));
-        assert_eq!(sizes.iter().sum::<usize>(), 30);
+        assert_eq!(sizes.iter().sum::<usize>(), n);
         assert_eq!(sizes[0], MIN_GROUP, "a group closed before the minimum");
 
         // A hash that never closes: every group is exactly MAX_GROUP.
-        let none: Vec<u32> = vec![u32::MAX; 30];
+        let none: Vec<u32> = vec![u32::MAX; n];
         let sizes = group_sizes(&none);
-        assert_eq!(sizes.iter().sum::<usize>(), 30);
+        assert_eq!(sizes.iter().sum::<usize>(), n);
         assert!(sizes[..sizes.len() - 1].iter().all(|&s| s == MAX_GROUP));
     }
 
@@ -282,7 +294,7 @@ mod tests {
     /// `⌊n / MIN_GROUP⌋ + 1` per run.
     #[test]
     fn at_most_one_group_is_short_and_the_fold_never_cascades() {
-        for n in 1..=60usize {
+        for n in 1..=3 * MAX_GROUP {
             for closing in [
                 vec![],
                 (0..n).step_by(7).collect::<Vec<_>>(),
@@ -310,14 +322,14 @@ mod tests {
     /// stands alone when it does not.
     #[test]
     fn a_short_tail_folds_only_when_it_fits() {
-        // 7 then 2: folds to one group of 9.
-        let mut h = vec![u32::MAX; 9];
-        h[6] = 0;
-        assert_eq!(group_sizes(&h), vec![9]);
-        // 12 then 2: 14 > MAX_GROUP, so the tail stands alone.
-        let mut h = vec![u32::MAX; 14];
-        h[11] = 0;
-        assert_eq!(group_sizes(&h), vec![12, 2]);
+        // MIN_GROUP then 2: folds to one group of MIN_GROUP + 2.
+        let mut h = vec![u32::MAX; MIN_GROUP + 2];
+        h[MIN_GROUP - 1] = 0;
+        assert_eq!(group_sizes(&h), vec![MIN_GROUP + 2]);
+        // MAX_GROUP then 2: over MAX_GROUP together, so the tail stands alone.
+        let mut h = vec![u32::MAX; MAX_GROUP + 2];
+        h[MAX_GROUP - 1] = 0;
+        assert_eq!(group_sizes(&h), vec![MAX_GROUP, 2]);
         // A run shorter than MIN_GROUP is one group, with nothing to fold into.
         assert_eq!(group_sizes(&[u32::MAX; 3]), vec![3]);
         assert_eq!(group_sizes(&[]), Vec::<usize>::new());
@@ -356,7 +368,7 @@ mod tests {
         // Lose the three largest data symbols — including the LONGEST, which
         // is the case that makes trimming non-trivial: nothing left says how
         // far the group reaches except the rebuilt length prefixes.
-        let have: Vec<Option<Vec<u8>>> = (0..k + rs::PARITY)
+        let have: Vec<Option<Vec<u8>>> = (0..k + PARITY)
             .map(|j| (!(1..=3).contains(&j)).then(|| all[j].clone()))
             .collect();
         assert_eq!(
@@ -397,7 +409,7 @@ mod tests {
         assert!(parity.iter().all(|p| p.is_empty()), "empty parity expected");
         // And it repairs: every index reads zero, the prefixes say zero, and
         // the members come back empty.
-        let all: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY).map(|_| Some(Vec::new())).collect();
+        let all: Vec<Option<Vec<u8>>> = (0..4 + PARITY).map(|_| Some(Vec::new())).collect();
         assert_eq!(
             repair_group(4, &all, MAX_MEMBER_VALUE).expect("repairable"),
             states
@@ -420,7 +432,7 @@ mod repair_cases {
     }
 
     fn lose(k: usize, all: &[Vec<u8>], gone: &[usize]) -> Vec<Option<Vec<u8>>> {
-        (0..k + rs::PARITY)
+        (0..k + PARITY)
             .map(|j| (!gone.contains(&j)).then(|| all[j].clone()))
             .collect()
     }
@@ -512,15 +524,15 @@ mod hostile_repair {
                 v
             })
             .collect();
-        let parity = rs::encode(&states, rs::PARITY).expect("codeable");
+        let parity = rs::encode(&states, PARITY).expect("codeable");
         let all: Vec<Vec<u8>> = states.iter().cloned().chain(parity).collect();
-        let have: Vec<Option<Vec<u8>>> = (0..4 + rs::PARITY)
-            .map(|j| (j >= rs::PARITY).then(|| all[j].clone()))
+        let have: Vec<Option<Vec<u8>>> = (0..4 + PARITY)
+            .map(|j| (j >= PARITY).then(|| all[j].clone()))
             .collect();
 
         rs::work::reset();
         assert_eq!(
-            rs::repair(4, rs::PARITY, &have, MAX_MEMBER_VALUE),
+            rs::repair(4, PARITY, &have, MAX_MEMBER_VALUE),
             Err(rs::RsError::MemberTooLong(huge))
         );
         assert_eq!(
@@ -540,7 +552,7 @@ mod hostile_repair {
             .map(|s| symbol(s))
             .chain(parity.iter().cloned())
             .collect();
-        let have: Vec<Option<Vec<u8>>> = (0..2 + rs::PARITY)
+        let have: Vec<Option<Vec<u8>>> = (0..2 + PARITY)
             .map(|j| (j != 0).then(|| all[j].clone()))
             .collect();
         rs::work::reset();
@@ -570,22 +582,22 @@ mod frozen_constants {
     #[test]
     fn the_close_threshold_comparison_is_pinned_at_its_exact_value() {
         // A run long enough that the FOLD cannot hide the difference: with a
-        // short tail, a group of 7 and a tail of 1 merge back into 8 and both
-        // answers look alike. Nineteen members give 7+12 against 12+7.
-        let run = |seventh: u32| {
-            let mut h = vec![u32::MAX; 6];
-            h.push(seventh);
-            h.extend(std::iter::repeat_n(u32::MAX, 12));
+        // short tail, a group of MIN and a tail of 1 merge back and both
+        // answers look alike. MIN + MAX members give MIN+MAX against MAX+MIN.
+        let run = |at_min: u32| {
+            let mut h = vec![u32::MAX; MIN_GROUP - 1];
+            h.push(at_min);
+            h.extend(std::iter::repeat_n(u32::MAX, MAX_GROUP));
             group_sizes(&h)
         };
         assert_eq!(
             run(CLOSE_THRESHOLD - 1),
-            vec![7, 12],
+            vec![MIN_GROUP, MAX_GROUP],
             "a hash one below the threshold must close the group"
         );
         assert_eq!(
             run(CLOSE_THRESHOLD),
-            vec![12, 7],
+            vec![MAX_GROUP, MIN_GROUP],
             "a hash AT the threshold must not: the comparison is `<`, not `<=`"
         );
     }
@@ -624,9 +636,9 @@ mod frozen_constants {
 /// validated when it was stored.
 #[derive(Default)]
 pub struct GroupIndex {
-    /// `(class, member cids) → the group's three parity ids`, in the order the
+    /// `(class, member cids) → the group's [`PARITY`] parity ids`, in the order the
     /// node listed them.
-    groups: Vec<(usize, Vec<crate::Cid>, [crate::Cid; rs::PARITY])>,
+    groups: Vec<(usize, Vec<crate::Cid>, [crate::Cid; PARITY])>,
 }
 
 impl GroupIndex {
@@ -654,14 +666,14 @@ impl GroupIndex {
         }
         let mut at = 0usize;
         for (class, members) in group_members(node) {
-            let trio = [ids[at], ids[at + 1], ids[at + 2]];
-            at += rs::PARITY;
-            out.groups.push((class, members, trio));
+            let group: [crate::Cid; PARITY] = std::array::from_fn(|i| ids[at + i]);
+            at += PARITY;
+            out.groups.push((class, members, group));
         }
     }
 
-    /// The three ids for exactly this group, if the node already had it.
-    pub fn exact(&self, class: usize, members: &[crate::Cid]) -> Option<[crate::Cid; rs::PARITY]> {
+    /// The [`PARITY`] ids for exactly this group, if the node already had it.
+    pub fn exact(&self, class: usize, members: &[crate::Cid]) -> Option<[crate::Cid; PARITY]> {
         self.groups
             .iter()
             .find(|(c, m, _)| *c == class && m == members)
@@ -684,7 +696,7 @@ impl GroupIndex {
         &self,
         class: usize,
         members: &[crate::Cid],
-    ) -> Option<(usize, crate::Cid, [crate::Cid; rs::PARITY])> {
+    ) -> Option<(usize, crate::Cid, [crate::Cid; PARITY])> {
         self.groups.iter().find_map(|(c, m, ids)| {
             if *c != class || m.len() != members.len() {
                 return None;

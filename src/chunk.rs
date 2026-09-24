@@ -44,7 +44,7 @@ impl Entry {
 
 /// The parity a node owes, accumulated as its members arrive.
 ///
-/// **Members are recorded, not read.** A group's three ids can come from three
+/// **Members are recorded, not read.** A group's parity ids can come from three
 /// places, and only the last needs the members' bytes at all:
 ///
 /// - the node being replaced already had this exact group — same members, same
@@ -176,16 +176,12 @@ impl Run {
         Ok(std::mem::take(&mut self.ids))
     }
 
-    /// Hand three freshly coded parity blocks to the caller and return their
-    /// ids. Only a group that was actually CODED reports: a reused group's
+    /// Hand a group's freshly coded parity blocks (`parity::PARITY` of them) to
+    /// the caller and return their ids. Only a group that was actually CODED reports: a reused group's
     /// parity is already out on the network, and re-reporting it would have
     /// the engine pay PUTs for blocks it has already put.
-    fn record(coded: &mut Vec<(Cid, Vec<u8>)>, parity: Vec<Vec<u8>>) -> [Cid; crate::rs::PARITY] {
-        let ids = [
-            block_id(kind::PARITY, &parity[0]),
-            block_id(kind::PARITY, &parity[1]),
-            block_id(kind::PARITY, &parity[2]),
-        ];
+    fn record(coded: &mut Vec<(Cid, Vec<u8>)>, parity: Vec<Vec<u8>>) -> [Cid; crate::parity::PARITY] {
+        let ids: [Cid; crate::parity::PARITY] = std::array::from_fn(|i| block_id(kind::PARITY, &parity[i]));
         for (id, bytes) in ids.iter().zip(parity) {
             coded.push((*id, bytes));
         }
@@ -199,7 +195,7 @@ impl Run {
         old: Option<&crate::parity::GroupIndex>,
         members: &[Cid],
         coded: &mut Vec<(Cid, Vec<u8>)>,
-    ) -> Result<[Cid; crate::rs::PARITY], BuildError> {
+    ) -> Result<[Cid; crate::parity::PARITY], BuildError> {
         if let Some(idx) = old {
             // Already had this exact group: its parity is a pure function of
             // these members, so it is already right.
@@ -209,7 +205,7 @@ impl Run {
                 return Ok(ids);
             }
             // One member changed in place: the correction needs only that
-            // member's two versions and the three old parity BLOCKS. If any of
+            // member's two versions and the PARITY old parity BLOCKS. If any of
             // them is not to hand, fall through and recode — never produce
             // parity that does not cover what it claims.
             if let Some((pos, was, old_ids)) = idx.one_off(self.class, members) {
@@ -240,9 +236,9 @@ impl Run {
         members: &[Cid],
         pos: usize,
         was: Cid,
-        old_ids: [Cid; crate::rs::PARITY],
+        old_ids: [Cid; crate::parity::PARITY],
     ) -> Result<Option<Vec<Vec<u8>>>, BuildError> {
-        let mut old_parity = Vec::with_capacity(crate::rs::PARITY);
+        let mut old_parity = Vec::with_capacity(crate::parity::PARITY);
         for id in &old_ids {
             match blocks.get(id) {
                 Some(b) => old_parity.push(b.to_vec()),

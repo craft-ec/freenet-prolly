@@ -26,19 +26,15 @@
 //!   submatrix of a Cauchy matrix is invertible, a group of `k` is literally the
 //!   first `k` columns and `m` rows the first `m` rows — so ONE definition covers
 //!   every `k` and every `m`, `k = 1` included.
-//! - The TREE's own parity per group is [`PARITY`] (3) and its largest group is
-//!   `parity::MAX_GROUP` (12): the node format's numbers, which this codec does not
-//!   decide. Other users of the codec (the SDK's load pieces, sdk#347) pass their
-//!   own `m` and `k`.
+//! - The TREE's own parity per group is `parity::PARITY` and its largest group is
+//!   `parity::MAX_GROUP`: the node format's numbers, owned there, which this codec
+//!   does not decide. Every user of the codec (the tree, the SDK's load pieces,
+//!   sdk#347) passes its own `m` and `k`.
 //! - Layout: byte `i` of every data symbol is one codeword. Parity `p` byte `i`
 //!   is `⊕_c C[p][c] · data_c[i]`.
 
 /// The reducing polynomial, x⁸ + x⁴ + x³ + x² + 1.
 const POLY: u16 = 0x11D;
-/// The TREE's parity symbols per group: three, so a group survives any three
-/// losses. A node-format number (sdk#321 changes it in its own epoch); the codec
-/// takes `m` per call and derives nothing from this.
-pub const PARITY: usize = 3;
 /// The most parity symbols the codec makes for one group.
 pub const MAX_M: usize = 8;
 /// The largest group the codec can code. NOT the tree's grouping bound
@@ -144,7 +140,7 @@ pub fn coeff(r: usize, c: usize) -> u8 {
     div(1, x_of(r) ^ ((Y0 + c) as u8))
 }
 
-/// The `m` parity symbols of a group (the tree calls it with [`PARITY`]).
+/// The `m` parity symbols of a group (the tree calls it with `parity::PARITY`).
 ///
 /// **There is no padding in the rule.** A symbol is its bytes followed by
 /// infinitely many zeros, and parity is defined per byte index — so a member's

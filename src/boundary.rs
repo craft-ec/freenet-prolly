@@ -118,7 +118,7 @@ pub enum BoundaryError {
     /// The entries measure more than `MAX_LOGICAL`.
     TooLarge,
     /// `pcount` is not what the node's own entries require. The count is a pure
-    /// function of them — three ids per sibling group — so a host can check it
+    /// function of them — `parity::PARITY` ids per sibling group — so a host can check it
     /// exactly, and the parity region stops being the one part of a valid node
     /// no rule constrains. `.0` is what the entries require, `.1` what the node
     /// claims.
@@ -196,7 +196,7 @@ mod reserve {
     use super::MAX_LOGICAL;
     use crate::node::{HEADER, MAX_NODE, MAX_PCOUNT};
     use crate::parity::{CLASSES, MIN_GROUP};
-    use crate::rs::PARITY;
+    use crate::parity::PARITY;
 
     /// A branch entry: klen(2) + cid(32) + agg(16) + a one-byte suffix, plus
     /// the 6-byte offset/key4 table slot.
@@ -215,11 +215,41 @@ mod reserve {
     /// One run per class, so one short tail per class.
     const LEAF_GROUPS: usize = LEAF_REFS / MIN_GROUP + CLASSES.len();
 
+    /// A full leaf's parity ids at a minimum group and a parity per group: the
+    /// ONE formula the asserts and the named test below share.
+    const fn leaf_ids(min_group: usize, parity: usize) -> usize {
+        (LEAF_REFS / min_group + CLASSES.len()) * parity
+    }
+
     const _: () = assert!(MAX_LOGICAL + 4096 <= MAX_NODE);
     const _: () = assert!(BRANCH_GROUPS * PARITY <= MAX_PCOUNT);
     const _: () = assert!(LEAF_GROUPS * PARITY <= MAX_PCOUNT);
+    const _: () = assert!(leaf_ids(MIN_GROUP, PARITY) == LEAF_GROUPS * PARITY);
     // The leaf is the binding case: a fifth class, or a smaller minimum group,
     // does not fit. Asserted so that is a fact rather than a comment.
     const _: () = assert!((LEAF_REFS / MIN_GROUP + CLASSES.len() + 1) * PARITY > MAX_PCOUNT);
-    const _: () = assert!((LEAF_REFS / (MIN_GROUP - 1) + CLASSES.len()) * PARITY > MAX_PCOUNT);
+    const _: () = assert!(leaf_ids(MIN_GROUP - 1, PARITY) > MAX_PCOUNT);
+
+    /// sdk#321's epoch, by name: at [`PARITY`] = 8 a full leaf needs EXACTLY the
+    /// reserve at [`MIN_GROUP`] = 21 (128 ids), and one fewer member per group
+    /// (MIN 20) needs 136 -- the mutant the compile-time asserts above refuse.
+    #[test]
+    fn the_leaf_worst_case_fills_the_reserve_exactly_at_m8_min21() {
+        println!(
+            "  leaf refs {LEAF_REFS}, classes {}, MIN {MIN_GROUP}, m {PARITY}: {} ids of {MAX_PCOUNT}; at MIN {}: {}",
+            CLASSES.len(),
+            leaf_ids(MIN_GROUP, PARITY),
+            MIN_GROUP - 1,
+            leaf_ids(MIN_GROUP - 1, PARITY)
+        );
+        assert_eq!((PARITY, MIN_GROUP), (8, 21), "the epoch's numbers moved");
+        assert_eq!(
+            (PARITY, MIN_GROUP, crate::parity::MAX_GROUP),
+            (8, 21, 36),
+            "the node format's grouping moved: a format epoch, never a side effect"
+        );
+        assert_eq!(leaf_ids(MIN_GROUP, PARITY), MAX_PCOUNT, "the leaf worst case is not the reserve exactly");
+        assert_eq!(leaf_ids(20, PARITY), 136, "MIN 20 would need 136 ids");
+        assert!(leaf_ids(20, PARITY) > MAX_PCOUNT);
+    }
 }

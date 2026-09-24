@@ -88,7 +88,7 @@ pub struct Applied {
     /// to a full recode, because a correction needs the old parity to correct.
     ///
     /// Groups that were REUSED are not listed: their parity is already out.
-    /// Corrected and recoded groups are, three blocks each.
+    /// Corrected and recoded groups are, `parity::PARITY` blocks each.
     pub parity: crate::build::ParityBlocks,
 }
 
