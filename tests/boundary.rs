@@ -505,7 +505,9 @@ fn frozen_vectors() {
     }
     // Parity: the code frozen to the byte, its canonical trimmed form, and
     // repair frozen with it.
-    for k in [1usize, 7, 12] {
+    // Rows 0-2 on the `parity` line, byte-identical to the three-row code
+    // (sdk#321: those lines do not move); the epoch's rows 3.. on `prows`.
+    for k in [1usize, 7, 12, 21, 36] {
         let (plen, ids) = parity_vector(k);
         got += &format!(
             "parity {k} {plen} {} {} {}\n",
@@ -513,6 +515,7 @@ fn frozen_vectors() {
             hex(&ids[1]),
             hex(&ids[2])
         );
+        got += &format!("prows {k} {}\n", ids[3..].iter().map(|i| hex(i)).collect::<Vec<_>>().join(" "));
         got += &format!("prepair {k} {}\n", hex(&parity_repair_digest(k)));
     }
     got += &format!("puneven {}\n", hex(&parity_uneven_digest()));
@@ -677,10 +680,10 @@ fn a_node_with_the_wrong_parity_count_is_refused_and_the_right_one_is_not() {
         }
         b.finish().unwrap()
     };
-    // Four children is one group, so the node requires exactly 3 parity ids.
-    let probe = build(3);
+    // Four children is one group, so the node requires exactly PARITY ids.
+    let probe = build(freenet_prolly::parity::PARITY);
     let want = freenet_prolly::parity::pcount_of(&Node::parse(&probe).expect("parses"));
-    assert_eq!(want, 3, "four children are one group");
+    assert_eq!(want, freenet_prolly::parity::PARITY, "four children are one group");
 
     // The control: the right count is accepted, so the refusals below are about
     // the COUNT and not about parity being rejected wholesale.
@@ -692,7 +695,7 @@ fn a_node_with_the_wrong_parity_count_is_refused_and_the_right_one_is_not() {
     // passes the entry checks whatever its parity says.
     assert_eq!(check_node(&n), Ok(()));
 
-    for parity in [0usize, 1, 2, 4, 6] {
+    for parity in [0usize, 1, want - 1, want + 1, 2 * want] {
         let bytes = build(parity);
         // It PARSES — the region's size is all `parse` decides — and the count
         // is settled here, where the entries are known.
@@ -932,15 +935,12 @@ fn range_proof_vector(n: usize) -> (usize, usize, [u8; 32]) {
 /// symbol), `k = 12` the largest the grouping rule can make, and the lengths
 /// are deliberately unequal so the padding and the length prefix are exercised
 /// rather than skipped.
-pub fn parity_vector(k: usize) -> (usize, [Cid; 3]) {
+pub fn parity_vector(k: usize) -> (usize, [Cid; freenet_prolly::parity::PARITY]) {
     use freenet_prolly::parity::encode_group;
     let states = parity_members(k);
     let parity = encode_group(&states).expect("a codeable group");
-    let ids = [
-        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[0]),
-        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[1]),
-        freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[2]),
-    ];
+    let ids: [Cid; freenet_prolly::parity::PARITY] =
+        std::array::from_fn(|i| freenet_prolly::block_id(freenet_prolly::kind::PARITY, &parity[i]));
     // The STORED length of the first parity block, which is a function of its
     // own bytes and not of the group's longest member. Frozen so that a change
     // to trimming shows up here rather than only in the ids.
@@ -977,7 +977,7 @@ pub fn parity_members(k: usize) -> Vec<Vec<u8>> {
 /// what survives.
 pub fn parity_uneven_digest() -> [u8; 32] {
     use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
-    use freenet_prolly::rs::PARITY;
+    use freenet_prolly::parity::PARITY;
     // Strictly increasing, so the LAST member is the one that sets the width.
     let states: Vec<Vec<u8>> = (0..6).map(|i| vec![(i as u8) + 1; 1 + i * 37]).collect();
     let k = states.len();
@@ -1001,7 +1001,7 @@ pub fn parity_uneven_digest() -> [u8; 32] {
             let have: Vec<Option<Vec<u8>>> = (0..k + PARITY)
                 .map(|j| (!gone.contains(&j)).then(|| all[j].clone()))
                 .collect();
-            let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+            let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+PARITY present");
             assert_eq!(got, states, "uneven: lost {gone:?}");
             for s in &got {
                 h.update(s);
@@ -1022,7 +1022,7 @@ pub fn parity_uneven_digest() -> [u8; 32] {
 
 pub fn parity_repair_digest(k: usize) -> [u8; 32] {
     use freenet_prolly::parity::{encode_group, repair_group, symbol, MAX_MEMBER_VALUE};
-    use freenet_prolly::rs::PARITY;
+    use freenet_prolly::parity::PARITY;
     let states = parity_members(k);
     let parity = encode_group(&states).expect("a codeable group");
     let all: Vec<Vec<u8>> = states
@@ -1039,7 +1039,7 @@ pub fn parity_repair_digest(k: usize) -> [u8; 32] {
                 let have: Vec<Option<Vec<u8>>> = (0..n)
                     .map(|j| (j != a && j != b && j != c).then(|| all[j].clone()))
                     .collect();
-                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+3 present");
+                let got = repair_group(k, &have, MAX_MEMBER_VALUE).expect("k of k+PARITY present");
                 assert_eq!(got, states, "k = {k}: lost {a},{b},{c}");
                 for s in &got {
                     h.update(s);
@@ -1114,8 +1114,8 @@ fn a_node_refused_for_anything_cheaper_costs_no_grouping() {
             )
             .unwrap();
         }
-        // Eight children are one group, so three ids.
-        for p in 0..3u8 {
+        // Eight children are one group, so PARITY ids.
+        for p in 0..freenet_prolly::parity::PARITY as u8 {
             b.push_parity([0x70 + p; 32]).unwrap();
         }
         b.finish().unwrap()

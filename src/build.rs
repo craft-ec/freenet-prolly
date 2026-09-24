@@ -165,7 +165,7 @@ impl<F: FnMut(Cid, &[u8])> TreeBuilder<F> {
     /// Separate from the sink, and returned rather than streamed, because the
     /// order is the caller's decision: data nodes, then the head, then parity
     /// (ARCHITECTURE §7). Every group of a fresh tree is coded — there is no
-    /// older tree to reuse from — so this is three blocks per group.
+    /// older tree to reuse from — so this is `parity::PARITY` blocks per group.
     pub fn finish_with_parity(mut self) -> Result<(Cid, ParityBlocks), TreeError> {
         if self.poisoned {
             return Err(TreeError::Poisoned);
